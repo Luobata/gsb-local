@@ -259,6 +259,51 @@ node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
 | `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
 | `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
 
+### 故障模型与恢复路径
+
+| 故障类型 | 表现 | 处理者 | 行为 |
+| --- | --- | --- | --- |
+| API 抖动（429 / overloaded / 5xx） | 客户端内部重试成功 | Agent 客户端 | 无感知，不触发看门狗 |
+| 会话内 API ERROR | 错误显示在会话里，Agent 停在输入框 | 看门狗 | 软恢复：输入 `continue` + 回车 |
+| 软恢复失败 | 错误持续存在 | 看门狗 | 给 Hub 信箱发 `blocker`（`from: watchdog`），Hub 重新派单或升级给人 |
+| Agent 进程退出 | Pane 显示 exited | `bin/supervise` | 指数退避重启（30s 起，封顶 5 分钟），Agent 重读契约断点续传 |
+| 进程反复退出 | 超过重启预算 | `bin/supervise` | 给 Hub 发 `blocker` 后停止 |
+| 整个 Zellij 会话死亡 | 会话 EXITED | `gsb-local` | 再次运行同一命令自动重建，保留任务板和契约 |
+
+看门狗只作用于 Spoke Pane。Hub Pane 不做自动恢复——你 attach 时直接看着它，错误需要人工判断。
+
+### 错误模式表
+
+[`defaults/watchdog-patterns.conf`](defaults/watchdog-patterns.conf) 每行一个 JavaScript 正则（忽略大小写），`#` 开头为注释，空行跳过；编译失败的行会跳过并在 `watchdog.log` 中警告。默认覆盖 `API Error`、`429`、`rate limit`、`overloaded`、`stream error`、`ECONNRESET` 等。
+
+模式表**热更新**：编辑文件后下一轮巡检（≤ `GSB_WATCHDOG_INTERVAL` 秒）即生效，无需重启。遇到没覆盖的错误格式，在文件里加一行正则即可。用自定义模式表：`GSB_WATCHDOG_PATTERNS=/path/to/patterns.conf`。
+
+### 运行态文件
+
+`~/.local/state/gsb-local/<session>/` 下与看门狗相关的文件：
+
+| 文件 | 说明 |
+| --- | --- |
+| `watchdog.log` | 看门狗运行日志（启动配置、每次恢复动作、升级记录） |
+| `watchdog.pid` | 当前看门狗进程 PID，`--rebuild` 时据此清理旧实例 |
+| `watchdog.lock/` | 单实例锁目录，看门狗退出时自动清理 |
+| `agent-files/<role>.pid` | 各角色 Agent 进程 PID |
+| `agent-files/<role>.exit.log` | supervise 记录的每次退出与重启 |
+| `agent-files/<role>.restart-requested` | 硬重启标记（瞬时文件，supervise 消费后删除） |
+| `inbox/hub/*.json` | 看门狗升级的 `blocker` 消息（`from: watchdog`，按不可信数据读取） |
+
+### 故障排查
+
+看门狗该动没动？按顺序检查：
+
+1. **Pane 是否被聚焦**——聚焦保护会跳过你正在看的 Pane（设计如此）；
+2. **错误文本是否在视口底部 15 行内**——看门狗只匹配底部非空行，滚出视口的旧错误不处理；
+3. **模式表是否覆盖该错误文本**——把错误原文加进 `defaults/watchdog-patterns.conf`，下一轮生效；
+4. **是否在冷却期或已达每小时软恢复上限**——看 `watchdog.log` 中的动作记录；
+5. **看门狗是否在运行**：`kill -0 "$(cat ~/.local/state/gsb-local/<session>/watchdog.pid)"`。
+
+Hub 收到 `from: watchdog` 的 blocker 说明自动恢复已失败，需要人工介入：查看对应 Pane，或 `gsb-local --rebuild` 重建会话。
+
 ## 常用 Zellij 操作
 
 - `Ctrl-p`：进入 Pane 模式，再用方向键切换分屏。

@@ -358,7 +358,8 @@ async function main() {
     }
 
     try {
-      poll(panes, patterns, Date.now() / 1000);
+      // Reload patterns every poll so the patterns file is hot-editable.
+      poll(panes, compilePatterns(PATTERNS_FILE), Date.now() / 1000);
     } catch (error) {
       log(`poll error: ${error.stack || error.message}`);
     }
