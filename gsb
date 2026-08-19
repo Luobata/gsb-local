@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink "$SOURCE_PATH")"
+  if [[ "$SOURCE_PATH" != /* ]]; then
+    SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
+  fi
+done
+ROOT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+
+# A Zellij server permanently inherits the environment of its creator. If GSB is
+# launched from inside another Claude tool process, these markers can make new
+# Claude panes look like nested sessions and suppress transcript persistence.
+GSB_PARENT_ENV_SANITIZED=false
+for tainted_var in \
+  CLAUDECODE \
+  CLAUDE_CODE_SESSION_ID \
+  CLAUDE_CODE_CHILD_SESSION \
+  CLAUDE_CODE_BRIDGE_SESSION_ID \
+  CLAUDE_JOB_DIR \
+  CLAUDE_CODE_ENTRYPOINT \
+  CLAUDE_CODE_EXECPATH \
+  CLAUDE_PID; do
+  if [[ -n "${!tainted_var:-}" ]]; then
+    GSB_PARENT_ENV_SANITIZED=true
+    unset "$tainted_var"
+  fi
+done
+if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
+  export TERM=xterm-256color
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+  printf 'GSB Local: %s\n' "$ROOT_DIR"
+  printf 'Zellij:   %s\n' "$(zellij --version 2>/dev/null || printf 'missing')"
+  printf 'Claude:   %s\n' "$(claude --version 2>/dev/null || printf 'missing')"
+  printf 'Codex:    %s\n' "$(codex --version 2>/dev/null || printf 'missing')"
+  printf 'Kimi:     %s\n' "$(kimi --version 2>/dev/null || printf 'missing')"
+  exit 0
+fi
+
+REBUILD=false
+PRINT_CONFIG=false
+BACKGROUND=false
+FULL_ACCESS=false
+CONFIG_PROFILE=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --rebuild) REBUILD=true ;;
+    --print-config) PRINT_CONFIG=true ;;
+    --background) BACKGROUND=true ;;
+    --full-access) FULL_ACCESS=true ;;
+    --config[0-9]*) CONFIG_PROFILE="${1#--}" ;;
+    --config)
+      if [[ -z "${2:-}" || "${2:-}" == --* ]]; then
+        printf 'Missing profile name after --config.\n' >&2
+        exit 1
+      fi
+      CONFIG_PROFILE="$2"
+      shift
+      ;;
+    --help)
+      printf '%s\n' \
+        'Usage: gsb-local [--rebuild] [--background] [--full-access] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
+        '       gsb-local --print-config [WORKSPACE] [SESSION]' \
+        '       gsb-local --check'
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+WORKSPACE="${1:-$PWD}"
+SESSION="${2:-seed-gsb}"
+
+if [[ -n "$CONFIG_PROFILE" && ! "$CONFIG_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  printf 'Config profile names may only contain letters, numbers, dot, underscore, and hyphen.\n' >&2
+  exit 1
+fi
+
+if [[ "$FULL_ACCESS" == true ]]; then
+  export GSB_FULL_ACCESS=true
+  export GSB_PERMISSION_PROFILE=full-access
+  export GSB_PERMISSION_MODE=bypassPermissions
+  export GSB_CODEX_APPROVAL=never
+  export GSB_CODEX_SANDBOX=danger-full-access
+  export GSB_KIMI_PERMISSION=auto
+else
+  export GSB_FULL_ACCESS=false
+  export GSB_PERMISSION_PROFILE=balanced
+fi
+
+if [[ ! -d "$WORKSPACE" ]]; then
+  printf 'Workspace does not exist: %s\n' "$WORKSPACE" >&2
+  exit 1
+fi
+WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+
+if [[ ! "$SESSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  printf 'Session name may only contain letters, numbers, dot, underscore, and hyphen.\n' >&2
+  exit 1
+fi
+
+ROLE_PATTERN='^[a-z][a-z0-9-]*$'
+ROLES=()
+AGENT_SPECS=()
+
+canonical_role() {
+  printf '%s' "${1//_/-}"
+}
+
+role_env_var() {
+  local normalized
+  normalized="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+  printf 'GSB_%s_AGENT' "$normalized"
+}
+
+role_exists() {
+  local wanted="$1"
+  local role
+  for role in ${ROLES[@]+"${ROLES[@]}"}; do
+    [[ "$role" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+add_role() {
+  local role
+  local spec="$2"
+  role="$(canonical_role "$1")"
+  if [[ ! "$role" =~ $ROLE_PATTERN ]]; then
+    printf 'Invalid role in %s: %s\n' "$CONFIG_PATH" "$1" >&2
+    printf 'Role names must use lowercase letters, numbers, and hyphens.\n' >&2
+    exit 1
+  fi
+  if role_exists "$role"; then
+    printf 'Duplicate role in %s: %s\n' "$CONFIG_PATH" "$role" >&2
+    exit 1
+  fi
+  ROLES[${#ROLES[@]}]="$role"
+  AGENT_SPECS[${#AGENT_SPECS[@]}]="$spec"
+}
+
+prompt_for_role() {
+  local role="$1"
+  local project_prompt="$WORKSPACE/.gsb-local/prompts/$role.md"
+  local builtin_prompt="$ROOT_DIR/prompts/$role.md"
+  if [[ -f "$project_prompt" ]]; then
+    printf '%s' "$project_prompt"
+  elif [[ -f "$builtin_prompt" ]]; then
+    printf '%s' "$builtin_prompt"
+  else
+    return 1
+  fi
+}
+
+if [[ -n "$CONFIG_PROFILE" ]]; then
+  PROJECT_PROFILE_PATH="$WORKSPACE/.gsb-local/profiles/$CONFIG_PROFILE.conf"
+  BUILTIN_PROFILE_PATH="$ROOT_DIR/profiles/$CONFIG_PROFILE.conf"
+  CONFIG_SOURCE=profile
+  if [[ -f "$PROJECT_PROFILE_PATH" ]]; then
+    CONFIG_PATH="$PROJECT_PROFILE_PATH"
+  elif [[ -f "$BUILTIN_PROFILE_PATH" ]]; then
+    CONFIG_PATH="$BUILTIN_PROFILE_PATH"
+  else
+    printf 'Unknown GSB config profile: %s\n' "$CONFIG_PROFILE" >&2
+    printf 'Looked for:\n  %s\n  %s\n' "$PROJECT_PROFILE_PATH" "$BUILTIN_PROFILE_PATH" >&2
+    exit 1
+  fi
+else
+  REQUESTED_CONFIG_PATH="${GSB_CONFIG:-$WORKSPACE/.gsb-local/agents.conf}"
+  CONFIG_SOURCE=project
+  if [[ -f "$REQUESTED_CONFIG_PATH" ]]; then
+    CONFIG_PATH="$REQUESTED_CONFIG_PATH"
+  elif [[ -n "${GSB_CONFIG:-}" ]]; then
+    printf 'GSB_CONFIG does not exist: %s\n' "$REQUESTED_CONFIG_PATH" >&2
+    exit 1
+  else
+    CONFIG_PATH="$ROOT_DIR/defaults/agents.conf"
+    CONFIG_SOURCE=default
+  fi
+fi
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  printf 'Missing default GSB config: %s\n' "$CONFIG_PATH" >&2
+  exit 1
+fi
+
+while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+  trimmed_line="$(printf '%s' "$config_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -z "$trimmed_line" || "${trimmed_line:0:1}" == "#" ]] && continue
+  if [[ "$trimmed_line" != *=* ]]; then
+    printf 'Invalid config line in %s: %s\n' "$CONFIG_PATH" "$config_line" >&2
+    exit 1
+  fi
+  config_key="$(printf '%s' "${trimmed_line%%=*}" | sed -e 's/[[:space:]]*$//')"
+  config_value="$(printf '%s' "${trimmed_line#*=}" | sed -e 's/^[[:space:]]*//')"
+  if [[ -z "$config_value" ]]; then
+    printf 'Empty agent command for %s in %s\n' "$config_key" "$CONFIG_PATH" >&2
+    exit 1
+  fi
+  if [[ "$CONFIG_SOURCE" == default && -n "${GSB_AGENT:-}" ]]; then
+    config_value="$GSB_AGENT"
+  fi
+  add_role "$config_key" "$config_value"
+done < "$CONFIG_PATH"
+
+if ! role_exists hub; then
+  printf 'Missing required hub role in %s.\n' "$CONFIG_PATH" >&2
+  exit 1
+fi
+
+for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
+  role="${ROLES[$role_index]}"
+  role_var="$(role_env_var "$role")"
+  if [[ -n "${!role_var:-}" ]]; then
+    AGENT_SPECS[$role_index]="${!role_var}"
+  fi
+  printf -v "$role_var" '%s' "${AGENT_SPECS[$role_index]}"
+  export "$role_var"
+  if ! prompt_for_role "$role" >/dev/null; then
+    printf 'Missing prompt for active role %s. Add one at either:\n' "$role" >&2
+    printf '  %s\n  %s\n' "$WORKSPACE/.gsb-local/prompts/$role.md" "$ROOT_DIR/prompts/$role.md" >&2
+    exit 1
+  fi
+done
+
+previous_ifs="$IFS"
+IFS=,
+GSB_ROLES="${ROLES[*]}"
+IFS="$previous_ifs"
+export GSB_ROLES
+
+if [[ "$PRINT_CONFIG" == true ]]; then
+  config_suffix=""
+  if [[ "$CONFIG_SOURCE" == default ]]; then
+    config_suffix=" (default)"
+  fi
+  printf 'Workspace: %s\n' "$WORKSPACE"
+  printf 'Config:    %s%s\n' "$CONFIG_PATH" "$config_suffix"
+  if [[ -n "$CONFIG_PROFILE" ]]; then
+    printf 'Profile:   %s\n' "$CONFIG_PROFILE"
+  fi
+  printf 'Roles:     %s\n' "$GSB_ROLES"
+  printf 'Permissions: %s\n' "$GSB_PERMISSION_PROFILE"
+  for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
+    printf '%-16s %-20s prompt=%s\n' \
+      "${ROLES[$role_index]}:" \
+      "${AGENT_SPECS[$role_index]}" \
+      "$(prompt_for_role "${ROLES[$role_index]}")"
+  done
+  exit 0
+fi
+
+for required_command in zellij node; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$required_command" >&2
+    exit 1
+  fi
+done
+
+command_or_alias_exists() {
+  local command_name="$1"
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ "$command_name" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || return 1
+  /bin/zsh -ic 'whence -w -- "$1" >/dev/null 2>&1' gsb-check "$command_name" >/dev/null 2>&1
+}
+
+for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
+  role="${ROLES[$role_index]}"
+  agent_spec="${AGENT_SPECS[$role_index]}"
+  case "$agent_spec" in
+    claude) agent_binary="claude" ;;
+    codex) agent_binary="codex" ;;
+    kimi) agent_binary="kimi" ;;
+    claude:*|codex:*|kimi:*) agent_binary="${agent_spec#*:}" ;;
+    shell:*)
+      if [[ -z "${agent_spec#shell:}" ]]; then
+        printf 'Empty shell command configured for role: %s\n' "$role" >&2
+        exit 1
+      fi
+      continue
+      ;;
+    *)
+      if [[ "$agent_spec" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then
+        # Bare custom commands remain Claude-compatible for backwards compatibility.
+        agent_binary="$agent_spec"
+      else
+        printf 'Unsupported agent spec for %s: %s\n' "$role" "$agent_spec" >&2
+        printf 'Use claude, codex, kimi, a compatible adapter, or shell:<command>.\n' >&2
+        exit 1
+      fi
+      ;;
+  esac
+  if [[ -z "$agent_binary" ]] || ! command_or_alias_exists "$agent_binary"; then
+    printf 'Missing command for %s: %s\n' "$role" "${agent_binary:-<empty>}" >&2
+    exit 1
+  fi
+done
+
+export GSB_LOCAL_ROOT="$ROOT_DIR"
+export GSB_WORKSPACE="$WORKSPACE"
+export GSB_SESSION="$SESSION"
+export GSB_AGENT="${GSB_AGENT:-claude}"
+export GSB_STATE_DIR="${GSB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$SESSION}"
+export GSB_CONFIG_PATH="$CONFIG_PATH"
+export GSB_PROTOCOL_FILE="$ROOT_DIR/protocol/dispatch.md"
+export GSB_ROLE_ROSTER="$GSB_STATE_DIR/ROLES.md"
+export GSB_LAYOUT_FILE="$GSB_STATE_DIR/layouts/current.kdl"
+
+mkdir -p "$GSB_STATE_DIR/reports" "$GSB_STATE_DIR/contracts" "$GSB_STATE_DIR/layouts" "$GSB_STATE_DIR/agent-files"
+for role in "${ROLES[@]}"; do
+  mkdir -p "$GSB_STATE_DIR/inbox/$role" "$GSB_STATE_DIR/inbox-archive/$role"
+done
+
+roster_tmp="$GSB_STATE_DIR/.ROLES.md.$$.tmp"
+{
+  printf '%s\n' '# GSB Active Role Roster' '' "Session: $SESSION" "Workspace: $WORKSPACE" '' '## Active roles' ''
+  for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
+    printf -- '- %s: `%s` (prompt: `%s`)\n' \
+      "${ROLES[$role_index]}" \
+      "${AGENT_SPECS[$role_index]}" \
+      "$(prompt_for_role "${ROLES[$role_index]}")"
+  done
+  printf '%s\n' '' 'Only roles in this roster are active. Removing a role from agents.conf and rebuilding removes its pane and routing authority while retaining historical files.'
+} > "$roster_tmp"
+chmod 600 "$roster_tmp"
+mv "$roster_tmp" "$GSB_ROLE_ROSTER"
+
+if [[ ! -f "$GSB_STATE_DIR/TASK.md" ]]; then
+  {
+    printf '%s\n' \
+      '# GSB Shared Task Board' \
+      '' \
+      "Workspace: $WORKSPACE" \
+      "Session: $SESSION" \
+      '' \
+      '## Goal' \
+      '' \
+      '_Hub fills this section after receiving the user goal._' \
+      '' \
+      '## Assignments' \
+      ''
+    for role in "${ROLES[@]}"; do
+      [[ "$role" == hub ]] && continue
+      printf -- '- %s: waiting\n' "$role"
+    done
+    printf '%s\n' '' '## Decisions' '' '_Hub records accepted decisions here._'
+  } > "$GSB_STATE_DIR/TASK.md"
+fi
+
+for contract_role in "${ROLES[@]}"; do
+  [[ "$contract_role" == hub ]] && continue
+  contract_file="$GSB_STATE_DIR/contracts/$contract_role.md"
+  if [[ ! -f "$contract_file" ]]; then
+    printf '%s\n' \
+      "# Dispatch Contract: $contract_role" \
+      '' \
+      "Contract ID: $SESSION-$contract_role" \
+      'Status: waiting' \
+      '' \
+      '## Objective' \
+      '' \
+      '_Hub replaces this with one observable outcome and relevant background._' \
+      '' \
+      '## Scope' \
+      '' \
+      '- Allowed: repository inspection, safe diagnostics, and the role report.' \
+      '- Write allow-list: none by default. Hub must list exact paths to grant scoped mutation.' \
+      '- Do not touch: commits, pushes, deployments, unrelated files, or scope outside this contract.' \
+      '' \
+      '## Validation' \
+      '' \
+      '- Done when: Hub-defined checks are satisfied with current-run evidence.' \
+      '- Proof: record exact commands, relevant output, and affected paths in the role report.' \
+      '' \
+      '## Stop conditions' \
+      '' \
+      '- Stop and send a blocker if required access is missing, scope must expand, write ownership conflicts, or evidence conflicts with the objective.' \
+      '' \
+      '## Reply route' \
+      '' \
+      "- Send progress: node \"$ROOT_DIR/bin/relay.mjs\" send hub progress '{\"summary\":\"...\"}'" \
+      "- Send blocker: node \"$ROOT_DIR/bin/relay.mjs\" send hub blocker '{\"question\":\"...\",\"missing\":\"...\",\"safe_fallback\":\"no_safe_fallback\"}'" \
+      "- Send final result: node \"$ROOT_DIR/bin/relay.mjs\" send hub result '{\"summary\":\"...\",\"report\":\"reports/$contract_role.md\",\"proof\":\"...\",\"caveats\":[]}'" \
+      "- After sending, wake Hub: bash \"$ROOT_DIR/bin/nudge\" hub" \
+      > "$contract_file"
+  fi
+done
+
+node "$ROOT_DIR/bin/render-layout.mjs" "$GSB_LAYOUT_FILE" "$SESSION" "${ROLES[@]}"
+
+if [[ "$GSB_PARENT_ENV_SANITIZED" == true ]]; then
+  printf 'Sanitized inherited Claude child-session markers before starting Zellij.\n'
+fi
+if [[ "$FULL_ACCESS" == true ]]; then
+  printf 'WARNING: full-access enabled; built-in agents will run without normal approval or sandbox protections.\n' >&2
+fi
+
+SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
+if [[ "$REBUILD" == true ]] && printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
+  printf 'Rebuilding Zellij session with current configuration: %s\n' "$SESSION"
+  zellij delete-session --force "$SESSION" >/dev/null
+elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session && /EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
+  printf 'Rebuilding dead Zellij session: %s\n' "$SESSION"
+  zellij delete-session "$SESSION" >/dev/null
+elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
+  if [[ "$BACKGROUND" == true ]]; then
+    printf 'Zellij session is already active in the background: %s\n' "$SESSION"
+    exit 0
+  else
+    printf 'Attaching to active Zellij session: %s\n' "$SESSION"
+    exec zellij attach "$SESSION"
+  fi
+fi
+
+if [[ "$BACKGROUND" == true ]]; then
+  exec zellij attach \
+    --create-background "$SESSION" \
+    options \
+    --default-cwd "$WORKSPACE" \
+    --default-layout "$GSB_LAYOUT_FILE" \
+    --on-force-close detach \
+    --show-startup-tips false
+fi
+
+exec zellij \
+  --session "$SESSION" \
+  options \
+  --attach-to-session true \
+  --default-cwd "$WORKSPACE" \
+  --default-layout "$GSB_LAYOUT_FILE" \
+  --on-force-close detach \
+  --show-startup-tips false

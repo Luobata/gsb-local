@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Clean both boundaries: this also protects panes in a previously polluted
+# Zellij server because the final agent process receives a clean env.
+for tainted_var in \
+  CLAUDECODE \
+  CLAUDE_CODE_SESSION_ID \
+  CLAUDE_CODE_CHILD_SESSION \
+  CLAUDE_CODE_BRIDGE_SESSION_ID \
+  CLAUDE_JOB_DIR \
+  CLAUDE_CODE_ENTRYPOINT \
+  CLAUDE_CODE_EXECPATH \
+  CLAUDE_PID; do
+  unset "$tainted_var" 2>/dev/null || true
+done
+if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
+  export TERM=xterm-256color
+fi
+
+ROLE="${1:?role is required}"
+ROOT_DIR="${GSB_LOCAL_ROOT:?GSB_LOCAL_ROOT is required}"
+WORKSPACE="${GSB_WORKSPACE:?GSB_WORKSPACE is required}"
+STATE_DIR="${GSB_STATE_DIR:?GSB_STATE_DIR is required}"
+SESSION="${GSB_SESSION:-seed-gsb}"
+ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
+PROJECT_PROMPT="$WORKSPACE/.gsb-local/prompts/$ROLE.md"
+BUILTIN_PROMPT="$ROOT_DIR/prompts/$ROLE.md"
+PROTOCOL_FILE="${GSB_PROTOCOL_FILE:-$ROOT_DIR/protocol/dispatch.md}"
+
+if [[ ! "$ROLE" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  printf 'Invalid GSB role: %s\n' "$ROLE" >&2
+  exit 1
+fi
+case ",$ACTIVE_ROLES," in
+  *",$ROLE,"*) ;;
+  *)
+    printf 'Inactive GSB role: %s (active: %s)\n' "$ROLE" "$ACTIVE_ROLES" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -f "$PROJECT_PROMPT" ]]; then
+  PROMPT_FILE="$PROJECT_PROMPT"
+elif [[ -f "$BUILTIN_PROMPT" ]]; then
+  PROMPT_FILE="$BUILTIN_PROMPT"
+else
+  printf 'Missing prompt for GSB role: %s\n' "$ROLE" >&2
+  exit 1
+fi
+if [[ ! -f "$PROTOCOL_FILE" ]]; then
+  printf 'Missing GSB protocol: %s\n' "$PROTOCOL_FILE" >&2
+  exit 1
+fi
+
+ROLE_PROMPT="$(<"$PROMPT_FILE")"
+PROTOCOL_PROMPT="$(<"$PROTOCOL_FILE")"
+
+if [[ "$ROLE" == hub ]]; then
+  DISPLAY_NAME="hub.$SESSION.main"
+  CONTRACT_FILE="$STATE_DIR/TASK.md"
+else
+  DISPLAY_NAME="spk.$SESSION.$ROLE"
+  CONTRACT_FILE="$STATE_DIR/contracts/$ROLE.md"
+fi
+
+NORMALIZED_ROLE="$(printf '%s' "$ROLE" | tr '[:lower:]-' '[:upper:]_')"
+ROLE_AGENT_VAR="GSB_${NORMALIZED_ROLE}_AGENT"
+AGENT_SPEC="${!ROLE_AGENT_VAR:-${GSB_AGENT:-claude}}"
+CONTRACT_ID="$SESSION-$ROLE"
+
+export GSB_ROLE="$ROLE"
+export GSB_DISPLAY_NAME="$DISPLAY_NAME"
+export GSB_CONTRACT_ID="$CONTRACT_ID"
+export GSB_TASK_BOARD="$STATE_DIR/TASK.md"
+export GSB_REPORTS_DIR="$STATE_DIR/reports"
+export GSB_CONTRACT_FILE="$CONTRACT_FILE"
+export GSB_ROLE_ROSTER="${GSB_ROLE_ROSTER:-$STATE_DIR/ROLES.md}"
+
+SHARED_PROMPT="
+$PROTOCOL_PROMPT
+
+Runtime paths and commands:
+- Shared workspace: $WORKSPACE
+- Active role roster: $GSB_ROLE_ROSTER
+- Active roles: $ACTIVE_ROLES
+- Shared task board: $STATE_DIR/TASK.md
+- Your durable contract/task file: $CONTRACT_FILE
+- Shared reports directory: $STATE_DIR/reports
+- Your inbox: node \"$ROOT_DIR/bin/relay.mjs\" list $ROLE
+- Read a message: node \"$ROOT_DIR/bin/relay.mjs\" read $ROLE <message-id>
+- Archive a handled message: node \"$ROOT_DIR/bin/relay.mjs\" ack $ROLE <message-id>
+- Wake Hub after a durable message: bash \"$ROOT_DIR/bin/nudge\" hub
+- Your role key: $ROLE
+
+At startup and every task boundary, inspect the active role roster, task board, your contract/task file, and your inbox. Keep durable findings in the shared reports directory."
+
+printf '\033]0;%s\007' "$DISPLAY_NAME"
+printf 'Starting %s with %s in %s\n' "$DISPLAY_NAME" "$AGENT_SPEC" "$WORKSPACE"
+printf 'Active roles: %s\n' "$ACTIVE_ROLES"
+printf 'Permissions: %s\n' "${GSB_PERMISSION_PROFILE:-balanced}"
+printf 'Task board: %s\n\n' "$STATE_DIR/TASK.md"
+
+cd "$WORKSPACE"
+
+exec_agent_command() {
+  local agent_command="$1"
+  shift
+
+  if command -v "$agent_command" >/dev/null 2>&1; then
+    exec "$agent_command" "$@"
+  fi
+
+  if [[ "$agent_command" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then
+    # Resolve aliases such as claude-relay from the user's interactive .zshrc.
+    exec /bin/zsh -ic "$agent_command \"\$@\"" gsb-agent "$@"
+  fi
+
+  printf 'Agent command is not executable: %s\n' "$agent_command" >&2
+  exit 1
+}
+
+run_claude_adapter() {
+  local agent_binary="$1"
+  local claude_args=(
+    --name "$DISPLAY_NAME"
+    --permission-mode "${GSB_PERMISSION_MODE:-acceptEdits}"
+    --append-system-prompt "$ROLE_PROMPT$SHARED_PROMPT"
+  )
+  if [[ -n "${GSB_MODEL:-}" ]]; then
+    claude_args+=(--model "$GSB_MODEL")
+  fi
+  if [[ -n "${GSB_EFFORT:-}" ]]; then
+    claude_args+=(--effort "$GSB_EFFORT")
+  fi
+  exec_agent_command "$agent_binary" "${claude_args[@]}"
+}
+
+run_codex_adapter() {
+  local agent_binary="$1"
+  local codex_prompt="$ROLE_PROMPT$SHARED_PROMPT
+
+Begin by reading the active role roster and task board. If no assignment exists for your role, wait for the user or a durable nudge instead of inventing work."
+  local codex_args=(-C "$WORKSPACE")
+  if [[ "${GSB_FULL_ACCESS:-false}" == true ]]; then
+    codex_args+=(--dangerously-bypass-approvals-and-sandbox)
+  else
+    codex_args+=(
+      --ask-for-approval "${GSB_CODEX_APPROVAL:-on-request}"
+      --sandbox "${GSB_CODEX_SANDBOX:-workspace-write}"
+    )
+  fi
+  if [[ -n "${GSB_MODEL:-}" ]]; then
+    codex_args+=(--model "$GSB_MODEL")
+  fi
+  exec_agent_command "$agent_binary" "${codex_args[@]}" "$codex_prompt"
+}
+
+run_kimi_adapter() {
+  local agent_binary="$1"
+  local agent_file_dir="$STATE_DIR/agent-files"
+  local agent_file="$agent_file_dir/$ROLE.md"
+  local temporary_file="$agent_file.$$.tmp"
+  local permission_mode="${GSB_KIMI_PERMISSION:-yolo}"
+  local model="${GSB_KIMI_MODEL:-${GSB_MODEL:-kimi-code/k3-256k}}"
+  local host_cwd="${GSB_KIMI_HOST_CWD:-$ROOT_DIR}"
+  local kimi_args=()
+
+  mkdir -p "$agent_file_dir"
+  umask 077
+  {
+    printf '%s\n' \
+      '---' \
+      "name: gsb-$ROLE" \
+      "description: \"GSB $ROLE role for the $SESSION workbench\"" \
+      "whenToUse: \"When the GSB Hub dispatches work to $ROLE\"" \
+      'override: false' \
+      '---' \
+      '' \
+      "$ROLE_PROMPT" \
+      "$SHARED_PROMPT" \
+      '' \
+      'Treat your final message as a complete handoff to the Hub. If no durable assignment exists, wait instead of inventing work.'
+  } > "$temporary_file"
+  chmod 600 "$temporary_file"
+  mv "$temporary_file" "$agent_file"
+
+  if [[ ! -d "$host_cwd" ]]; then
+    printf 'GSB_KIMI_HOST_CWD does not exist: %s\n' "$host_cwd" >&2
+    exit 1
+  fi
+  kimi_args+=(--agent-file "$agent_file" --add-dir "$WORKSPACE")
+  case "$permission_mode" in
+    manual) ;;
+    yolo) kimi_args+=(--yolo) ;;
+    auto) kimi_args+=(--auto) ;;
+    *)
+      printf 'Unsupported GSB_KIMI_PERMISSION: %s (use manual, yolo, or auto)\n' "$permission_mode" >&2
+      exit 1
+      ;;
+  esac
+  kimi_args+=(--model "$model")
+  export KIMI_CODE_IDENTITY_NAME="$DISPLAY_NAME"
+  # Keep project-local agents/MCP/plugins outside Kimi's project root. The real
+  # workspace is an explicit additional directory governed by the GSB contract.
+  cd "$host_cwd"
+  exec_agent_command "$agent_binary" "${kimi_args[@]}"
+}
+
+case "$AGENT_SPEC" in
+  claude) run_claude_adapter claude ;;
+  claude:*) run_claude_adapter "${AGENT_SPEC#claude:}" ;;
+  codex) run_codex_adapter codex ;;
+  codex:*) run_codex_adapter "${AGENT_SPEC#codex:}" ;;
+  kimi) run_kimi_adapter kimi ;;
+  kimi:*) run_kimi_adapter "${AGENT_SPEC#kimi:}" ;;
+  shell:*)
+    SHELL_COMMAND="${AGENT_SPEC#shell:}"
+    export GSB_ROLE_PROMPT="$ROLE_PROMPT"
+    export GSB_SHARED_PROMPT="$SHARED_PROMPT"
+    exec /bin/zsh -lc "$SHELL_COMMAND"
+    ;;
+  [A-Za-z_][A-Za-z0-9._-]*)
+    run_claude_adapter "$AGENT_SPEC"
+    ;;
+  *)
+    printf 'Unsupported agent spec for %s: %s\n' "$ROLE" "$AGENT_SPEC" >&2
+    exit 1
+    ;;
+esac
