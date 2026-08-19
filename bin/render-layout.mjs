@@ -21,7 +21,7 @@ for (const role of roles) {
 }
 
 const quote = (value) => JSON.stringify(value);
-const command = (role) => `exec \"$GSB_LOCAL_ROOT/bin/run-agent\" ${role}`;
+const command = (role) => `exec \"$GSB_LOCAL_ROOT/bin/supervise\" ${role}`;
 const title = (role) => role === "hub" ? `hub.${session}.main` : `spk.${session}.${role}`;
 const pane = (role, indent, options = "") => [
   `${indent}pane${options} name=${quote(title(role))} command=${quote("/bin/zsh")} {`,

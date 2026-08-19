@@ -18,6 +18,10 @@ if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
   export TERM=xterm-256color
 fi
 
+# First layer of API-error defense: let the CLI itself retry longer before
+# surfacing an error. Best-effort; ignored by CLI versions that don't read it.
+export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-10}"
+
 ROLE="${1:?role is required}"
 ROOT_DIR="${GSB_LOCAL_ROOT:?GSB_LOCAL_ROOT is required}"
 WORKSPACE="${GSB_WORKSPACE:?GSB_WORKSPACE is required}"
@@ -77,6 +81,9 @@ export GSB_REPORTS_DIR="$STATE_DIR/reports"
 export GSB_CONTRACT_FILE="$CONTRACT_FILE"
 export GSB_ROLE_ROSTER="${GSB_ROLE_ROSTER:-$STATE_DIR/ROLES.md}"
 
+mkdir -p "$STATE_DIR/agent-files"
+printf '%s\n' "$$" > "$STATE_DIR/agent-files/$ROLE.pid"
+
 SHARED_PROMPT="
 $PROTOCOL_PROMPT
 
@@ -92,6 +99,8 @@ Runtime paths and commands:
 - Archive a handled message: node \"$ROOT_DIR/bin/relay.mjs\" ack $ROLE <message-id>
 - Wake Hub after a durable message: bash \"$ROOT_DIR/bin/nudge\" hub
 - Your role key: $ROLE
+
+If your inbox contains a watchdog restart notice, or your contract shows an in-progress objective you do not remember starting, you were restarted after an error: re-read the task board and your contract, then continue the objective from durable state.
 
 At startup and every task boundary, inspect the active role roster, task board, your contract/task file, and your inbox. Keep durable findings in the shared reports directory."
 

@@ -221,6 +221,44 @@ bash "$GSB_LOCAL_ROOT/bin/nudge" core-bug
 
 协议真相源见 [protocol/dispatch.md](protocol/dispatch.md)。
 
+## 看门狗（Watchdog）
+
+Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错误并停在输入框，后台 Spoke 会因此静默卡死。看门狗自动处理这类故障：
+
+1. 每 `GSB_WATCHDOG_INTERVAL` 秒（默认 60）抓取每个 Spoke Pane 的视口内容；
+2. 用 [`defaults/watchdog-patterns.conf`](defaults/watchdog-patterns.conf) 中的正则匹配视口**底部非空行**（错误提示的位置）；
+3. 只有同时满足「连续 2 轮巡检都命中」「屏幕内容静止」「该 Pane 当前和上一轮都未被聚焦」才动作——人正在看的 Pane 绝不打扰；
+4. **软恢复**：向 Pane 输入 `continue` 并回车（可用 `GSB_WATCHDOG_RETRY_TEXT` 改）。每小时最多 `GSB_WATCHDOG_MAX_SOFT` 次（默认 3）；
+5. 软恢复无效：向 Hub 信箱投递 `blocker` 并 nudge，由 Hub 重新派单或升级给人；
+6. 进程退出类故障由 [`bin/supervise`](bin/supervise) 兜底：指数退避重启（30s 起，封顶 5 分钟），超过 `GSB_SUPERVISE_MAX_ATTEMPTS` 次（默认 10）同样给 Hub 发 blocker。
+
+因为契约、信箱、报告都在磁盘上，无论哪种恢复路径，Agent 重启后重读契约即可断点续传。
+
+可选**硬重启**（默认关闭）：`GSB_WATCHDOG_HARD_RESTART=true` 时，软恢复失败的 Spoke 会被 Ctrl-c 终止并由 supervise 重启。
+
+看门狗随会话启动自动在后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。关闭：`GSB_WATCHDOG_ENABLED=false`。
+
+日志与自检：
+
+```bash
+tail -f ~/.local/state/gsb-local/<session>/watchdog.log   # 看门狗日志
+cat ~/.local/state/gsb-local/<session>/agent-files/<role>.exit.log  # 重启记录
+node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `GSB_WATCHDOG_ENABLED` | `true` | 会话启动时是否拉起看门狗 |
+| `GSB_WATCHDOG_INTERVAL` | `60` | 巡检间隔（秒） |
+| `GSB_WATCHDOG_BOTTOM_LINES` | `15` | 匹配视口底部多少行非空内容 |
+| `GSB_WATCHDOG_STALE_POLLS` | `2` | 连续命中多少轮才动作 |
+| `GSB_WATCHDOG_RETRY_TEXT` | `continue` | 软恢复时输入的文本 |
+| `GSB_WATCHDOG_MAX_SOFT` | `3` | 每小时软恢复上限 |
+| `GSB_WATCHDOG_COOLDOWN` | `300` | 同一角色两次动作的最小间隔（秒） |
+| `GSB_WATCHDOG_HARD_RESTART` | `false` | 软恢复失败后是否 Ctrl-c 硬重启 |
+| `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
+| `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
+
 ## 常用 Zellij 操作
 
 - `Ctrl-p`：进入 Pane 模式，再用方向键切换分屏。

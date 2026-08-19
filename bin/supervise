@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pane-level supervisor: restarts run-agent after error exits with bounded
+# exponential backoff. Clean exits (0, or 130 from an interactive Ctrl-C) are
+# not restarted. The watchdog may request a hard restart by touching
+# agent-files/<role>.restart-requested before signalling the pane; the marker
+# forces a restart even when the exit code looks clean.
+
+ROLE="${1:?role is required}"
+ROOT_DIR="${GSB_LOCAL_ROOT:?GSB_LOCAL_ROOT is required}"
+STATE_DIR="${GSB_STATE_DIR:?GSB_STATE_DIR is required}"
+
+MAX_ATTEMPTS="${GSB_SUPERVISE_MAX_ATTEMPTS:-10}"
+BASE_DELAY="${GSB_SUPERVISE_BASE_DELAY:-30}"
+RESTART_MARKER="$STATE_DIR/agent-files/$ROLE.restart-requested"
+EXIT_LOG="$STATE_DIR/agent-files/$ROLE.exit.log"
+mkdir -p "$STATE_DIR/agent-files"
+
+attempt=0
+while true; do
+  exit_code=0
+  "$ROOT_DIR/bin/run-agent" "$ROLE" || exit_code=$?
+  printf '%s role=%s exit_code=%s attempt=%s\n' \
+    "$(date -u +%FT%TZ)" "$ROLE" "$exit_code" "$attempt" >> "$EXIT_LOG"
+
+  restart_requested=false
+  if [[ -f "$RESTART_MARKER" ]]; then
+    rm -f "$RESTART_MARKER"
+    restart_requested=true
+  fi
+
+  if [[ "$restart_requested" != true && ( "$exit_code" -eq 0 || "$exit_code" -eq 130 ) ]]; then
+    exit 0
+  fi
+
+  attempt=$((attempt + 1))
+  if [[ "$attempt" -ge "$MAX_ATTEMPTS" ]]; then
+    printf '%s role=%s restart budget exhausted after %s attempts\n' \
+      "$(date -u +%FT%TZ)" "$ROLE" "$attempt" >> "$EXIT_LOG"
+    GSB_ROLE=hub node "$ROOT_DIR/bin/relay.mjs" send hub blocker \
+      "{\"question\":\"$ROLE exited $attempt times (last exit code $exit_code)\",\"missing\":\"supervisor restart budget exhausted; inspect $EXIT_LOG\",\"safe_fallback\":\"no_safe_fallback\"}" \
+      >/dev/null 2>&1 || true
+    bash "$ROOT_DIR/bin/nudge" hub >/dev/null 2>&1 || true
+    exit "$exit_code"
+  fi
+
+  delay=$((BASE_DELAY * (1 << (attempt - 1))))
+  if [[ "$delay" -gt 300 ]]; then
+    delay=300
+  fi
+  printf '%s role=%s restarting in %ss (attempt %s/%s)\n' \
+    "$(date -u +%FT%TZ)" "$ROLE" "$delay" "$attempt" "$MAX_ATTEMPTS" >> "$EXIT_LOG"
+  sleep "$delay"
+done

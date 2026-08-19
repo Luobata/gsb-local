@@ -423,6 +423,25 @@ elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { 
   fi
 fi
 
+# Launch the in-session error watchdog for this session's spoke panes. Only
+# reached when creating a new session (attach paths exit/exec above), so a
+# rebuild first stops any previous watchdog via its pidfile. The watchdog
+# exits on its own when the zellij session disappears.
+if [[ "${GSB_WATCHDOG_ENABLED:-true}" == true ]]; then
+  watchdog_pidfile="$GSB_STATE_DIR/watchdog.pid"
+  if [[ -f "$watchdog_pidfile" ]]; then
+    previous_watchdog="$(cat "$watchdog_pidfile" 2>/dev/null || true)"
+    if [[ -n "$previous_watchdog" ]] && kill -0 "$previous_watchdog" 2>/dev/null; then
+      kill "$previous_watchdog" 2>/dev/null || true
+    fi
+    rm -f "$watchdog_pidfile"
+  fi
+  rm -rf "$GSB_STATE_DIR/watchdog.lock"
+  nohup node "$ROOT_DIR/bin/watchdog.mjs" </dev/null >>"$GSB_STATE_DIR/watchdog.log" 2>&1 &
+  printf '%s\n' "$!" > "$watchdog_pidfile"
+  disown 2>/dev/null || true
+fi
+
 if [[ "$BACKGROUND" == true ]]; then
   exec zellij attach \
     --create-background "$SESSION" \
