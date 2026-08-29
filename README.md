@@ -33,6 +33,8 @@ Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--pro
 
 项目配置的事实源是 `.gsb-local/agents.conf`、`.gsb-local/models.conf` 和 `.gsb-local/prompts/`；`.gsb-local/workbench.json` 仅作为 Studio 的 UI 草稿与展示元数据 sidecar，不覆盖手工修改的配置事实。
 
+Studio 默认缓存 Agent 命令存在性检查：可用命令在当前进程内持续缓存，不可用结果 30 秒后自动重查；设置 `GSB_STUDIO_CMD_CACHE=off` 可关闭缓存。交互 shell 检查超时或失败时默认显示警告并允许继续启动；设置 `GSB_STUDIO_CHECK_STRICT=on` 可恢复为阻断错误。
+
 只在后台创建、不立即占用当前终端：
 
 ```bash

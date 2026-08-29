@@ -39,6 +39,9 @@ const CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const STUDIO_API_VERSION = 2;
 const SPAWN_TIMEOUT_MS = 5_000;
+const INTERACTIVE_COMMAND_TIMEOUT_MS = 8_000;
+const COMMAND_NEGATIVE_TTL_MS = 30_000;
+const COMMAND_RESULT_MARKER = "__GSB_STUDIO_COMMAND__";
 const DEFAULT_CONFIG_HOME = path.join(os.homedir(), ".config", "gsb-local", "studio");
 
 function configHome() {
@@ -346,32 +349,125 @@ function commandForAgent(agent) {
   return agent;
 }
 
-function commandAvailable(command) {
-  if (!command) return true;
-  const hasZsh = existsSync("/bin/zsh");
-  // The /bin/sh fallback intentionally checks executables only; aliases require interactive zsh.
-  const result = spawnSync(hasZsh ? "/bin/zsh" : "/bin/sh", hasZsh
-    ? ["-ic", 'whence -w -- "$1" >/dev/null 2>&1', "gsb-studio", command]
-    : ["-c", 'command -v "$1" >/dev/null 2>&1', "gsb-studio", command], { timeout: SPAWN_TIMEOUT_MS });
-  return result.status === 0;
+export function createRuntimeValidator({
+  spawnSyncImpl = spawnSync,
+  now = Date.now,
+  env = process.env,
+  hasZsh = existsSync("/bin/zsh"),
+  listSessionOptionsImpl = listSessionOptions,
+} = {}) {
+  const commandCache = new Map();
+
+  function cachedCommand(command) {
+    if (env.GSB_STUDIO_CMD_CACHE === "off") return null;
+    const cached = commandCache.get(command);
+    if (!cached) return null;
+    if (cached.available || now() - cached.ts < COMMAND_NEGATIVE_TTL_MS) {
+      return { available: cached.available, uncertain: false };
+    }
+    commandCache.delete(command);
+    return null;
+  }
+
+  function cacheCommand(command, available) {
+    if (env.GSB_STUDIO_CMD_CACHE !== "off") commandCache.set(command, { available, ts: now() });
+  }
+
+  function precheckCommand(command) {
+    const checked = spawnSyncImpl("/bin/sh", [
+      "-c",
+      'command -v "$1" >/dev/null 2>&1',
+      "gsb-studio",
+      command,
+    ], { timeout: SPAWN_TIMEOUT_MS });
+    return checked.status === 0;
+  }
+
+  function interactiveCommandResults(commands) {
+    if (!commands.length) return new Map();
+    const lookup = hasZsh ? 'whence -w -- "$command"' : 'command -v "$command"';
+    const script = `for command in "$@"; do if ${lookup} >/dev/null 2>&1; then printf '${COMMAND_RESULT_MARKER}1\\n'; else printf '${COMMAND_RESULT_MARKER}0\\n'; fi; done`;
+    const checked = spawnSyncImpl(hasZsh ? "/bin/zsh" : "/bin/sh", [
+      hasZsh ? "-ic" : "-c",
+      script,
+      "gsb-studio",
+      ...commands,
+    ], { encoding: "utf8", timeout: INTERACTIVE_COMMAND_TIMEOUT_MS });
+    if (checked.error || checked.signal) {
+      const reason = checked.error?.code === "ETIMEDOUT" ? "检查超时" : "检查失败";
+      return new Map(commands.map((command) => [command, { available: false, uncertain: true, reason }]));
+    }
+    if (checked.status !== 0) {
+      return new Map(commands.map((command) => [command, { available: false, uncertain: false }]));
+    }
+    const matches = [...String(checked.stdout || "").matchAll(new RegExp(`^${COMMAND_RESULT_MARKER}([01])$`, "gm"))];
+    return new Map(commands.map((command, index) => {
+      const match = matches[index];
+      return [command, match
+        ? { available: match[1] === "1", uncertain: false }
+        : { available: false, uncertain: true, reason: "检查失败" }];
+    }));
+  }
+
+  function checkCommands(commands) {
+    const results = new Map();
+    const interactive = [];
+    for (const command of new Set(commands.filter(Boolean))) {
+      const cached = cachedCommand(command);
+      if (cached) {
+        results.set(command, cached);
+      } else if (precheckCommand(command)) {
+        const available = { available: true, uncertain: false };
+        cacheCommand(command, true);
+        results.set(command, available);
+      } else {
+        interactive.push(command);
+      }
+    }
+    for (const [command, checked] of interactiveCommandResults(interactive)) {
+      if (!checked.uncertain) cacheCommand(command, checked.available);
+      results.set(command, checked);
+    }
+    return results;
+  }
+
+  function validate(workbench) {
+    const result = validateWorkbench(workbench);
+    const roles = workbench?.roles || [];
+    const roleCommands = roles.map((role) => ({
+      role,
+      command: commandForAgent(typeof role?.agent === "string" ? role.agent : ""),
+    }));
+    const commands = checkCommands(roleCommands.map(({ command }) => command));
+    for (const { role, command } of roleCommands) {
+      if (!command) continue;
+      const checked = commands.get(command);
+      if (checked?.uncertain) {
+        const message = `${role.id}: 无法确认命令 ${command}（${checked.reason}）；如已安装可继续启动`;
+        (env.GSB_STUDIO_CHECK_STRICT === "on" ? result.errors : result.warnings).push(message);
+      } else if (!checked?.available) {
+        result.errors.push(`${role.id}: 找不到命令或 alias ${command}`);
+      }
+    }
+    if (SESSION_PATTERN.test(workbench?.session || "")) {
+      const existing = listSessionOptionsImpl().find((session) => session.name === workbench.session);
+      if (existing?.workspace && existing.workspace !== workbench.workspace) {
+        result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
+      } else if (existing?.status === "running" && !workbench.rebuild) {
+        result.warnings.push(`会话 ${workbench.session} 已在运行；当前配置不会覆盖它。请勾选「重建同名会话」或更换会话名称`);
+      }
+    }
+    result.valid = result.errors.length === 0;
+    return result;
+  }
+
+  return { checkCommands, validate };
 }
 
+const runtimeValidator = createRuntimeValidator();
+
 function validationWithRuntime(workbench) {
-  const result = validateWorkbench(workbench);
-  for (const role of workbench.roles || []) {
-    const command = commandForAgent(role.agent || "");
-    if (command && !commandAvailable(command)) result.errors.push(`${role.id}: 找不到命令或 alias ${command}`);
-  }
-  if (SESSION_PATTERN.test(workbench.session || "")) {
-    const existing = listSessionOptions().find((session) => session.name === workbench.session);
-    if (existing?.workspace && existing.workspace !== workbench.workspace) {
-      result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
-    } else if (existing?.status === "running" && !workbench.rebuild) {
-      result.warnings.push(`会话 ${workbench.session} 已在运行；当前配置不会覆盖它。请勾选「重建同名会话」或更换会话名称`);
-    }
-  }
-  result.valid = result.errors.length === 0;
-  return result;
+  return runtimeValidator.validate(workbench);
 }
 
 function configPreview(workbench) {

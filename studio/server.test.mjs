@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  createRuntimeValidator,
   createStudioServer,
   loadProjectState,
   openTerminalSession,
@@ -63,6 +64,20 @@ function fixture(workspace) {
       },
     ],
   };
+}
+
+function fakeRuntimeValidator(spawnSyncImpl, options = {}) {
+  return createRuntimeValidator({
+    spawnSyncImpl,
+    now: options.now || Date.now,
+    env: options.env || {},
+    hasZsh: options.hasZsh ?? true,
+    listSessionOptionsImpl: () => [],
+  });
+}
+
+function interactiveOutput(...available) {
+  return available.map((value) => `__GSB_STUDIO_COMMAND__${value ? 1 : 0}`).join("\n") + "\n";
 }
 
 test("Studio accepts an omitted project and still validates explicit project arguments", () => {
@@ -283,6 +298,134 @@ test("workbench validation protects Hub and role identity", () => {
     const result = validateWorkbench(invalid);
     assert.equal(result.valid, false);
     assert.ok(result.errors.some((message) => message.includes("必须且只能包含一个 hub")));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runtime command validation caches a repeated available command", () => {
+  const calls = [];
+  const validator = fakeRuntimeValidator((command, args) => {
+    calls.push({ command, args });
+    return { status: 0, signal: null, error: null };
+  });
+  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal(calls.length, 1);
+});
+
+test("runtime command validation expires negative cache entries after 30 seconds", () => {
+  let currentTime = 1_000;
+  const calls = [];
+  const validator = fakeRuntimeValidator((command) => {
+    calls.push(command);
+    return command === "/bin/zsh"
+      ? { status: 0, signal: null, error: null, stdout: interactiveOutput(false) }
+      : { status: 1, signal: null, error: null };
+  }, { now: () => currentTime });
+  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal(calls.length, 2);
+  currentTime += 29_999;
+  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal(calls.length, 2);
+  currentTime += 2;
+  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal(calls.length, 4);
+});
+
+test("runtime command validation keeps positive cache entries across TTL periods", () => {
+  let currentTime = 1_000;
+  let calls = 0;
+  const validator = fakeRuntimeValidator(() => {
+    calls += 1;
+    return { status: 0, signal: null, error: null };
+  }, { now: () => currentTime });
+  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  currentTime += 300_000;
+  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal(calls, 1);
+});
+
+test("runtime command timeout is a warning and does not invalidate the workbench", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-timeout-"));
+  try {
+    const validator = fakeRuntimeValidator((command) => command === "/bin/zsh"
+      ? { status: null, signal: "SIGTERM", error: { code: "ETIMEDOUT" } }
+      : { status: 1, signal: null, error: null });
+    const workbench = fixture(workspace);
+    workbench.roles[0].agent = "slow-agent";
+    const result = validator.validate(workbench);
+    assert.equal(result.valid, true);
+    assert.ok(result.warnings.some((message) => message.includes("slow-agent") && message.includes("检查超时")));
+    assert.ok(!result.errors.some((message) => message.includes("slow-agent")));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runtime command clean exit 1 is a not-found error", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-missing-"));
+  try {
+    const validator = fakeRuntimeValidator(() => ({ status: 1, signal: null, error: null }));
+    const workbench = fixture(workspace);
+    workbench.roles[0].agent = "missing-agent";
+    const result = validator.validate(workbench);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((message) => message.includes("找不到命令或 alias missing-agent")));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runtime command precheck avoids interactive shells when every command is available", () => {
+  const calls = [];
+  const validator = fakeRuntimeValidator((command, args) => {
+    calls.push({ command, args });
+    return { status: 0, signal: null, error: null };
+  });
+  const commands = ["claude", "codex", "kimi", "zellij"];
+  assert.deepEqual([...validator.checkCommands(commands).values()].map(({ available }) => available), [true, true, true, true]);
+  assert.equal(calls.filter(({ command }) => command === "/bin/zsh").length, 0);
+  assert.equal(calls.filter(({ command }) => command === "/bin/sh").length, 4);
+});
+
+test("runtime command misses use one positional-argument interactive batch", () => {
+  const calls = [];
+  const commands = ["alias-one", "alias two", "$(unsafe)"];
+  const validator = fakeRuntimeValidator((command, args) => {
+    calls.push({ command, args });
+    return command === "/bin/zsh"
+      ? { status: 0, signal: null, error: null, stdout: interactiveOutput(true, false, true) }
+      : { status: 1, signal: null, error: null };
+  });
+  const result = validator.checkCommands(commands);
+  assert.deepEqual([...result.values()].map(({ available }) => available), [true, false, true]);
+  const interactive = calls.filter(({ command }) => command === "/bin/zsh");
+  assert.equal(interactive.length, 1);
+  assert.deepEqual(interactive[0].args.slice(3), commands);
+  assert.ok(commands.every((command) => !interactive[0].args[1].includes(command)));
+});
+
+test("runtime command rollback switches restore strict and uncached behavior", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-switches-"));
+  try {
+    const strictValidator = fakeRuntimeValidator((command) => command === "/bin/zsh"
+      ? { status: null, signal: "SIGTERM", error: { code: "ETIMEDOUT" } }
+      : { status: 1, signal: null, error: null }, { env: { GSB_STUDIO_CHECK_STRICT: "on" } });
+    const workbench = fixture(workspace);
+    workbench.roles[0].agent = "slow-agent";
+    const strict = strictValidator.validate(workbench);
+    assert.equal(strict.valid, false);
+    assert.ok(strict.errors.some((message) => message.includes("slow-agent") && message.includes("检查超时")));
+
+    let calls = 0;
+    const uncachedValidator = fakeRuntimeValidator(() => {
+      calls += 1;
+      return { status: 0, signal: null, error: null };
+    }, { env: { GSB_STUDIO_CMD_CACHE: "off" } });
+    uncachedValidator.checkCommands(["codex"]);
+    uncachedValidator.checkCommands(["codex"]);
+    assert.equal(calls, 2);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
