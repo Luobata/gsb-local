@@ -218,12 +218,13 @@ function templateDetailView(template, currentProfile = "") {
 function projectDetailView(project, state, sessions, profileName, { landing = false } = {}) {
   const targetProject = clone(project);
   const targetWorkbench = clone(state.workbench);
-  const targetValidation = clone(state.validation);
+  const targetValidation = state.validation ? clone(state.validation) : null;
   const related = clone(sessions);
   const running = related.find((session) => session.status === "running") || null;
   const lastSession = [...related].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0] || null;
-  const errors = targetValidation.errors || [];
-  const warnings = targetValidation.warnings || [];
+  const errors = targetValidation?.errors || [];
+  const warnings = targetValidation?.warnings || [];
+  const validationPending = !targetValidation;
   return {
     kind: "project",
     key: `project:${targetProject.path}`,
@@ -236,7 +237,7 @@ function projectDetailView(project, state, sessions, profileName, { landing = fa
       ["记忆会话", targetWorkbench.session || lastSession?.name || "—"],
       ["运行状态", running ? `运行中 · ${running.name}` : lastSession ? `${lastSession.status} · ${lastSession.name}` : "无会话记录"],
       ["上次模板", profileName || targetWorkbench.profile || "CUSTOM"],
-      ["校验概览", `${errors.length} errors · ${warnings.length} warnings`],
+      ["校验概览", validationPending ? "校验中…" : `${errors.length} errors · ${warnings.length} warnings`],
     ],
     groups: [
       {
@@ -249,10 +250,12 @@ function projectDetailView(project, state, sessions, profileName, { landing = fa
       },
       {
         title: "VALIDATION NOTES",
-        items: [
-          ...errors.map((message) => ({ title: `ERROR · ${message}` })),
-          ...warnings.map((message) => ({ title: `WARN · ${message}` })),
-        ],
+        items: validationPending
+          ? [{ title: "校验中…", meta: "命令与配置检查完成后会自动更新", pending: true }]
+          : [
+            ...errors.map((message) => ({ title: `ERROR · ${message}` })),
+            ...warnings.map((message) => ({ title: `WARN · ${message}` })),
+          ],
         empty: "当前配置没有错误或警告。",
       },
     ],
@@ -311,9 +314,11 @@ function detailActionButtons(view) {
     if (view.target.running) actions.push(terminalOpenButton(view.target.running.name));
     const launch = element("button", "secondary-button", "▶ 用上次配置启动");
     launch.type = "button";
-    const error = view.target.validation.errors?.[0];
-    launch.disabled = !view.target.project.configured || Boolean(error);
-    launch.title = !view.target.project.configured ? "项目尚未配置" : (error || `启动 ${view.target.workbench.session}`);
+    const validationPending = !view.target.validation;
+    const error = view.target.validation?.errors?.[0];
+    launch.disabled = validationPending || !view.target.project.configured || Boolean(error);
+    launch.title = validationPending ? "正在校验项目配置" : !view.target.project.configured ? "项目尚未配置" : (error || `启动 ${view.target.workbench.session}`);
+    if (validationPending) launch.textContent = "校验中…";
     if (!view.target.project.configured) launch.textContent = "先配置项目";
     else if (error) launch.textContent = "配置需修正";
     launch.addEventListener("click", async () => {
@@ -377,6 +382,7 @@ function renderDetail(view = detailView) {
     const list = element("ul", "detail-list");
     group.items.forEach((item) => {
       const row = element("li");
+      row.classList.toggle("is-pending", Boolean(item.pending));
       row.append(element("b", "", item.title));
       if (item.meta) row.append(element("small", "", item.meta));
       list.append(row);
@@ -390,8 +396,12 @@ function renderDetail(view = detailView) {
 
 function toggleDetail(force, { restoreFocus = true } = {}) {
   const panel = $("#detail-panel");
+  const backdrop = $("#detail-backdrop");
   const open = force ?? !panel.classList.contains("is-open");
   panel.classList.toggle("is-open", open);
+  backdrop.classList.toggle("is-open", open);
+  backdrop.setAttribute("aria-hidden", String(!open));
+  document.body.classList.toggle("has-detail-open", open);
   panel.toggleAttribute("inert", !open);
   panel.setAttribute("aria-hidden", String(!open));
   if (open) {
@@ -834,10 +844,16 @@ async function openProjectDetail(project, trigger, options = {}) {
   openDetail(loading, trigger);
   trigger.setAttribute("aria-busy", "true");
   try {
-    const state = await projectLaunchState(project);
+    const renderProjectState = (state) => {
+      if (detailView?.key !== loading.key) return;
+      detailView = projectDetailView(project, state, sessionsForProject(project), profileName(state.workbench.profile), options);
+      renderDetail(detailView);
+    };
+    const state = await projectLaunchState(project, {
+      onProject: (workbench) => renderProjectState({ workbench, validation: null }),
+    });
     if (detailView?.key !== loading.key) return;
-    detailView = projectDetailView(project, state, sessionsForProject(project), profileName(state.workbench.profile), options);
-    renderDetail(detailView);
+    renderProjectState(state);
   } catch (error) {
     if (detailView?.key !== loading.key) return;
     detailView = {
@@ -883,25 +899,27 @@ function projectResource(project, { landing = false, recentProject = "" } = {}) 
   return button;
 }
 
-async function projectLaunchState(project) {
+function projectLaunchState(project, { onProject } = {}) {
   if (!projectLaunchCache.has(project.path)) {
-    const pending = (async () => {
-      const loaded = await api("/api/project", {
-        method: "POST",
-        body: JSON.stringify({ workspace: project.path, remember: false }),
-      });
+    const projectRequest = api("/api/project", {
+      method: "POST",
+      body: JSON.stringify({ workspace: project.path, remember: false }),
+    });
+    const pending = projectRequest.then(async (loaded) => {
       const checked = await api("/api/validate", {
         method: "POST",
         body: JSON.stringify({ workbench: loaded.workbench }),
       });
       return { workbench: loaded.workbench, validation: checked.validation };
-    })().catch((error) => {
+    }).catch((error) => {
       projectLaunchCache.delete(project.path);
       throw error;
     });
-    projectLaunchCache.set(project.path, pending);
+    projectLaunchCache.set(project.path, { projectRequest, pending });
   }
-  return projectLaunchCache.get(project.path);
+  const cached = projectLaunchCache.get(project.path);
+  if (onProject) cached.projectRequest.then((loaded) => onProject(loaded.workbench)).catch(() => {});
+  return cached.pending;
 }
 
 function confirmFullAccessLaunch(target) {
@@ -1703,6 +1721,7 @@ function bindEvents() {
   });
   $("#project-switcher").addEventListener("click", (event) => openProjectDetail(currentProjectOption(), event.currentTarget));
   $("#return-projects").addEventListener("click", returnToProjectLanding);
+  $("#detail-backdrop").addEventListener("click", () => toggleDetail(false));
 
   $$(".preview-tab").forEach((button) => button.addEventListener("click", () => { previewKind = button.dataset.preview; renderPreview(); }));
   $("#save-config").addEventListener("click", saveConfig);
