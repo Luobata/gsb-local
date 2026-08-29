@@ -4,7 +4,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
-const sectionIds = ["sec-projects", "sec-templates", "sec-roster", "sec-runtime"];
+const sectionIds = ["sec-templates", "sec-roster", "sec-runtime", "sec-validation"];
 const promptIntentMarker = "<!-- gsb:intent -->";
 
 const hubCapabilitySnippets = {
@@ -47,6 +47,8 @@ let validationRevision = 0;
 let persistentError = "";
 let detailView = null;
 let detailReturnFocus = null;
+let currentStep = 0;
+let visitedSteps = new Set([0]);
 const projectLaunchCache = new Map();
 
 function updateInPlace(update) {
@@ -275,7 +277,7 @@ function renderDetailEditState() {
   const node = $("#detail-edit-state");
   if (!node) return;
   const dirty = Boolean(workbench) && hasUnsavedChanges();
-  node.textContent = workbench ? `EDIT STATE · ${dirty ? "● 未保存" : "✓ 已保存"}` : "EDIT STATE · 未载入项目";
+  node.textContent = workbench ? `EDIT STATE · 草稿 ${dirty ? "● 未保存" : "✓ 已写入"}` : "EDIT STATE · 未载入项目";
   node.classList.toggle("is-dirty", dirty);
 }
 
@@ -326,13 +328,13 @@ function detailActionButtons(view) {
     edit.addEventListener("click", async () => {
       if (view.target.project.path === loadedWorkspace) {
         toggleDetail(false);
-        if (view.target.landing) scrollToSection("sec-templates");
+        if (view.target.landing) enterEditor();
         else toast("当前项目已在编辑器中");
         return;
       }
       if (!await loadProject(view.target.project.path)) return;
       toggleDetail(false);
-      if (view.target.landing) scrollToSection("sec-templates");
+      if (view.target.landing) enterEditor();
     });
     actions.push(launch, edit);
   }
@@ -342,13 +344,13 @@ function detailActionButtons(view) {
     edit.addEventListener("click", async () => {
       if (view.target.project.path === loadedWorkspace) {
         toggleDetail(false);
-        if (view.target.landing) scrollToSection("sec-templates");
+        if (view.target.landing) enterEditor();
         else toast("当前项目已在编辑器中");
         return;
       }
       if (!await loadProject(view.target.project.path)) return;
       toggleDetail(false);
-      if (view.target.landing) scrollToSection("sec-templates");
+      if (view.target.landing) enterEditor();
     });
     actions.push(edit);
   }
@@ -419,7 +421,7 @@ function hasUnsavedChanges() {
 
 function renderSaveState() {
   const dirty = hasUnsavedChanges();
-  $("#summary-save-state").textContent = `LIVE SPEC · ${dirty ? "●未保存" : "✓已保存"}`;
+  $("#summary-save-state").textContent = `LIVE SPEC · 草稿${dirty ? " ● 未保存" : " ✓ 已写入"}`;
   $("#discard-changes").hidden = !dirty || !cleanWorkbenchSnapshot;
   renderDetailEditState();
 }
@@ -558,7 +560,7 @@ async function createIndependentTemplate(name) {
   currentRole = 0;
   validationResult = null;
   renderAll();
-  scrollToSection("sec-roster");
+  goToStep("sec-roster");
   toast(`独立模板「${savedName}」已创建，现在可以逐个配置角色`);
   return true;
 }
@@ -902,7 +904,14 @@ async function projectLaunchState(project) {
   return projectLaunchCache.get(project.path);
 }
 
+function confirmFullAccessLaunch(target) {
+  return target.permission !== "full-access" || window.confirm(
+    `Full Access 会让 ${target.name || target.session || "此工作台"} 绕过内置 Agent 的审批与沙箱。确定以最高权限保存并启动吗？`,
+  );
+}
+
 async function executeQuickLaunch(target, button, statusNode = null) {
+  if (!confirmFullAccessLaunch(target)) return null;
   const label = button.textContent;
   let keepDisabled = false;
   button.disabled = true;
@@ -1008,14 +1017,7 @@ function renderResourceBrowser() {
 }
 
 function renderResourceBrowserContent() {
-  const projects = bootstrap.projectOptions || fallbackProjectOptions();
   const sessions = bootstrap.sessionOptions || fallbackSessionOptions();
-  $("#project-count").textContent = String(projects.length).padStart(2, "0");
-  const projectList = $("#project-options");
-  projectList.replaceChildren(...(projects.length
-    ? projects.map(projectResource)
-    : [resourceEmpty("没有可选项目", "选择一个目录后，它会出现在这里")]));
-
   $$('[data-session-filter]').forEach((button) => button.classList.toggle("is-active", button.dataset.sessionFilter === sessionFilter));
   const visibleSessions = sessionFilter === "project"
     ? sessions.filter((session) => session.workspace === workbench.workspace)
@@ -1044,10 +1046,58 @@ function renderProjectLanding() {
     : workbench?.workspace ? ` 当前项目：${workbench.workspace}` : " 选择项目后进入完整工作台。";
 }
 
+function currentProjectOption() {
+  const projects = bootstrap.projectOptions || fallbackProjectOptions();
+  const workspace = workbench?.workspace || "";
+  const sessions = sessionsForProject({ path: workspace });
+  return projects.find((project) => project.path === workspace) || {
+    path: workspace,
+    name: workspace.split("/").filter(Boolean).at(-1) || "当前项目",
+    configured: true,
+    sessions: sessions.length,
+    running: sessions.filter((session) => session.status === "running").length,
+  };
+}
+
+function renderEditorProjectBar() {
+  if (!workbench) return;
+  const project = currentProjectOption();
+  $("#editor-project-name").textContent = project.name;
+  $("#editor-project-path").textContent = project.path;
+  $("#project-switcher").title = `只读预览当前项目：${project.path}`;
+}
+
+function enterEditor(sectionId = "sec-templates") {
+  setWorkspaceReady(true);
+  goToStep(sectionId);
+}
+
+function returnToProjectLanding() {
+  const dirty = hasUnsavedChanges();
+  if (!confirmDiscard("返回项目列表")) return false;
+  if (dirty && cleanWorkbenchSnapshot) {
+    workbench = clone(cleanWorkbenchSnapshot);
+    loadedWorkspace = workbench.workspace || loadedWorkspace;
+    currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
+    validationResult = null;
+    validatedWorkbenchFingerprint = "";
+    renderAll();
+    markWorkbenchClean();
+  }
+  setWorkspaceReady(false);
+  renderProjectLanding();
+  $("#landing-project-path").focus();
+  return true;
+}
+
 function setWorkspaceReady(ready) {
-  ["sec-templates", "sec-roster", "sec-runtime"].forEach((id) => { document.getElementById(id).hidden = !ready; });
-  $$(".step[data-section]").forEach((button) => { if (button.dataset.section !== "sec-projects") button.hidden = !ready; });
+  $("#sec-projects").hidden = ready;
+  sectionIds.forEach((id) => { document.getElementById(id).hidden = !ready; });
+  $(".stepper").hidden = !ready;
+  $$(".step[data-section]").forEach((button) => { button.hidden = button.dataset.section === "sec-projects"; });
   $("#nav-validation").hidden = !ready;
+  $("#landing-head").hidden = ready;
+  $("#editor-project-bar").hidden = !ready;
   $(".summary-panel").hidden = !ready;
   $(".actionbar").hidden = !ready;
   $(".shell").classList.toggle("is-project-only", !ready);
@@ -1088,6 +1138,8 @@ async function loadProject(workspace, options = {}) {
     bootstrap.sessionOptions = result.sessionOptions;
     bootstrap.recentProjects = result.projectOptions.map((project) => project.path);
     currentRole = 0;
+    currentStep = 0;
+    visitedSteps = new Set([0]);
     validationResult = null;
     validatedWorkbenchFingerprint = "";
     setPersistentError();
@@ -1145,7 +1197,10 @@ function renderSummary() {
   $("#summary-session").textContent = workbench.session || "—";
   $("#summary-permission").textContent = (workbench.permission || "balanced").toUpperCase();
   $("#summary-watch").textContent = workbench.watchdog === false ? "OFF" : "ON";
-  $("#save-config").textContent = workbench.profile?.startsWith("user:") ? "保存配置并同步模板" : "仅保存配置";
+  $("#save-config").textContent = "保存配置";
+  $("#save-config-note").textContent = workbench.profile?.startsWith("user:")
+    ? "写入项目 · 同步当前模板"
+    : "写入项目 .gsb-local";
   $("#spoke-dots").replaceChildren(...workbench.roles.filter((role) => role.id !== "hub").map((role) => element("span", "spoke-dot", role.id.slice(0, 2).toUpperCase())));
   $("#summary-roster").replaceChildren(...workbench.roles.map((role) => {
     const item = element("li");
@@ -1155,6 +1210,7 @@ function renderSummary() {
     return item;
   }));
   renderSaveState();
+  renderWizardNavigation();
 }
 
 function renderAll() {
@@ -1164,8 +1220,10 @@ function renderAll() {
     renderProfiles();
     renderRoleList();
     renderRoleEditor();
+    renderEditorProjectBar();
     renderRuntime();
     renderSummary();
+    renderWizardNavigation();
   });
 }
 
@@ -1173,36 +1231,69 @@ function activateSection(sectionId) {
   $$(".step").forEach((node) => {
     const active = node.dataset.section === sectionId;
     node.classList.toggle("is-active", active);
-    node.setAttribute("aria-current", active ? "location" : "false");
+    node.setAttribute("aria-current", active ? "step" : "false");
   });
 }
 
-function scrollToSection(sectionId) {
-  document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  activateSection(sectionId);
+function stepComplete(sectionId) {
+  if (!workbench) return false;
+  if (sectionId === "sec-templates") return workbench.roles.length > 0 && workbench.roles.some((role) => role.id === "hub");
+  if (sectionId === "sec-roster") {
+    return workbench.roles.some((role) => role.id === "hub")
+      && workbench.roles.every((role) => typeof role.agent === "string" && role.agent.trim());
+  }
+  if (sectionId === "sec-runtime") return /^[A-Za-z0-9._-]+$/.test(workbench.session || "");
+  return validationResult?.valid === true && validatedWorkbenchFingerprint === workbenchFingerprint();
 }
 
-function observeSections() {
-  if (!("IntersectionObserver" in window)) return;
-  const observer = new IntersectionObserver((entries) => {
-    const visible = entries.filter((entry) => entry.isIntersecting).sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
-    if (visible) activateSection(visible.target.id);
-  }, { rootMargin: "-18% 0px -62%", threshold: [0, 0.25, 0.6] });
-  sectionIds.forEach((id) => observer.observe(document.getElementById(id)));
+function renderWizardNavigation() {
+  if (!workbench || $(".shell").classList.contains("is-project-only")) return;
+  sectionIds.forEach((id, index) => {
+    const section = document.getElementById(id);
+    const active = index === currentStep;
+    section.hidden = !active;
+    section.classList.toggle("is-active", active);
+  });
+  $$(".step[data-section]").forEach((button) => {
+    const index = sectionIds.indexOf(button.dataset.section);
+    const active = index === currentStep;
+    const complete = stepComplete(button.dataset.section);
+    button.classList.toggle("is-active", active);
+    button.classList.toggle("is-complete", complete);
+    button.classList.toggle("is-visited", visitedSteps.has(index));
+    button.setAttribute("aria-current", active ? "step" : "false");
+    const status = button.querySelector(".step-status");
+    status.textContent = active ? "●" : complete ? "✓" : "";
+    const title = button.querySelector("b")?.textContent || `步骤 ${index + 1}`;
+    button.setAttribute("aria-label", `${title}${active ? "，当前步骤" : complete ? "，已完成" : "，未完成"}`);
+  });
+  $("#previous-step").disabled = currentStep === 0;
+  $("#next-step").hidden = currentStep === sectionIds.length - 1;
+  $("#wizard-position").textContent = `${String(currentStep + 1).padStart(2, "0")} / ${String(sectionIds.length).padStart(2, "0")}`;
+  activateSection(sectionIds[currentStep]);
+}
+
+function goToStep(sectionId, { focus = true } = {}) {
+  const index = sectionIds.indexOf(sectionId);
+  if (index < 0 || !workbench) return false;
+  currentStep = index;
+  visitedSteps.add(index);
+  renderWizardNavigation();
+  if (sectionId === "sec-validation") validateAndRender();
+  if (focus) {
+    requestAnimationFrame(() => {
+      const heading = document.querySelector(`#${sectionId} h2`);
+      heading?.focus({ preventScroll: true });
+      window.scrollTo({ left: 0, top: Math.max(0, $(".shell").offsetTop - 10), behavior: "auto" });
+    });
+  }
+  return true;
 }
 
 function toggleValidation(force) {
-  const drawer = $("#validation-drawer");
-  const open = force ?? !drawer.classList.contains("is-open");
-  drawer.classList.toggle("is-open", open);
-  drawer.toggleAttribute("inert", !open);
-  drawer.setAttribute("aria-hidden", String(!open));
-  $("#nav-validation").setAttribute("aria-expanded", String(open));
-  $("#toggle-validation")?.setAttribute("aria-expanded", String(open));
-  if (open) {
-    if ($("#detail-panel").classList.contains("is-open")) toggleDetail(false, { restoreFocus: false });
-    validateAndRender();
-  }
+  if (force === false) return;
+  if ($("#detail-panel").classList.contains("is-open")) toggleDetail(false, { restoreFocus: false });
+  goToStep("sec-validation");
 }
 
 function syncLaunchButton() {
@@ -1233,6 +1324,7 @@ function renderValidation() {
     box.append(list);
   }
   syncLaunchButton();
+  renderWizardNavigation();
 }
 
 function renderPreview() {
@@ -1376,7 +1468,7 @@ function createRole(id, agent) {
   renderRoleEditor();
   renderSummary();
   scheduleValidation();
-  scrollToSection("sec-roster");
+  goToStep("sec-roster");
 }
 
 function removeRole() {
@@ -1422,6 +1514,7 @@ async function saveConfig() {
 }
 
 async function launch() {
+  if (!confirmFullAccessLaunch(workbench)) return;
   toggleValidation(true);
   const button = $("#launch-workbench");
   button.disabled = true;
@@ -1478,7 +1571,7 @@ async function launch() {
 async function browseForProject({ focusTemplates = false } = {}) {
   try {
     const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
-    if (await loadProject(result.path) && focusTemplates) scrollToSection("sec-templates");
+    if (await loadProject(result.path) && focusTemplates) goToStep("sec-templates");
   } catch (error) {
     if (!/取消/.test(error.message)) toast(error.message, "error");
   }
@@ -1488,14 +1581,14 @@ async function openLandingProjectPath() {
   const input = $("#landing-project-path");
   const workspace = input.value.trim();
   if (!workspace) return input.reportValidity();
-  if (await loadProject(workspace)) scrollToSection("sec-templates");
+  if (await loadProject(workspace)) goToStep("sec-templates");
 }
 
 function bindEvents() {
-  $$(".step[data-section]").forEach((button) => button.addEventListener("click", () => scrollToSection(button.dataset.section)));
-  $("#nav-validation").addEventListener("click", () => toggleValidation());
+  $$(".step[data-section]").forEach((button) => button.addEventListener("click", () => goToStep(button.dataset.section)));
+  $("#previous-step").addEventListener("click", () => goToStep(sectionIds[Math.max(0, currentStep - 1)]));
+  $("#next-step").addEventListener("click", () => goToStep(sectionIds[Math.min(sectionIds.length - 1, currentStep + 1)]));
   $("#toggle-validation").addEventListener("click", () => toggleValidation());
-  $("#close-validation").addEventListener("click", () => toggleValidation(false));
   $("#close-detail").addEventListener("click", () => toggleDetail(false));
   $("#add-role").addEventListener("click", addRole);
   $("#remove-role").addEventListener("click", removeRole);
@@ -1608,6 +1701,8 @@ function bindEvents() {
   $("#landing-project-path").addEventListener("keydown", (event) => {
     if (event.key === "Enter") openLandingProjectPath();
   });
+  $("#project-switcher").addEventListener("click", (event) => openProjectDetail(currentProjectOption(), event.currentTarget));
+  $("#return-projects").addEventListener("click", returnToProjectLanding);
 
   $$(".preview-tab").forEach((button) => button.addEventListener("click", () => { previewKind = button.dataset.preview; renderPreview(); }));
   $("#save-config").addEventListener("click", saveConfig);
@@ -1673,7 +1768,6 @@ function bindEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if ($("#detail-panel").classList.contains("is-open")) toggleDetail(false);
-    else if ($("#validation-drawer").classList.contains("is-open")) toggleValidation(false);
   });
 }
 
@@ -1696,7 +1790,6 @@ async function start() {
     setWorkspaceReady(false);
     renderProjectLanding();
   }
-  observeSections();
 }
 
 window.addEventListener("beforeunload", (event) => {
