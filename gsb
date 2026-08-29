@@ -11,6 +11,96 @@ while [[ -L "$SOURCE_PATH" ]]; do
 done
 ROOT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 
+watchdog_pid_is_alive() {
+  local watchdog_pid="$1"
+  [[ "$watchdog_pid" =~ ^[0-9]+$ ]] && kill -0 "$watchdog_pid" 2>/dev/null
+}
+
+cleanup_watchdog_artifacts() {
+  local watchdog_state_dir="$1"
+  rm -f \
+    "$watchdog_state_dir/watchdog.pid" \
+    "$watchdog_state_dir/watchdog.ready"
+  if [[ -d "$watchdog_state_dir/watchdog.lock" ]]; then
+    rmdir "$watchdog_state_dir/watchdog.lock" 2>/dev/null || {
+      printf 'Could not remove stale watchdog lock: %s\n' "$watchdog_state_dir/watchdog.lock" >&2
+      return 1
+    }
+  fi
+}
+
+launch_watchdog_from_session() {
+  local watchdog_state_dir="$1"
+  local watchdog_session="$2"
+  local watchdog_env_file="$watchdog_state_dir/session.env"
+  local watchdog_pid
+  local watchdog_ready_file="$watchdog_state_dir/watchdog.ready"
+  local watchdog_roles
+
+  if [[ -f "$watchdog_env_file" ]]; then
+    watchdog_pid="$(node -e '
+      const { spawn } = require("node:child_process");
+      const { openSync } = require("node:fs");
+      const log = openSync(process.argv[3], "a");
+      const child = spawn("bash", ["-c", "source \"$1\"; exec node \"$2\"", "_", process.argv[1], process.argv[2]], {
+        detached: true,
+        stdio: ["ignore", log, log],
+      });
+      child.unref();
+      process.stdout.write(String(child.pid));
+    ' "$watchdog_env_file" "$ROOT_DIR/bin/watchdog.mjs" "$watchdog_state_dir/watchdog.log")"
+  else
+    watchdog_roles="$(sed -n 's/^- \([a-z][a-z0-9-]*\):.*/\1/p' "$watchdog_state_dir/ROLES.md" 2>/dev/null | paste -sd, -)"
+    watchdog_pid="$(GSB_STATE_DIR="$watchdog_state_dir" \
+      GSB_SESSION="$watchdog_session" \
+      GSB_LOCAL_ROOT="$ROOT_DIR" \
+      GSB_ROLES="${watchdog_roles:-hub}" \
+      node -e '
+        const { spawn } = require("node:child_process");
+        const { openSync } = require("node:fs");
+        const log = openSync(process.argv[2], "a");
+        const child = spawn(process.execPath, [process.argv[1]], {
+          detached: true,
+          env: process.env,
+          stdio: ["ignore", log, log],
+        });
+        child.unref();
+        process.stdout.write(String(child.pid));
+      ' "$ROOT_DIR/bin/watchdog.mjs" "$watchdog_state_dir/watchdog.log")"
+  fi
+  printf '%s\n' "$watchdog_pid" > "$watchdog_state_dir/watchdog.pid"
+  for _ in {1..40}; do
+    if [[ -f "$watchdog_ready_file" ]] \
+      && [[ "$(cat "$watchdog_ready_file" 2>/dev/null || true)" == "$watchdog_pid" ]]; then
+      return 0
+    fi
+    if ! watchdog_pid_is_alive "$watchdog_pid"; then
+      break
+    fi
+    sleep 0.05
+  done
+  printf 'Watchdog failed to become ready for session %s. Inspect %s\n' \
+    "$watchdog_session" "$watchdog_state_dir/watchdog.log" >&2
+  return 1
+}
+
+ensure_open_watchdog() {
+  local watchdog_state_dir="$1"
+  local watchdog_session="$2"
+  local watchdog_enabled="$3"
+  local watchdog_pid=""
+  [[ "$watchdog_enabled" == true ]] || return 0
+  if [[ -f "$watchdog_state_dir/watchdog.pid" ]]; then
+    watchdog_pid="$(cat "$watchdog_state_dir/watchdog.pid" 2>/dev/null || true)"
+  fi
+  if watchdog_pid_is_alive "$watchdog_pid"; then
+    return 0
+  fi
+  printf 'Restarting missing or stale watchdog for active session: %s\n' "$watchdog_session"
+  cleanup_watchdog_artifacts "$watchdog_state_dir"
+  launch_watchdog_from_session "$watchdog_state_dir" "$watchdog_session"
+}
+
 # A Zellij server permanently inherits the environment of its creator. If GSB is
 # launched from inside another Claude tool process, these markers can make new
 # Claude panes look like nested sessions and suppress transcript persistence.
@@ -33,6 +123,110 @@ if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
   export TERM=xterm-256color
 fi
 
+if [[ "${1:-}" == "studio" ]]; then
+  shift
+  exec node "$ROOT_DIR/studio/server.mjs" "$@"
+fi
+
+if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
+  shift
+  OPEN_BACKGROUND=false
+  if [[ "${1:-}" == "--background" ]]; then
+    OPEN_BACKGROUND=true
+    shift
+  fi
+  OPEN_SESSION="${1:-}"
+  if [[ -z "$OPEN_SESSION" ]]; then
+    printf 'Usage: gsb-local open [--background] SESSION\n' >&2
+    exit 1
+  fi
+  if [[ -n "${2:-}" ]]; then
+    printf 'Unexpected argument after session name: %s\n' "$2" >&2
+    exit 1
+  fi
+  if [[ ! "$OPEN_SESSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'Session name may only contain letters, numbers, dot, underscore, and hyphen.\n' >&2
+    exit 1
+  fi
+  for required_command in zellij node; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      printf 'Missing required command: %s\n' "$required_command" >&2
+      exit 1
+    fi
+  done
+
+  OPEN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$OPEN_SESSION"
+  OPEN_METADATA="$OPEN_STATE_DIR/session.json"
+  OPEN_WORKSPACE=""
+  OPEN_FULL_ACCESS=false
+  OPEN_WATCHDOG=true
+  OPEN_CONFIG_SOURCE=""
+  OPEN_CONFIG_PATH=""
+  OPEN_CONFIG_PROFILE=""
+  OPEN_MODELS_CONFIG_PATH=""
+  if [[ -f "$OPEN_METADATA" ]]; then
+    OPEN_SAVED_SESSION="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" session)"
+    if [[ "$OPEN_SAVED_SESSION" != "$OPEN_SESSION" ]]; then
+      printf 'Session metadata mismatch: requested %s but metadata contains %s\n' "$OPEN_SESSION" "$OPEN_SAVED_SESSION" >&2
+      exit 1
+    fi
+    OPEN_WORKSPACE="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" workspace)"
+    OPEN_FULL_ACCESS="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" fullAccess 2>/dev/null || printf false)"
+    OPEN_WATCHDOG="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" watchdogEnabled 2>/dev/null || printf true)"
+    OPEN_CONFIG_SOURCE="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" configSource 2>/dev/null || true)"
+    OPEN_CONFIG_PATH="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" configPath 2>/dev/null || true)"
+    OPEN_CONFIG_PROFILE="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" configProfile 2>/dev/null || true)"
+    OPEN_MODELS_CONFIG_PATH="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" modelsConfigPath 2>/dev/null || true)"
+  elif [[ -f "$OPEN_STATE_DIR/TASK.md" ]]; then
+    # One-time compatibility for sessions created before session.json existed.
+    OPEN_WORKSPACE="$(sed -n 's/^Workspace: //p' "$OPEN_STATE_DIR/TASK.md" | head -n 1)"
+    if [[ -f "$OPEN_STATE_DIR/session.env" ]] && grep -q '^export GSB_FULL_ACCESS=true$' "$OPEN_STATE_DIR/session.env"; then
+      OPEN_FULL_ACCESS=true
+    fi
+  fi
+  if [[ -z "$OPEN_WORKSPACE" ]]; then
+    printf 'No durable GSB metadata found for session: %s\n' "$OPEN_SESSION" >&2
+    printf 'Start it once with: gsb-local /absolute/project/path %s\n' "$OPEN_SESSION" >&2
+    exit 1
+  fi
+  if [[ ! -d "$OPEN_WORKSPACE" ]]; then
+    printf 'Saved workspace no longer exists for %s: %s\n' "$OPEN_SESSION" "$OPEN_WORKSPACE" >&2
+    exit 1
+  fi
+
+  OPEN_SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
+  if printf '%s\n' "$OPEN_SESSION_LIST" | awk -v session="$OPEN_SESSION" '$1 == session && !/EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
+    ensure_open_watchdog "$OPEN_STATE_DIR" "$OPEN_SESSION" "$OPEN_WATCHDOG"
+    if [[ "$OPEN_BACKGROUND" == true ]]; then
+      printf 'Zellij session is already active in the background: %s\n' "$OPEN_SESSION"
+      exit 0
+    fi
+    printf 'Attaching to %s (workspace: %s)\n' "$OPEN_SESSION" "$OPEN_WORKSPACE"
+    exec zellij attach "$OPEN_SESSION"
+  fi
+
+  # Do not let a shell inside some other GSB session leak its runtime contract
+  # into the session being reopened. Reconstruct only from durable metadata.
+  for inherited_var in $(compgen -v GSB_); do
+    unset "$inherited_var"
+  done
+
+  OPEN_ARGS=()
+  [[ "$OPEN_BACKGROUND" == true ]] && OPEN_ARGS+=(--background)
+  [[ "$OPEN_FULL_ACCESS" == true ]] && OPEN_ARGS+=(--full-access)
+  if [[ "$OPEN_CONFIG_SOURCE" == profile && -n "$OPEN_CONFIG_PROFILE" ]]; then
+    OPEN_ARGS+=(--config "$OPEN_CONFIG_PROFILE")
+  elif [[ -n "$OPEN_CONFIG_PATH" && "$OPEN_CONFIG_SOURCE" == project && "$OPEN_CONFIG_PATH" != "$OPEN_WORKSPACE/.gsb-local/agents.conf" ]]; then
+    export GSB_CONFIG="$OPEN_CONFIG_PATH"
+  fi
+  if [[ -n "$OPEN_MODELS_CONFIG_PATH" && "$OPEN_MODELS_CONFIG_PATH" != "$OPEN_WORKSPACE/.gsb-local/models.conf" ]]; then
+    export GSB_MODELS_CONFIG="$OPEN_MODELS_CONFIG_PATH"
+  fi
+  export GSB_WATCHDOG_ENABLED="$OPEN_WATCHDOG"
+  printf 'Reopening %s from durable workspace: %s\n' "$OPEN_SESSION" "$OPEN_WORKSPACE"
+  exec "$ROOT_DIR/gsb" "${OPEN_ARGS[@]}" "$OPEN_WORKSPACE" "$OPEN_SESSION"
+fi
+
 if [[ "${1:-}" == "--check" ]]; then
   printf 'GSB Local: %s\n' "$ROOT_DIR"
   printf 'Zellij:   %s\n' "$(zellij --version 2>/dev/null || printf 'missing')"
@@ -47,12 +241,14 @@ PRINT_CONFIG=false
 BACKGROUND=false
 FULL_ACCESS=false
 CONFIG_PROFILE=""
+LIST_CONFIGS=false
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --rebuild) REBUILD=true ;;
     --print-config) PRINT_CONFIG=true ;;
     --background) BACKGROUND=true ;;
     --full-access) FULL_ACCESS=true ;;
+    --list-configs) LIST_CONFIGS=true ;;
     --config[0-9]*) CONFIG_PROFILE="${1#--}" ;;
     --config)
       if [[ -z "${2:-}" || "${2:-}" == --* ]]; then
@@ -65,7 +261,10 @@ while [[ "${1:-}" == --* ]]; do
     --help)
       printf '%s\n' \
         'Usage: gsb-local [--rebuild] [--background] [--full-access] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
+        '       gsb-local open [--background] SESSION' \
+        '       gsb-local studio [--project PATH] [--port PORT] [--no-open]' \
         '       gsb-local --print-config [WORKSPACE] [SESSION]' \
+        '       gsb-local --list-configs' \
         '       gsb-local --check'
       exit 0
       ;;
@@ -76,6 +275,21 @@ while [[ "${1:-}" == --* ]]; do
   esac
   shift
 done
+
+if [[ "$LIST_CONFIGS" == true ]]; then
+  for profile_path in "$ROOT_DIR"/profiles/*.conf; do
+    [[ -f "$profile_path" ]] || continue
+    profile_name="${profile_path##*/}"
+    profile_name="${profile_name%.conf}"
+    printf '%s:\n' "$profile_name"
+    while IFS= read -r profile_line || [[ -n "$profile_line" ]]; do
+      profile_line="$(printf '%s' "$profile_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      [[ -z "$profile_line" || "${profile_line:0:1}" == "#" ]] && continue
+      printf '  %s\n' "$profile_line"
+    done < "$profile_path"
+  done
+  exit 0
+fi
 
 WORKSPACE="${1:-$PWD}"
 SESSION="${2:-seed-gsb}"
@@ -95,7 +309,12 @@ if [[ "$FULL_ACCESS" == true ]]; then
 else
   export GSB_FULL_ACCESS=false
   export GSB_PERMISSION_PROFILE=balanced
+  export GSB_PERMISSION_MODE="${GSB_PERMISSION_MODE:-acceptEdits}"
+  export GSB_CODEX_APPROVAL="${GSB_CODEX_APPROVAL:-on-request}"
+  export GSB_CODEX_SANDBOX="${GSB_CODEX_SANDBOX:-workspace-write}"
+  export GSB_KIMI_PERMISSION="${GSB_KIMI_PERMISSION:-yolo}"
 fi
+export GSB_WATCHDOG_ENABLED="${GSB_WATCHDOG_ENABLED:-true}"
 
 if [[ ! -d "$WORKSPACE" ]]; then
   printf 'Workspace does not exist: %s\n' "$WORKSPACE" >&2
@@ -111,6 +330,8 @@ fi
 ROLE_PATTERN='^[a-z][a-z0-9-]*$'
 ROLES=()
 AGENT_SPECS=()
+MODEL_ROLES=()
+MODEL_SPECS=()
 
 canonical_role() {
   printf '%s' "${1//_/-}"
@@ -120,6 +341,12 @@ role_env_var() {
   local normalized
   normalized="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
   printf 'GSB_%s_AGENT' "$normalized"
+}
+
+role_model_env_var() {
+  local normalized
+  normalized="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+  printf 'GSB_%s_MODEL' "$normalized"
 }
 
 role_exists() {
@@ -148,10 +375,46 @@ add_role() {
   AGENT_SPECS[${#AGENT_SPECS[@]}]="$spec"
 }
 
+add_role_model() {
+  local role
+  role="$(canonical_role "$1")"
+  if ! role_exists "$role"; then
+    printf 'Model configured for inactive role in %s: %s\n' "$MODELS_CONFIG_PATH" "$role" >&2
+    exit 1
+  fi
+  for configured_role in ${MODEL_ROLES[@]+"${MODEL_ROLES[@]}"}; do
+    if [[ "$configured_role" == "$role" ]]; then
+      printf 'Duplicate model role in %s: %s\n' "$MODELS_CONFIG_PATH" "$role" >&2
+      exit 1
+    fi
+  done
+  MODEL_ROLES[${#MODEL_ROLES[@]}]="$role"
+  MODEL_SPECS[${#MODEL_SPECS[@]}]="$2"
+}
+
+model_for_role() {
+  local wanted="$1"
+  local model_index
+  for ((model_index = 0; model_index < ${#MODEL_ROLES[@]}; model_index++)); do
+    if [[ "${MODEL_ROLES[$model_index]}" == "$wanted" ]]; then
+      printf '%s' "${MODEL_SPECS[$model_index]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 prompt_for_role() {
   local role="$1"
   local project_prompt="$WORKSPACE/.gsb-local/prompts/$role.md"
   local builtin_prompt="$ROOT_DIR/prompts/$role.md"
+  # Hub orchestration is a GSB invariant. Project/template configuration may
+  # add capabilities through hub-extension.md, but it cannot replace the core.
+  if [[ "$role" == hub ]]; then
+    [[ -f "$builtin_prompt" ]] || return 1
+    printf '%s' "$builtin_prompt"
+    return 0
+  fi
   if [[ -f "$project_prompt" ]]; then
     printf '%s' "$project_prompt"
   elif [[ -f "$builtin_prompt" ]]; then
@@ -217,6 +480,33 @@ if ! role_exists hub; then
   exit 1
 fi
 
+REQUESTED_MODELS_PATH="${GSB_MODELS_CONFIG:-$WORKSPACE/.gsb-local/models.conf}"
+MODELS_CONFIG_PATH=""
+if [[ -f "$REQUESTED_MODELS_PATH" ]]; then
+  MODELS_CONFIG_PATH="$REQUESTED_MODELS_PATH"
+elif [[ -n "${GSB_MODELS_CONFIG:-}" ]]; then
+  printf 'GSB_MODELS_CONFIG does not exist: %s\n' "$REQUESTED_MODELS_PATH" >&2
+  exit 1
+fi
+
+if [[ -n "$MODELS_CONFIG_PATH" ]]; then
+  while IFS= read -r model_line || [[ -n "$model_line" ]]; do
+    trimmed_model_line="$(printf '%s' "$model_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$trimmed_model_line" || "${trimmed_model_line:0:1}" == "#" ]] && continue
+    if [[ "$trimmed_model_line" != *=* ]]; then
+      printf 'Invalid model config line in %s: %s\n' "$MODELS_CONFIG_PATH" "$model_line" >&2
+      exit 1
+    fi
+    model_key="$(printf '%s' "${trimmed_model_line%%=*}" | sed -e 's/[[:space:]]*$//')"
+    model_value="$(printf '%s' "${trimmed_model_line#*=}" | sed -e 's/^[[:space:]]*//')"
+    if [[ -z "$model_value" ]]; then
+      printf 'Empty model for %s in %s\n' "$model_key" "$MODELS_CONFIG_PATH" >&2
+      exit 1
+    fi
+    add_role_model "$model_key" "$model_value"
+  done < "$MODELS_CONFIG_PATH"
+fi
+
 for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
   role="${ROLES[$role_index]}"
   role_var="$(role_env_var "$role")"
@@ -225,6 +515,13 @@ for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
   fi
   printf -v "$role_var" '%s' "${AGENT_SPECS[$role_index]}"
   export "$role_var"
+  role_model_var="$(role_model_env_var "$role")"
+  if [[ -z "${!role_model_var:-}" ]] && configured_model="$(model_for_role "$role")"; then
+    printf -v "$role_model_var" '%s' "$configured_model"
+  fi
+  if [[ -n "${!role_model_var:-}" ]]; then
+    export "$role_model_var"
+  fi
   if ! prompt_for_role "$role" >/dev/null; then
     printf 'Missing prompt for active role %s. Add one at either:\n' "$role" >&2
     printf '  %s\n  %s\n' "$WORKSPACE/.gsb-local/prompts/$role.md" "$ROOT_DIR/prompts/$role.md" >&2
@@ -251,9 +548,11 @@ if [[ "$PRINT_CONFIG" == true ]]; then
   printf 'Roles:     %s\n' "$GSB_ROLES"
   printf 'Permissions: %s\n' "$GSB_PERMISSION_PROFILE"
   for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
-    printf '%-16s %-20s prompt=%s\n' \
+    role_model_var="$(role_model_env_var "${ROLES[$role_index]}")"
+    printf '%-16s %-20s model=%-24s prompt=%s\n' \
       "${ROLES[$role_index]}:" \
       "${AGENT_SPECS[$role_index]}" \
+      "${!role_model_var:-<agent-default>}" \
       "$(prompt_for_role "${ROLES[$role_index]}")"
   done
   exit 0
@@ -313,22 +612,109 @@ export GSB_SESSION="$SESSION"
 export GSB_AGENT="${GSB_AGENT:-claude}"
 export GSB_STATE_DIR="${GSB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$SESSION}"
 export GSB_CONFIG_PATH="$CONFIG_PATH"
+export GSB_MODELS_CONFIG_PATH="$MODELS_CONFIG_PATH"
+export GSB_CONFIG_SOURCE="$CONFIG_SOURCE"
+export GSB_CONFIG_PROFILE="$CONFIG_PROFILE"
 export GSB_PROTOCOL_FILE="$ROOT_DIR/protocol/dispatch.md"
 export GSB_ROLE_ROSTER="$GSB_STATE_DIR/ROLES.md"
 export GSB_LAYOUT_FILE="$GSB_STATE_DIR/layouts/current.kdl"
+export GSB_SESSION_ENV_FILE="$GSB_STATE_DIR/session.env"
+export GSB_SESSION_METADATA_FILE="$GSB_STATE_DIR/session.json"
+
+existing_workspace=""
+if [[ -f "$GSB_SESSION_METADATA_FILE" ]]; then
+  if ! existing_workspace="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$GSB_SESSION_METADATA_FILE" workspace)"; then
+    printf 'Refusing to overwrite invalid session metadata: %s\n' "$GSB_SESSION_METADATA_FILE" >&2
+    exit 1
+  fi
+  existing_session="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$GSB_SESSION_METADATA_FILE" session)"
+  if [[ "$existing_session" != "$SESSION" ]]; then
+    printf 'Session metadata mismatch: requested %s but metadata contains %s\n' "$SESSION" "$existing_session" >&2
+    exit 1
+  fi
+elif [[ -f "$GSB_STATE_DIR/TASK.md" ]]; then
+  existing_workspace="$(sed -n 's/^Workspace: //p' "$GSB_STATE_DIR/TASK.md" | head -n 1)"
+fi
+if [[ -n "$existing_workspace" && "$existing_workspace" != "$WORKSPACE" ]]; then
+  printf 'Session %s belongs to a different workspace.\n' "$SESSION" >&2
+  printf '  Saved:     %s\n' "$existing_workspace" >&2
+  printf '  Requested: %s\n' "$WORKSPACE" >&2
+  printf 'Choose another session name, or reopen the saved session with: gsb-local open %s\n' "$SESSION" >&2
+  exit 1
+fi
+
+# Attaching to an already-running session must be read-only. In particular,
+# do not rewrite its environment, roster, layout, or metadata from whichever
+# directory/config happened to invoke gsb-local a second time.
+SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
+if [[ "$REBUILD" != true ]] && printf '%s\n' "$SESSION_LIST" | \
+    awk -v session="$SESSION" '$1 == session && !/EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
+  if [[ "$BACKGROUND" == true ]]; then
+    printf 'Zellij session is already active in the background: %s\n' "$SESSION"
+    exit 0
+  fi
+  printf 'Attaching to active Zellij session: %s\n' "$SESSION"
+  exec zellij attach "$SESSION"
+fi
 
 mkdir -p "$GSB_STATE_DIR/reports" "$GSB_STATE_DIR/contracts" "$GSB_STATE_DIR/layouts" "$GSB_STATE_DIR/agent-files"
 for role in "${ROLES[@]}"; do
   mkdir -p "$GSB_STATE_DIR/inbox/$role" "$GSB_STATE_DIR/inbox-archive/$role"
 done
 
+# A persistent Zellij server keeps the environment of the process that first
+# created it. Never rely on that server-global environment for a GSB pane:
+# write the complete session-scoped runtime contract and source it from every
+# generated pane before supervise/run-agent starts.
+session_env_tmp="$GSB_SESSION_ENV_FILE.$$.tmp"
+write_session_export() {
+  local variable_name="$1"
+  local variable_value="${!variable_name:-}"
+  printf 'export %s=%q\n' "$variable_name" "$variable_value"
+}
+{
+  printf '%s\n' '# Generated by gsb-local. Session-scoped; do not share across workspaces.'
+  for runtime_var in \
+    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR \
+    GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE \
+    GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE \
+    GSB_SESSION_METADATA_FILE GSB_ROLES GSB_WATCHDOG_ENABLED \
+    GSB_FULL_ACCESS GSB_PERMISSION_PROFILE GSB_PERMISSION_MODE \
+    GSB_CODEX_APPROVAL GSB_CODEX_SANDBOX GSB_KIMI_PERMISSION; do
+    write_session_export "$runtime_var"
+  done
+  for optional_var in GSB_MODEL GSB_EFFORT GSB_KIMI_MODEL GSB_KIMI_HOST_CWD; do
+    if [[ -n "${!optional_var:-}" ]]; then
+      write_session_export "$optional_var"
+    else
+      printf 'unset %s\n' "$optional_var"
+    fi
+  done
+  for role in "${ROLES[@]}"; do
+    role_var="$(role_env_var "$role")"
+    write_session_export "$role_var"
+    role_model_var="$(role_model_env_var "$role")"
+    if [[ -n "${!role_model_var:-}" ]]; then
+      write_session_export "$role_model_var"
+    else
+      printf 'unset %s\n' "$role_model_var"
+    fi
+  done
+} > "$session_env_tmp"
+chmod 600 "$session_env_tmp"
+mv "$session_env_tmp" "$GSB_SESSION_ENV_FILE"
+
+node "$ROOT_DIR/bin/session-meta.mjs" write "$GSB_SESSION_METADATA_FILE"
+
 roster_tmp="$GSB_STATE_DIR/.ROLES.md.$$.tmp"
 {
   printf '%s\n' '# GSB Active Role Roster' '' "Session: $SESSION" "Workspace: $WORKSPACE" '' '## Active roles' ''
   for ((role_index = 0; role_index < ${#ROLES[@]}; role_index++)); do
-    printf -- '- %s: `%s` (prompt: `%s`)\n' \
+    role_model_var="$(role_model_env_var "${ROLES[$role_index]}")"
+    printf -- '- %s: `%s` (model: `%s`, prompt: `%s`)\n' \
       "${ROLES[$role_index]}" \
       "${AGENT_SPECS[$role_index]}" \
+      "${!role_model_var:-agent-default}" \
       "$(prompt_for_role "${ROLES[$role_index]}")"
   done
   printf '%s\n' '' 'Only roles in this roster are active. Removing a role from agents.conf and rebuilding removes its pane and routing authority while retaining historical files.'
@@ -406,57 +792,87 @@ if [[ "$FULL_ACCESS" == true ]]; then
   printf 'WARNING: full-access enabled; built-in agents will run without normal approval or sandbox protections.\n' >&2
 fi
 
-SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
 if [[ "$REBUILD" == true ]] && printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
   printf 'Rebuilding Zellij session with current configuration: %s\n' "$SESSION"
   zellij delete-session --force "$SESSION" >/dev/null
 elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session && /EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
   printf 'Rebuilding dead Zellij session: %s\n' "$SESSION"
   zellij delete-session "$SESSION" >/dev/null
-elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
-  if [[ "$BACKGROUND" == true ]]; then
-    printf 'Zellij session is already active in the background: %s\n' "$SESSION"
-    exit 0
-  else
-    printf 'Attaching to active Zellij session: %s\n' "$SESSION"
-    exec zellij attach "$SESSION"
-  fi
 fi
 
-# Launch the in-session error watchdog for this session's spoke panes. Only
-# reached when creating a new session (attach paths exit/exec above), so a
-# rebuild first stops any previous watchdog via its pidfile. The watchdog
-# exits on its own when the zellij session disappears.
-if [[ "${GSB_WATCHDOG_ENABLED:-true}" == true ]]; then
+stop_watchdog() {
   watchdog_pidfile="$GSB_STATE_DIR/watchdog.pid"
   if [[ -f "$watchdog_pidfile" ]]; then
     previous_watchdog="$(cat "$watchdog_pidfile" 2>/dev/null || true)"
     if [[ -n "$previous_watchdog" ]] && kill -0 "$previous_watchdog" 2>/dev/null; then
       kill "$previous_watchdog" 2>/dev/null || true
     fi
-    rm -f "$watchdog_pidfile"
   fi
-  rm -rf "$GSB_STATE_DIR/watchdog.lock"
-  nohup node "$ROOT_DIR/bin/watchdog.mjs" </dev/null >>"$GSB_STATE_DIR/watchdog.log" 2>&1 &
-  printf '%s\n' "$!" > "$watchdog_pidfile"
-  disown 2>/dev/null || true
+  cleanup_watchdog_artifacts "$GSB_STATE_DIR"
+}
+
+start_watchdog() {
+  [[ "${GSB_WATCHDOG_ENABLED:-true}" == true ]] || return 0
+  launch_watchdog_from_session "$GSB_STATE_DIR" "$SESSION"
+}
+
+# The watchdog must not query a session while Zellij is still constructing it.
+# Zellij 0.44.3 can also hang or panic its per-session server during rapid
+# kill/recreate cycles. Bound each create attempt, probe whether the server
+# actually became live, and retry once instead of hanging the caller forever.
+stop_watchdog
+
+create_zellij_session() {
+  node "$ROOT_DIR/bin/run-with-timeout.mjs" 15000 \
+    zellij --layout "$GSB_LAYOUT_FILE" attach \
+      --create-background "$SESSION" \
+      options \
+      --default-cwd "$WORKSPACE" \
+      --disable-session-metadata true \
+      --on-force-close detach \
+      --session-serialization false \
+      --show-startup-tips false
+}
+
+session_created=false
+for create_attempt in 1 2; do
+  create_status=0
+  create_zellij_session || create_status=$?
+  if zellij list-sessions --no-formatting 2>/dev/null | \
+      awk -v session="$SESSION" '$1 == session && !/EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
+    session_created=true
+    break
+  fi
+  if [[ "$create_attempt" -lt 2 ]]; then
+    printf 'Zellij create attempt %s failed (status %s); retrying once.\n' "$create_attempt" "$create_status" >&2
+    sleep 1
+  fi
+done
+if [[ "$session_created" != true ]]; then
+  printf 'Failed to create Zellij session %s. Inspect %s for server details.\n' \
+    "$SESSION" "${TMPDIR:-/tmp}/zellij-$(id -u)/zellij-log/zellij.log" >&2
+  exit 1
 fi
+
+session_ready=false
+for _ in {1..50}; do
+  if zellij list-sessions --no-formatting 2>/dev/null | \
+      awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
+    session_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$session_ready" != true ]]; then
+  printf 'Zellij did not publish session %s after creation. Watchdog was not started.\n' "$SESSION" >&2
+  exit 1
+fi
+
+start_watchdog
 
 if [[ "$BACKGROUND" == true ]]; then
-  exec zellij attach \
-    --create-background "$SESSION" \
-    options \
-    --default-cwd "$WORKSPACE" \
-    --default-layout "$GSB_LAYOUT_FILE" \
-    --on-force-close detach \
-    --show-startup-tips false
+  printf 'Zellij session created in background: %s\n' "$SESSION"
+  exit 0
 fi
 
-exec zellij \
-  --session "$SESSION" \
-  options \
-  --attach-to-session true \
-  --default-cwd "$WORKSPACE" \
-  --default-layout "$GSB_LAYOUT_FILE" \
-  --on-force-close detach \
-  --show-startup-tips false
+exec zellij attach "$SESSION"

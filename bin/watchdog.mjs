@@ -19,11 +19,12 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { detectWake } from "./wake-detect.mjs";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (also exercised by --selftest)
@@ -58,40 +59,99 @@ export function spokeTitle(session, role) {
   return `spk.${session}.${role}`;
 }
 
+export function paneTitleMatches(title, base) {
+  return title === base || title.startsWith(`${base} · `);
+}
+
+export function parseWatchdogPid(value) {
+  const text = String(value || "").trim();
+  if (!/^\d+$/.test(text)) return null;
+  const pid = Number(text);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+export function watchdogPidIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+export function wakePrefixForRole(role) {
+  return `A durable GSB contract or mailbox message is available for ${role}.`;
+}
+
 // Resolve live panes for the given spoke roles. Returns Map<role, pane>.
 // A role with zero or multiple live panes is omitted (supervise handles exits).
 export function resolveSpokePanes(panes, session, roles) {
   const resolved = new Map();
   for (const role of roles) {
     const title = spokeTitle(session, role);
-    const hits = panes.filter((pane) => !pane.is_plugin && !pane.exited && pane.title === title);
+    const hits = panes.filter(
+      (pane) => !pane.is_plugin && !pane.exited && paneTitleMatches(pane.title, title),
+    );
     if (hits.length === 1) resolved.set(role, hits[0]);
   }
   return resolved;
 }
 
+export function isKimiTarget(role, pane, env = process.env) {
+  const key = `GSB_${role.replaceAll("-", "_").toUpperCase()}_AGENT`;
+  const spec = env[key] || "";
+  return spec === "kimi" || spec.startsWith("kimi:") || /kimi/i.test(pane?.title || "");
+}
+
 // Decide what to do for one role this poll. Pure except for mutating the
 // streak counter on `st`; all side effects happen in applyAction().
 //
-// obs = { hasPane, focused, idle, matched }
-// Returns { action: "forget"|"guard-focus"|"reset"|"clear"|"observe"|"soft"|"hard"|"escalate" }
+// obs = { hasPane, focused, idle, matched, draft }
+// Error recovery has priority over the orthogonal wake-draft fallback.
 export function decideAction(st, obs, now, config) {
   if (!obs.hasPane) return { action: "forget" };
   if (obs.focused || st.prevFocused) return { action: "guard-focus" };
-  if (!obs.idle) return { action: "reset", wasStreak: st.errorStreak > 0 };
-  if (!obs.matched) return { action: "clear", wasStreak: st.errorStreak > 0 };
-
-  st.errorStreak += 1;
-  if (st.errorStreak < config.stalePolls) return { action: "observe" };
-  if (now < st.escalatedUntil) return { action: "observe" };
-  if (now - st.lastActionAt < config.cooldown) return { action: "observe" };
-
-  const recentSoft = st.softTimes.filter((t) => now - t < 3600).length;
-  if (!st.softPending && recentSoft < config.maxSoft) {
-    return { action: "soft", retryText: config.retryText };
+  if (!obs.idle) {
+    return {
+      action: "reset",
+      wasStreak: st.errorStreak > 0,
+      wasDraft: st.draftStreak > 0 || st.draftAttempts > 0,
+    };
   }
-  if (config.hardRestart) return { action: "hard" };
-  return { action: "escalate", recentSoft };
+
+  if (obs.matched) {
+    st.draftStreak = 0;
+    st.draftAttempts = 0;
+    st.errorStreak += 1;
+    if (st.errorStreak < config.stalePolls) return { action: "observe" };
+    if (now < st.escalatedUntil) return { action: "observe" };
+    if (now - st.lastActionAt < config.cooldown) return { action: "observe" };
+
+    const recentSoft = st.softTimes.filter((t) => now - t < 3600).length;
+    if (!st.softPending && recentSoft < config.maxSoft) {
+      return { action: "soft", retryText: config.retryText };
+    }
+    if (config.hardRestart) return { action: "hard" };
+    return { action: "escalate", recentSoft };
+  }
+
+  if (config.draftRecovery && obs.draft) {
+    st.errorStreak = 0;
+    st.softPending = false;
+    st.draftStreak += 1;
+    if (st.draftStreak < config.draftPolls) return { action: "observe" };
+    if (now < st.escalatedUntil) return { action: "observe" };
+    if (now - st.lastActionAt < config.cooldown) return { action: "observe" };
+    if (st.draftAttempts < config.draftMaxEnter) return { action: "draft-enter" };
+    return { action: "draft-escalate", attempts: st.draftAttempts };
+  }
+
+  return {
+    action: "clear",
+    wasStreak: st.errorStreak > 0,
+    wasDraft: st.draftStreak > 0 || st.draftAttempts > 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +174,10 @@ const CONFIG = {
   maxSoft: Number(process.env.GSB_WATCHDOG_MAX_SOFT || 3),
   cooldown: Number(process.env.GSB_WATCHDOG_COOLDOWN || 300),
   escalateBackoff: Number(process.env.GSB_WATCHDOG_ESCALATE_BACKOFF || 900),
+  kimiSettleMs: Number(process.env.GSB_KIMI_NUDGE_SETTLE_SECONDS || 0.20) * 1000,
+  draftRecovery: process.env.GSB_WATCHDOG_DRAFT_RECOVERY !== "false",
+  draftPolls: Number(process.env.GSB_WATCHDOG_DRAFT_POLLS || 2),
+  draftMaxEnter: Number(process.env.GSB_WATCHDOG_DRAFT_MAX_ENTER || 3),
 };
 const PATTERNS_FILE =
   process.env.GSB_WATCHDOG_PATTERNS ||
@@ -147,6 +211,10 @@ function sendKeys(paneId, keys) {
   zellij(["action", "send-keys", "--pane-id", String(paneId), ...keys]);
 }
 
+function sleepMs(milliseconds) {
+  if (milliseconds > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
 function freshState() {
   return {
     prevHash: null,
@@ -156,6 +224,8 @@ function freshState() {
     softTimes: [],
     lastActionAt: 0,
     escalatedUntil: 0,
+    draftStreak: 0,
+    draftAttempts: 0,
   };
 }
 
@@ -167,7 +237,8 @@ function markerPath(role) {
 
 // Drop a blocker envelope directly into Hub's inbox and wake it. Hub reads
 // mailbox payloads as untrusted data, so a watchdog-sourced message is safe.
-function notifyHub(role, detail) {
+function notifyHub(role, detail, issue = "error") {
+  const draftIssue = issue === "draft";
   const ts = new Date().toISOString();
   const id = `${ts.replace(/[-:.TZ]/g, "")}-watchdog-${randomBytes(4).toString("hex")}`;
   const envelope = {
@@ -180,9 +251,13 @@ function notifyHub(role, detail) {
     kind: "blocker",
     ts,
     payload: {
-      question: `${role} pane shows a persistent error and automatic soft recovery failed`,
-      missing: "manual intervention: inspect the pane, or rebuild the session with --rebuild",
-      safe_fallback: "no_safe_fallback",
+      question: draftIssue
+        ? `${role} pane retains an unsubmitted GSB wake-up after automatic Enter retries`
+        : `${role} pane shows a persistent error and automatic soft recovery failed`,
+      missing: draftIssue
+        ? "manual intervention: press Enter, or clear the draft and resend nudge"
+        : "manual intervention: inspect the pane, or rebuild the session with --rebuild",
+      safe_fallback: draftIssue ? "manually press Enter or clear and resend nudge" : "no_safe_fallback",
       detail,
     },
   };
@@ -212,30 +287,60 @@ function applyAction(role, pane, st, action, now) {
       // after this poll so the next one may act.
       st.prevFocused = Boolean(pane.is_focused);
       st.prevHash = null;
+      st.draftStreak = 0;
+      st.draftAttempts = 0;
       break;
     case "reset":
       if (action.wasStreak) log(`role=${role} screen active again; error streak reset`);
       st.errorStreak = 0;
       st.softPending = false;
       st.prevFocused = false;
+      st.draftStreak = 0;
+      st.draftAttempts = 0;
       break;
     case "clear":
       if (action.wasStreak) log(`role=${role} error pattern cleared`);
+      if (action.wasDraft) log(`role=${role} wake draft cleared`);
       st.errorStreak = 0;
       st.softPending = false;
       st.prevFocused = false;
+      st.draftStreak = 0;
+      st.draftAttempts = 0;
       break;
     case "observe":
       st.prevFocused = false;
       break;
     case "soft":
       writeChars(pane.id, action.retryText);
+      if (isKimiTarget(role, pane)) sleepMs(CONFIG.kimiSettleMs);
       sendKeys(pane.id, ["Enter"]);
       st.softPending = true;
       st.softTimes.push(now);
       st.lastActionAt = now;
       st.prevFocused = false;
+      st.draftStreak = 0;
+      st.draftAttempts = 0;
       log(`role=${role} soft recovery: sent "${action.retryText}" + Enter (streak=${st.errorStreak})`);
+      break;
+    case "draft-enter":
+      sendKeys(pane.id, ["Enter"]);
+      st.draftAttempts += 1;
+      st.draftStreak = 0;
+      st.lastActionAt = now;
+      st.prevFocused = false;
+      log(`role=${role} wake draft recovery: sent Enter (attempt=${st.draftAttempts}/${CONFIG.draftMaxEnter})`);
+      break;
+    case "draft-escalate":
+      notifyHub(
+        role,
+        `wake-up prefix remained in the input region after ${action.attempts} automatic Enter attempts`,
+        "draft",
+      );
+      st.draftStreak = 0;
+      st.escalatedUntil = now + CONFIG.escalateBackoff;
+      st.lastActionAt = now;
+      st.prevFocused = false;
+      log(`role=${role} wake draft escalated to hub after ${action.attempts} Enter attempts`);
       break;
     case "hard":
       mkdirSync(path.dirname(markerPath(role)), { recursive: true });
@@ -245,6 +350,8 @@ function applyAction(role, pane, st, action, now) {
       st.errorStreak = 0;
       st.lastActionAt = now;
       st.prevFocused = false;
+      st.draftStreak = 0;
+      st.draftAttempts = 0;
       log(`role=${role} hard restart: marker set, sent Ctrl-c`);
       break;
     case "escalate":
@@ -279,11 +386,13 @@ function poll(panes, patterns, now) {
         continue;
       }
       const hash = sha256(screen);
+      const wake = detectWake(screen, wakePrefixForRole(role));
       obs = {
         hasPane: true,
         focused: Boolean(pane.is_focused),
         idle: st.prevHash !== null && st.prevHash === hash,
         matched: matchError(screen, patterns, CONFIG.bottomLines),
+        draft: wake.draft,
       };
       st.prevHash = hash;
     }
@@ -309,17 +418,46 @@ async function main() {
   }
 
   const lockDir = path.join(STATE_DIR, "watchdog.lock");
+  const readyFile = path.join(STATE_DIR, "watchdog.ready");
+  const pidFile = path.join(STATE_DIR, "watchdog.pid");
   mkdirSync(STATE_DIR, { recursive: true });
   try {
     mkdirSync(lockDir);
   } catch (error) {
     if (error.code === "EEXIST") {
-      console.error("watchdog: another instance holds the lock; exiting");
-      process.exit(0);
+      let existingPid = null;
+      try {
+        existingPid = parseWatchdogPid(readFileSync(pidFile, "utf8"));
+      } catch {
+        // A missing or malformed PID cannot prove that the lock is live.
+      }
+      if (watchdogPidIsAlive(existingPid)) {
+        console.error(`watchdog: live pid ${existingPid} holds the lock; exiting`);
+        process.exit(0);
+      }
+      log(`reclaiming stale lock pid=${existingPid ?? "missing"}`);
+      for (const staleFile of [readyFile, pidFile]) {
+        try {
+          unlinkSync(staleFile);
+        } catch {
+          // best effort
+        }
+      }
+      rmdirSync(lockDir);
+      mkdirSync(lockDir);
+    } else {
+      throw error;
     }
-    throw error;
   }
+  writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 });
   const cleanup = () => {
+    for (const ownedFile of [readyFile, pidFile]) {
+      try {
+        if (parseWatchdogPid(readFileSync(ownedFile, "utf8")) === process.pid) unlinkSync(ownedFile);
+      } catch {
+        // best effort
+      }
+    }
     try {
       rmdirSync(lockDir);
     } catch {
@@ -338,8 +476,10 @@ async function main() {
   log(
     `started session=${SESSION} interval=${CONFIG.interval}s bottom=${CONFIG.bottomLines} ` +
       `stale=${CONFIG.stalePolls} soft_max=${CONFIG.maxSoft}/h cooldown=${CONFIG.cooldown}s ` +
-      `hard_restart=${CONFIG.hardRestart} patterns=${patterns.length}`,
+      `hard_restart=${CONFIG.hardRestart} draft=${CONFIG.draftRecovery} ` +
+      `draft_polls=${CONFIG.draftPolls} draft_max=${CONFIG.draftMaxEnter} patterns=${patterns.length}`,
   );
+  writeFileSync(readyFile, `${process.pid}\n`, { mode: 0o600 });
 
   let sessionFailures = 0;
   for (;;) {
@@ -398,9 +538,18 @@ function runSelfTest() {
   test("matchError passes on clean screen", matchError("analyzing repo\ntests passing", patterns, 15) === false);
 
   test("spokeTitle format", spokeTitle("s1", "core-bug") === "spk.s1.core-bug");
+  test("paneTitleMatches accepts legacy title", paneTitleMatches("spk.s1.core-bug", "spk.s1.core-bug"));
+  test(
+    "paneTitleMatches accepts model suffix",
+    paneTitleMatches("spk.s1.core-bug · claude-0812", "spk.s1.core-bug"),
+  );
+  test(
+    "paneTitleMatches rejects another role",
+    paneTitleMatches("spk.s1.ui · kimi-code/k3-256k", "spk.s1.core-bug") === false,
+  );
 
   const panes = [
-    { id: "terminal_1", title: "spk.s1.core-bug", is_plugin: false, exited: false, is_focused: false },
+    { id: "terminal_1", title: "spk.s1.core-bug · claude-0812", is_plugin: false, exited: false, is_focused: false },
     { id: "terminal_2", title: "hub.s1.main", is_plugin: false, exited: false, is_focused: true },
     { id: "terminal_3", title: "spk.s1.core-bug", is_plugin: false, exited: true, is_focused: false },
     { id: "plugin_1", title: "spk.s1.ui", is_plugin: true, exited: false, is_focused: false },
@@ -410,9 +559,32 @@ function runSelfTest() {
   test("resolveSpokePanes picks the live pane", resolved.get("core-bug")?.id === "terminal_1");
   test("resolveSpokePanes resolves other roles", resolved.get("ui")?.id === "terminal_4");
   test("resolveSpokePanes omits roles without a pane", resolved.has("ops-gov") === false);
+  test("isKimiTarget detects configured Kimi", isKimiTarget("ui", { title: "spk.s1.ui" }, { GSB_UI_AGENT: "kimi" }));
+  test("isKimiTarget detects Kimi title", isKimiTarget("ui", { title: "spk.s1.ui · kimi-code/k3-256k" }, {}));
+  test("isKimiTarget leaves Codex instant", !isKimiTarget("ui", { title: "spk.s1.ui · gpt-5.6-sol" }, { GSB_UI_AGENT: "codex" }));
+  test("parseWatchdogPid accepts a positive integer", parseWatchdogPid("123\n") === 123);
+  test("parseWatchdogPid rejects malformed content", parseWatchdogPid("12x") === null);
+  test("watchdogPidIsAlive sees the self-test process", watchdogPidIsAlive(process.pid));
+  test(
+    "wakePrefixForRole matches the fixed spoke wake-up",
+    wakePrefixForRole("coder") === "A durable GSB contract or mailbox message is available for coder.",
+  );
+  test(
+    "shared detector finds a role wake-up in the input region",
+    detectWake(`history\n› ${wakePrefixForRole("coder")}\nstatus`, wakePrefixForRole("coder")).draft,
+  );
 
   // decideAction state machine.
-  const cfg = { stalePolls: 2, cooldown: 300, maxSoft: 3, hardRestart: false, retryText: "continue" };
+  const cfg = {
+    stalePolls: 2,
+    cooldown: 300,
+    maxSoft: 3,
+    hardRestart: false,
+    retryText: "continue",
+    draftRecovery: true,
+    draftPolls: 2,
+    draftMaxEnter: 3,
+  };
   const t0 = 1_000_000;
   let st = freshState();
 
@@ -476,6 +648,67 @@ function runSelfTest() {
   decideAction(st, { hasPane: true, focused: false, idle: true, matched: true }, t0, cfg);
   const capped = decideAction(st, { hasPane: true, focused: false, idle: true, matched: true }, t0 + 1, cfg);
   test("maxSoft cap escalates", capped.action === "escalate");
+
+  // Wake-draft fallback: two idle polls, error priority, capped retries.
+  st = freshState();
+  st.prevHash = "h1";
+  test(
+    "draft poll 1 observes",
+    decideAction(st, { hasPane: true, focused: false, idle: true, matched: false, draft: true }, t0, cfg).action === "observe",
+  );
+  test("draft poll 1 recorded", st.draftStreak === 1);
+  test(
+    "draft poll 2 requests Enter",
+    decideAction(st, { hasPane: true, focused: false, idle: true, matched: false, draft: true }, t0 + 1, cfg).action === "draft-enter",
+  );
+
+  st = freshState();
+  st.prevHash = "h1";
+  st.draftStreak = 1;
+  st.draftAttempts = 3;
+  const draftEscalation = decideAction(
+    st,
+    { hasPane: true, focused: false, idle: true, matched: false, draft: true },
+    t0,
+    cfg,
+  );
+  test(
+    "draft retry cap escalates",
+    draftEscalation.action === "draft-escalate" && draftEscalation.attempts === 3,
+  );
+
+  st = freshState();
+  st.prevHash = "h1";
+  decideAction(st, { hasPane: true, focused: false, idle: true, matched: true, draft: true }, t0, cfg);
+  const errorWins = decideAction(
+    st,
+    { hasPane: true, focused: false, idle: true, matched: true, draft: true },
+    t0 + 1,
+    cfg,
+  );
+  test("error recovery takes priority over draft fallback", errorWins.action === "soft");
+
+  st = freshState();
+  st.prevHash = "h1";
+  st.draftStreak = 1;
+  st.draftAttempts = 1;
+  const draftReset = decideAction(
+    st,
+    { hasPane: true, focused: false, idle: false, matched: false, draft: true },
+    t0,
+    cfg,
+  );
+  test("screen activity resets a draft sequence", draftReset.action === "reset" && draftReset.wasDraft);
+
+  st = freshState();
+  st.prevHash = "h1";
+  const disabledDraft = decideAction(
+    st,
+    { hasPane: true, focused: false, idle: true, matched: false, draft: true },
+    t0,
+    { ...cfg, draftRecovery: false },
+  );
+  test("draft recovery switch disables the fallback", disabledDraft.action === "clear");
 
   if (failed) {
     console.error(`\n${failed} self-test(s) failed`);

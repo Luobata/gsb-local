@@ -18,11 +18,36 @@ gsb-local --check
 gsb-local /path/to/your/repository
 ```
 
+也可以先打开本地可视化配置器：
+
+```bash
+gsb-local studio
+
+# 也可直接指定项目，跳过项目落地页
+gsb-local studio --project /path/to/your/repository
+```
+
+Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--project` 启动时，首屏按最近项目展示配置和运行会话；可直接载入项目、用上次配置启动，或从运行中项目点「在终端打开」。进入工作台后既可以选择 `config1-4`，也可以从最小 Hub 骨架创建独立个人模板；模板卡也支持校验后直接启动。新项目默认用合法的目录 basename 作为会话名，不合法时回退为 `seed-gsb`。
+
+非 Hub 角色默认使用“系统基座 + 一句话意图”两层编辑，保存时仍合成为完整的 `.gsb-local/prompts/<role>.md`；无标记的旧提示词继续按自定义全文编辑。新建角色只需角色 ID 和 Agent，内置基座覆盖 `coder`、`core-bug`、`ops-gov`、`plan-backup`、`frontend`、`backend`、`test`、`docs` 与通用兜底。模板显示名称支持中文、空格、符号与 Emoji，个人模板保存在 `~/.config/gsb-local/studio/templates/`，不绑定创建时的项目和会话。Profile 友好名来自各 `profiles/*.conf` 文件头的 `# label:`；`profiles/config1.conf` 同时是默认角色映射的单一事实源，`defaults/agents.conf` 以相对符号链接保留原 CLI 路径。最终启动仍调用同一套 `gsb-local` CLI，不存在第二套运行逻辑。`Ctrl-C` 只关闭 Studio 页面服务，不会关闭已经启动的 Zellij 会话。
+
+项目配置的事实源是 `.gsb-local/agents.conf`、`.gsb-local/models.conf` 和 `.gsb-local/prompts/`；`.gsb-local/workbench.json` 仅作为 Studio 的 UI 草稿与展示元数据 sidecar，不覆盖手工修改的配置事实。
+
 只在后台创建、不立即占用当前终端：
 
 ```bash
 gsb-local --background /path/to/your/repository
 ```
+
+后台启动后，从任意目录进入已保存的会话：
+
+```bash
+gsb-local open my-task
+```
+
+`open` 会从 `~/.local/state/gsb-local/<session>/session.json` 读取最初绑定的绝对项目路径、配置来源、权限和 watchdog 策略。活跃会话只会 attach；已关闭的会话会保留任务板、合同和报告，并由 GSB 按持久化配置重新创建。不要用 `zellij attach <session>` 复活已退出的 GSB 会话；GSB 会禁用该会话的 Zellij 磁盘恢复，避免 Agent 完整提示词被还原成 `start_suspended` 待确认命令。
+
+Zellij 0.44.x 在快速结束并立即重建同名会话时偶尔会卡在 server/client 初始化。GSB 为创建过程设置 15 秒硬超时并只重试一次；如果仍失败会明确退出并给出 Zellij 日志路径，不会无限卡住。
 
 显式以最高权限启动内置 Agent：
 
@@ -39,6 +64,14 @@ gsb-local /path/to/your/repository my-task
 ```
 
 ### 命名配置 Profile
+
+列出所有内置配置及角色映射：
+
+```bash
+gsb-local --list-configs
+```
+
+`config1` 是默认六角色薄 Hub 配置的显式命名版本，可通过 `--config1` 或 `--config config1` 选择：Hub 使用 `claude-glm-5.3` 负责编排，独立 `coder` 使用 Codex 承担生产实现。
 
 使用内置 `config2`，让 Hub 使用 `claude-0812`、`core-bug` 使用 Codex，其余角色保持默认：
 
@@ -70,7 +103,7 @@ gsb-local --config4 /path/to/your/repository my-task
 
 `--config config4` 与 `--config4` 等价。编号快捷参数统一按 `--configN` 解析；对应的 Profile 文件不存在时会明确报错。
 
-再次运行同一命令会重新连接活跃会话；如果会话已被关闭成 dead 状态，会保留共享任务板并按当前角色配置重新创建 Agent。没有项目配置时，启动器读取 [`defaults/agents.conf`](defaults/agents.conf)，默认映射为：Hub/plan-backup 使用 Codex，core-bug 使用 `claude-0812`，ops-gov 使用 `claude-relay`，UI 使用 Kimi。临时把这套默认配置的所有角色统一切换到 Codex：
+再次运行同一命令会重新连接活跃会话；如果会话已被关闭，会保留共享任务板并按当前角色配置重新创建 Agent。同一个会话名永久绑定首次保存的工作区；从另一个项目用同名启动会在改写任何状态前被拒绝。推荐日常重开使用 `gsb-local open <session>`。没有项目配置时，启动器读取 [`defaults/agents.conf`](defaults/agents.conf)，默认映射为：Hub 使用 `claude-glm-5.3`，coder/plan-backup 使用 Codex，core-bug 使用 `claude-0812`，ops-gov 使用 `claude-relay`，UI 使用 Kimi。临时把这套默认配置的所有角色统一切换到 Codex：
 
 ```bash
 GSB_AGENT=codex gsb-local /path/to/your/repository
@@ -90,6 +123,7 @@ GSB_MODEL=opus GSB_EFFORT=high GSB_PERMISSION_MODE=manual gsb-local /path/to/rep
 
 ```ini
 hub=claude:claude-relay
+coder=codex
 core-bug=codex
 ops-gov=claude
 plan-backup=claude
@@ -132,6 +166,30 @@ gsb-local --rebuild /path/to/your/repository
 
 环境变量名按角色动态生成：角色名转大写、连字符转下划线，再加 `GSB_` 和 `_AGENT`。例如 `test-review` 对应 `GSB_TEST_REVIEW_AGENT`。
 
+### Hub 内核与能力扩展
+
+每个模板必须且只能包含一个 `hub`。任务拆解、合同生成、角色分发、结果回收、冲突处理和最终汇总属于 GSB 的不可变 Hub 内核，由内置 [`prompts/hub.md`](prompts/hub.md) 和派发协议在运行时永久注入；项目或个人模板不能删除、替换或削弱这些职责。
+
+Studio 会锁定 Hub 的角色 ID 和删除操作，并把可编辑区域明确标为“Hub 能力扩展”。扩展适合加入领域知识、审核偏好和额外协调规则，例如架构决策、质量门禁、进度治理或产品判断。项目扩展保存到：
+
+```text
+<workspace>/.gsb-local/prompts/hub-extension.md
+```
+
+运行时顺序为“不可变 Hub 内核 → 能力扩展 → GSB 协议与当前运行上下文”。扩展与内核或协议冲突时，仅冲突部分不生效。旧版 Studio 生成的项目级 `prompts/hub.md` 会按兼容扩展读取；重新保存后使用新的 `hub-extension.md`。
+
+### 每个角色独立选择模型
+
+可选的 `.gsb-local/models.conf` 使用同样的 `role=value` 语法，只覆盖对应角色的模型：
+
+```ini
+hub=glm-5
+coder=gpt-5.6-sol
+ui=kimi-code/k3-256k
+```
+
+只需填写 Agent CLI 实际支持的模型名；没有配置的角色继续使用自己的 Agent 默认模型。环境变量 `GSB_<ROLE>_MODEL` 优先级更高，例如 `GSB_CORE_BUG_MODEL=opus`。Studio 会自动维护这份文件，并在启动前验证角色是否仍然活动。
+
 ### UI/Kimi 插件
 
 内置 `ui` 角色覆盖所有设计和 UI 工作，包括产品/UX/视觉/交互设计、设计系统、截图分析、展示层实现、响应式、无障碍和视觉验收。Hub 遇到包含这些内容的任务时，只要 `ui` 在活动角色表中，就必须把 UI 部分拆给它。
@@ -168,8 +226,9 @@ GSB_KIMI_MODEL=kimi-code/k3 gsb-local --rebuild /path/to/your/repository
 
 ## 布局
 
-- `hub.<session>.main`：接收目标、读取活动角色表、拆分工作、审核报告并决定最终方案。
-- `spk.<session>.<role>`：按配置动态生成；删除角色后不再生成对应 Pane。
+- `hub.<session>.main · <model>`：薄编排层；接收目标、拆分契约、分发、处理冲突并汇总，不默认承担生产编码。
+- `spk.<session>.<role> · <model>`：按配置动态生成，并在边框显示实际模型或 Agent alias；删除角色后不再生成对应 Pane。
+- 默认实现角色：`coder`，获得 Hub 明确的路径级写入范围后负责代码和针对性测试。
 - 默认诊断角色：`core-bug`、`ops-gov`、`plan-backup`。
 - 可选 UI 角色：`ui`，默认交给 Kimi。
 
@@ -189,7 +248,7 @@ Spoke 默认只调查并写报告。Hub 可以在契约中授予精确路径的�
 
 - Hub 给每个 Spoke 写五段契约：Objective、Scope、Validation、Stop conditions、Reply route。
 - 跨 Pane 内容通过原子 JSON 文件信箱传递，消息只按数据读取，不自动产生批准或提权。
-- `nudge` 只发送固定唤醒语，不把任务 payload 直接注入另一个 Agent；提交使用 Zellij 的真实 `Enter` 键事件，以兼容 Kimi Code 的增强键盘协议。
+- `nudge` 只发送固定唤醒语，不把任务 payload 直接注入另一个 Agent；提交使用 Zellij 的真实 `Enter` 键事件。所有 Agent 在字符突发后默认等待 250ms（`GSB_NUDGE_SETTLE_SECONDS`）再提交；Kimi 仍兼容旧变量 `GSB_KIMI_NUDGE_SETTLE_SECONDS`。提交后会用 `dump-screen` 区分输入区草稿与历史区已提交消息：草稿残留时按 0.3/0.6/1.2 秒补发最多三次 Enter，仍失败则 `Ctrl-U` 清行并完整重发一次，最后向 Hub 投递 blocker 并返回非零。`GSB_NUDGE_VERIFY=false` 可回退为只发送不验证。Kimi 的重复唤醒仅在历史区确认已提交时合并，输入框残留不会再被误判为已排队。
 - 启动 Zellij 和 Agent 前会清除继承自父 Claude 的 child-session 标记，避免独立 Pane 被误判为嵌套会话。
 
 运行态目录：
@@ -230,13 +289,14 @@ Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错�
 3. 只有同时满足「连续 2 轮巡检都命中」「屏幕内容静止」「该 Pane 当前和上一轮都未被聚焦」才动作——人正在看的 Pane 绝不打扰；
 4. **软恢复**：向 Pane 输入 `continue` 并回车（可用 `GSB_WATCHDOG_RETRY_TEXT` 改）。每小时最多 `GSB_WATCHDOG_MAX_SOFT` 次（默认 3）；
 5. 软恢复无效：向 Hub 信箱投递 `blocker` 并 nudge，由 Hub 重新派单或升级给人；
-6. 进程退出类故障由 [`bin/supervise`](bin/supervise) 兜底：指数退避重启（30s 起，封顶 5 分钟），超过 `GSB_SUPERVISE_MAX_ATTEMPTS` 次（默认 10）同样给 Hub 发 blocker。
+6. 独立检测输入区里的 GSB 唤醒草稿：连续 2 轮静止且未聚焦时只补 Enter；连续 3 次仍无效则给 Hub 发 blocker，不与 API 错误软恢复抢动作；
+7. 进程退出类故障由 [`bin/supervise`](bin/supervise) 兜底：指数退避重启（30s 起，封顶 5 分钟），超过 `GSB_SUPERVISE_MAX_ATTEMPTS` 次（默认 10）同样给 Hub 发 blocker。
 
 因为契约、信箱、报告都在磁盘上，无论哪种恢复路径，Agent 重启后重读契约即可断点续传。
 
 可选**硬重启**（默认关闭）：`GSB_WATCHDOG_HARD_RESTART=true` 时，软恢复失败的 Spoke 会被 Ctrl-c 终止并由 supervise 重启。
 
-看门狗随会话启动自动在后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。关闭：`GSB_WATCHDOG_ENABLED=false`。
+看门狗随会话启动自动在独立进程组后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。`gsb-local open <session>` 在 attach 前会检查 PID；若进程已死，会清理残留 pid/ready/lock 并从该会话的 `session.env` 自动复活。看门狗自身启动时也会在确认旧 PID 已死后接管陈旧锁。关闭：`GSB_WATCHDOG_ENABLED=false`。
 
 日志与自检：
 
@@ -244,6 +304,7 @@ Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错�
 tail -f ~/.local/state/gsb-local/<session>/watchdog.log   # 看门狗日志
 cat ~/.local/state/gsb-local/<session>/agent-files/<role>.exit.log  # 重启记录
 node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
+node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区判别自检
 ```
 
 | 环境变量 | 默认值 | 说明 |
@@ -256,6 +317,9 @@ node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
 | `GSB_WATCHDOG_MAX_SOFT` | `3` | 每小时软恢复上限 |
 | `GSB_WATCHDOG_COOLDOWN` | `300` | 同一角色两次动作的最小间隔（秒） |
 | `GSB_WATCHDOG_HARD_RESTART` | `false` | 软恢复失败后是否 Ctrl-c 硬重启 |
+| `GSB_WATCHDOG_DRAFT_RECOVERY` | `true` | 是否补交持续滞留的 GSB 唤醒草稿 |
+| `GSB_WATCHDOG_DRAFT_POLLS` | `2` | 草稿连续静止多少轮后补 Enter |
+| `GSB_WATCHDOG_DRAFT_MAX_ENTER` | `3` | 草稿补 Enter 多少次后升级 blocker |
 | `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
 | `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
 
@@ -265,10 +329,12 @@ node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
 | --- | --- | --- | --- |
 | API 抖动（429 / overloaded / 5xx） | 客户端内部重试成功 | Agent 客户端 | 无感知，不触发看门狗 |
 | 会话内 API ERROR | 错误显示在会话里，Agent 停在输入框 | 看门狗 | 软恢复：输入 `continue` + 回车 |
+| 唤醒语停在输入框 | 固定 `A durable GSB...` 文本未提交 | `nudge` + 看门狗 | 当次验证重试；持续草稿由看门狗补 Enter 或升级 blocker |
 | 软恢复失败 | 错误持续存在 | 看门狗 | 给 Hub 信箱发 `blocker`（`from: watchdog`），Hub 重新派单或升级给人 |
 | Agent 进程退出 | Pane 显示 exited | `bin/supervise` | 指数退避重启（30s 起，封顶 5 分钟），Agent 重读契约断点续传 |
 | 进程反复退出 | 超过重启预算 | `bin/supervise` | 给 Hub 发 `blocker` 后停止 |
 | 整个 Zellij 会话死亡 | 会话 EXITED | `gsb-local` | 再次运行同一命令自动重建，保留任务板和契约 |
+| 看门狗死亡、会话仍活着 | pid/ready/lock 残留但 PID 不存活 | `gsb-local open` | 清理陈旧状态并从持久化会话环境复活 |
 
 看门狗只作用于 Spoke Pane。Hub Pane 不做自动恢复——你 attach 时直接看着它，错误需要人工判断。
 
@@ -286,6 +352,7 @@ node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
 | --- | --- |
 | `watchdog.log` | 看门狗运行日志（启动配置、每次恢复动作、升级记录） |
 | `watchdog.pid` | 当前看门狗进程 PID，`--rebuild` 时据此清理旧实例 |
+| `watchdog.ready` | 看门狗完成单实例加锁后的就绪握手；启动器确认 PID 一致后才报告启动成功 |
 | `watchdog.lock/` | 单实例锁目录，看门狗退出时自动清理 |
 | `agent-files/<role>.pid` | 各角色 Agent 进程 PID |
 | `agent-files/<role>.exit.log` | supervise 记录的每次退出与重启 |
@@ -304,9 +371,30 @@ node "$GSB_LOCAL_ROOT/bin/watchdog.mjs" --selftest        # 内置自检
 
 Hub 收到 `from: watchdog` 的 blocker 说明自动恢复已失败，需要人工介入：查看对应 Pane，或 `gsb-local --rebuild` 重建会话。
 
+### 唤醒草稿应急 Runbook
+
+当 Spoke 没反应且固定唤醒语停在输入框时，按从轻到重的顺序处理。`nudge` 不携带任务本体，合同和信箱都在磁盘上，因此重复唤醒是幂等的。
+
+```bash
+# 1. 只读定位 Pane；记录输出里的 pane_id
+bash "$GSB_LOCAL_ROOT/bin/nudge" <role> --dry-run
+ZELLIJ_SESSION_NAME=<session> zellij action dump-screen --pane-id <pane_id> | tail -20
+
+# 2. 完整唤醒语只差提交时，补一个 Enter
+ZELLIJ_SESSION_NAME=<session> zellij action send-keys --pane-id <pane_id> Enter
+
+# 3. 输入是半截或混有脏文本时，清行后重发
+ZELLIJ_SESSION_NAME=<session> zellij action send-keys --pane-id <pane_id> "Ctrl u"
+bash "$GSB_LOCAL_ROOT/bin/nudge" <role>
+```
+
+若 Pane 正显示更新、trust/权限对话框或界面已卡死，不要盲发 Enter；先人工处理对话框，或写入 `agent-files/<role>.restart-requested` 后让 `bin/supervise` 重启对应 Agent。第三方 Stop hook 失败会扩大 TUI 回合切换窗口，也应同时排查。看门狗本身不活时运行 `gsb-local open --background <session>` 即可触发 liveness 检查和复活。
+
 ## 常用 Zellij 操作
 
 - `Ctrl-p`：进入 Pane 模式，再用方向键切换分屏。
 - `Ctrl-t`：进入 Tab 模式。
 - `Ctrl-o d`：暂时离开（detach），后台会话继续保留。
 - `Ctrl-q`：结束整个 Zellij 会话。
+
+结束后重新打开请运行 `gsb-local open <session>`。这会恢复 GSB 的持久化任务状态，但不会依赖或复活 Zellij 保存的 Agent 命令行。
