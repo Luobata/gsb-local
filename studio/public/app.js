@@ -103,6 +103,27 @@ function toast(message, kind = "info") {
   if (kind !== "error") setTimeout(() => node.remove(), 4200);
 }
 
+function confirmInStudio({ title, message, confirmLabel, cancelMessage }) {
+  const dialog = $("#confirm-dialog");
+  if (dialog.open) return false;
+  const cancel = $("#cancel-confirm");
+  const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  $("#confirm-dialog-title").textContent = title;
+  $("#confirm-dialog-message").textContent = message;
+  $("#confirm-action").textContent = confirmLabel;
+  dialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const confirmed = dialog.returnValue === "confirm";
+      if (!confirmed) toast(cancelMessage);
+      if (trigger && document.contains(trigger)) trigger.focus();
+      resolve(confirmed);
+    }, { once: true });
+    dialog.showModal();
+    cancel.focus();
+  });
+}
+
 async function openSessionInTerminal(session, button) {
   const label = button.textContent;
   button.disabled = true;
@@ -305,8 +326,8 @@ function detailActionButtons(view) {
     prepareTemplateQuickLaunch(view.target, launch);
     const use = element("button", "primary-button", "使用此模板");
     use.type = "button";
-    use.addEventListener("click", () => {
-      if (applyTemplate(view.target)) toggleDetail(false);
+    use.addEventListener("click", async () => {
+      if (await applyTemplate(view.target)) toggleDetail(false);
     });
     actions.push(launch, use);
   }
@@ -442,14 +463,20 @@ function markWorkbenchClean() {
   renderSaveState();
 }
 
-function confirmDiscard(action) {
+async function confirmDiscard(action) {
   const consequence = action.includes("放弃") ? action : `${action}并放弃这些修改`;
-  return !hasUnsavedChanges() || window.confirm(`当前工作台有未保存修改。确定要${consequence}吗？`);
+  if (!hasUnsavedChanges()) return true;
+  return confirmInStudio({
+    title: `确定要${consequence}吗？`,
+    message: "当前工作台有未保存修改；继续后无法恢复这些修改。",
+    confirmLabel: "放弃修改并继续",
+    cancelMessage: `已取消${action}；未保存修改仍保留`,
+  });
 }
 
-function discardChanges() {
+async function discardChanges() {
   if (!hasUnsavedChanges() || !cleanWorkbenchSnapshot) return false;
-  if (!confirmDiscard("放弃所有未保存修改")) return false;
+  if (!await confirmDiscard("放弃所有未保存修改")) return false;
   workbench = clone(cleanWorkbenchSnapshot);
   loadedWorkspace = workbench.workspace || loadedWorkspace;
   currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
@@ -545,7 +572,7 @@ function minimalHubRole() {
 }
 
 async function createIndependentTemplate(name) {
-  if (!confirmDiscard("创建空白模板")) return false;
+  if (!await confirmDiscard("创建空白模板")) return false;
   const nextWorkbench = {
     ...workbench,
     version: 1,
@@ -595,12 +622,12 @@ function workbenchForTemplate(template) {
   };
 }
 
-function applyTemplate(template) {
+async function applyTemplate(template) {
   if (workbench.profile === template.profileId) {
     toast(`正在编辑${template.source === "user" ? "模板 " : " "}${template.name}，已保留当前修改`);
     return false;
   }
-  if (!confirmDiscard(`载入${template.source === "user" ? "模板 " : " "}${template.name}`)) return false;
+  if (!await confirmDiscard(`载入${template.source === "user" ? "模板 " : " "}${template.name}`)) return false;
   workbench = workbenchForTemplate(template);
   currentRole = 0;
   renderAll();
@@ -626,7 +653,7 @@ async function prepareTemplateQuickLaunch(template, button) {
 }
 
 async function quickLaunchTemplate(template, button) {
-  if (!confirmDiscard(`用模板 ${template.name} 直接启动`)) return false;
+  if (!await confirmDiscard(`用模板 ${template.name} 直接启动`)) return false;
   try {
     const target = workbenchForTemplate(template);
     const checked = await api("/api/validate", { method: "POST", body: JSON.stringify({ workbench: target }) });
@@ -922,14 +949,18 @@ function projectLaunchState(project, { onProject } = {}) {
   return cached.pending;
 }
 
-function confirmFullAccessLaunch(target) {
-  return target.permission !== "full-access" || window.confirm(
-    `Full Access 会让 ${target.name || target.session || "此工作台"} 绕过内置 Agent 的审批与沙箱。确定以最高权限保存并启动吗？`,
-  );
+async function confirmFullAccessLaunch(target) {
+  if (target.permission !== "full-access") return true;
+  return confirmInStudio({
+    title: "确定以 Full Access 启动吗？",
+    message: `Full Access 会让 ${target.name || target.session || "此工作台"} 绕过内置 Agent 的审批与沙箱。`,
+    confirmLabel: "以最高权限启动",
+    cancelMessage: "已取消 Full Access 启动",
+  });
 }
 
 async function executeQuickLaunch(target, button, statusNode = null) {
-  if (!confirmFullAccessLaunch(target)) return null;
+  if (!await confirmFullAccessLaunch(target)) return null;
   const label = button.textContent;
   let keepDisabled = false;
   button.disabled = true;
@@ -1090,9 +1121,9 @@ function enterEditor(sectionId = "sec-templates") {
   goToStep(sectionId);
 }
 
-function returnToProjectLanding() {
+async function returnToProjectLanding() {
   const dirty = hasUnsavedChanges();
-  if (!confirmDiscard("返回项目列表")) return false;
+  if (!await confirmDiscard("返回项目列表")) return false;
   if (dirty && cleanWorkbenchSnapshot) {
     workbench = clone(cleanWorkbenchSnapshot);
     loadedWorkspace = workbench.workspace || loadedWorkspace;
@@ -1133,7 +1164,7 @@ async function loadProject(workspace, options = {}) {
     toast("当前项目已经选中");
     return false;
   }
-  if (workspace !== loadedWorkspace && !options.discardConfirmed && !confirmDiscard(`载入项目 ${workspace}`)) {
+  if (workspace !== loadedWorkspace && !options.discardConfirmed && !await confirmDiscard(`载入项目 ${workspace}`)) {
     if (workbench) {
       workbench.workspace = loadedWorkspace;
       renderRuntime();
@@ -1175,7 +1206,7 @@ async function loadProject(workspace, options = {}) {
 
 async function selectSession(session) {
   if (session.workspace && session.workspace !== loadedWorkspace) {
-    if (!confirmDiscard(`载入会话 ${session.name} 关联的项目`)) return false;
+    if (!await confirmDiscard(`载入会话 ${session.name} 关联的项目`)) return false;
     return loadProject(session.workspace, { session: session.name, discardConfirmed: true });
   }
   workbench.session = session.name;
@@ -1532,7 +1563,7 @@ async function saveConfig() {
 }
 
 async function launch() {
-  if (!confirmFullAccessLaunch(workbench)) return;
+  if (!await confirmFullAccessLaunch(workbench)) return;
   toggleValidation(true);
   const button = $("#launch-workbench");
   button.disabled = true;

@@ -190,7 +190,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .shell.is-project-only #sec-projects { padding: clamp(22px, 3vw, 32px); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(18,24,20,.9), rgba(9,13,10,.82)); box-shadow: 0 28px 80px rgba(0,0,0,.22); }
 .shell.is-project-only .project-landing-list { max-height: min(440px, 48vh); }
 
-.editor-project-bar { min-height: 72px; margin: -8px 0 28px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line); background: linear-gradient(90deg, rgba(103,216,199,.055), rgba(13,17,14,.76) 55%); }
+.editor-project-bar { position: sticky; z-index: 17; top: 78px; min-height: 72px; margin: -8px 0 28px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line); background: linear-gradient(90deg, #101a17, var(--panel) 55%); }
 .project-switcher { min-width: 0; flex: 1; padding: 7px 10px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 0; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
 .project-switcher:hover { background: rgba(103,216,199,.05); color: var(--ink); }
 .project-switcher-glyph { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid rgba(103,216,199,.48); color: var(--cyan); font: 10px var(--mono); }
@@ -515,6 +515,8 @@ body.has-detail-open { overflow: hidden; }
 .studio-dialog form { padding: 26px; }
 .studio-dialog h2 { margin: 7px 0 5px; font: 600 25px var(--display); }
 .studio-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 11px; }
+.confirm-dialog { border-color: var(--warning); }
+.confirm-dialog .eyebrow { color: var(--warning); }
 .template-baseline { display: flex; align-items: center; gap: 12px; margin: 3px 0 21px; padding: 12px; border: 1px solid var(--line); background: #0c100d; }
 .baseline-node { width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--signal); color: var(--signal); font: 11px var(--mono); }
 .template-baseline > span:last-child { display: grid; gap: 3px; }
@@ -538,6 +540,7 @@ body.has-detail-open { overflow: hidden; }
   .topbar { padding: 0 16px; }
   .version { display: none; }
   .stepper { height: auto; grid-template-columns: repeat(4, 1fr); }
+  .editor-project-bar { top: 62px; }
   .step { min-height: 62px; display: flex; justify-content: center; padding: 10px 5px; text-align: center; }
   .step span { font-size: 18px; }
   .step b, .step small { display: none; }
