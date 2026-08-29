@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>GSB Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#studio-main">跳到主要内容</a>
+    <div class="ambient-grid" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="GSB Studio 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><b>GSB</b> STUDIO</span>
+      </a>
+      <div class="topbar-meta">
+        <span class="connection"><i aria-hidden="true"></i>LOCAL / 127.0.0.1</span>
+        <span class="version">CONFIG COMPILER · V1</span>
+      </div>
+    </header>
+
+    <nav class="stepper" aria-label="配置步骤">
+      <button class="step is-active" data-section="sec-projects"><span>01</span><b>选择项目</b><small>Projects</small></button>
+      <button class="step" data-section="sec-templates"><span>02</span><b>选择模板</b><small>Topology</small></button>
+      <button class="step" data-section="sec-roster"><span>03</span><b>角色与模型</b><small>Roster</small></button>
+      <button class="step" data-section="sec-runtime"><span>04</span><b>项目与会话</b><small>Runtime</small></button>
+      <button id="nav-validation" class="step" type="button" aria-expanded="false" aria-controls="validation-drawer"><span>05</span><b>校验与启动</b><small>Launch</small></button>
+    </nav>
+
+    <main id="studio-main" class="shell">
+      <section class="workspace">
+        <div class="panel-head">
+          <div>
+            <span class="eyebrow">SINGLE-PAGE WORKBENCH</span>
+            <h1>在一页中配置完整工作台</h1>
+            <p>模板、角色、项目和运行策略始终可见；导航会定位到对应区块。</p>
+          </div>
+        </div>
+
+        <section id="sec-projects" class="stage is-active" data-stage="0">
+          <div class="project-landing-head">
+            <div>
+              <span class="eyebrow">PROJECTS / RECENT + ACTIVE</span>
+              <h2>从项目继续，而不是重新填写</h2>
+              <p>最近项目优先；已保存的角色、模板、会话和运行策略会随项目恢复。</p>
+            </div>
+            <span class="project-total"><b id="landing-project-count">00</b><small>PROJECTS</small></span>
+          </div>
+          <div class="path-control project-landing-path">
+            <label class="field grow">
+              <span>打开其他项目 <small>输入绝对路径</small></span>
+              <input id="landing-project-path" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/project" required />
+            </label>
+            <button id="landing-open-project" class="secondary-button" type="button">打开路径</button>
+            <button id="landing-browse-project" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
+              选择目录
+            </button>
+          </div>
+          <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
+          <p id="landing-project-status" class="resource-note" aria-live="polite"><span aria-hidden="true">↳</span> 选择项目后进入完整工作台。</p>
+        </section>
+
+        <section id="sec-templates" class="stage" data-stage="1">
+          <div class="section-label"><span>TEMPLATES / BUILTIN + YOURS</span><i></i></div>
+          <div id="template-grid" class="profile-grid skeleton-grid" aria-label="工作台模板"></div>
+        </section>
+
+        <section id="sec-roster" class="stage" data-stage="2">
+          <div class="roster-layout">
+            <aside class="role-rail" aria-label="活动角色">
+              <div class="rail-head">
+                <span>ACTIVE ROSTER</span>
+                <button id="add-role" class="icon-button" type="button" aria-label="添加角色" title="添加角色">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                </button>
+              </div>
+              <div id="role-list" class="role-list"></div>
+            </aside>
+
+            <div class="role-editor">
+              <div class="role-editor-head">
+                <div>
+                  <span class="eyebrow" id="role-type">ORCHESTRATOR</span>
+                  <h2 id="role-heading">Hub</h2>
+                </div>
+                <button id="remove-role" class="text-button danger" type="button">移除角色</button>
+              </div>
+
+              <div class="form-grid two-col">
+                <label class="field">
+                  <span>角色 ID <small>用于 Pane、合同和 Relay</small></span>
+                  <input id="role-id" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="field">
+                  <span>显示名称</span>
+                  <input id="role-name" autocomplete="off" />
+                </label>
+                <label class="field">
+                  <span>Agent / Alias</span>
+                  <input id="role-agent" list="agent-options" autocomplete="off" spellcheck="false" />
+                  <datalist id="agent-options">
+                    <option value="claude-glm-5.3"></option>
+                    <option value="claude-0812"></option>
+                    <option value="claude-relay"></option>
+                    <option value="codex"></option>
+                    <option value="claude"></option>
+                    <option value="kimi"></option>
+                  </datalist>
+                </label>
+                <label class="field">
+                  <span>模型覆盖 <small>留空则使用 Agent 默认值</small></span>
+                  <input id="role-model" list="model-options" autocomplete="off" spellcheck="false" />
+                  <datalist id="model-options"></datalist>
+                </label>
+              </div>
+
+              <label class="field">
+                <span>职责摘要</span>
+                <input id="role-description" autocomplete="off" />
+              </label>
+
+              <section id="hub-core-panel" class="hub-core-panel" hidden>
+                <div class="hub-core-head">
+                  <span class="hub-core-lock" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                  </span>
+                  <span><small>BUILT-IN / IMMUTABLE</small><b>Hub 核心编排能力</b></span>
+                  <em>CORE V1</em>
+                </div>
+                <div class="hub-core-capabilities">
+                  <span><i>01</i><b>任务拆解</b><small>形成目标清晰、边界明确的执行合同</small></span>
+                  <span><i>02</i><b>角色分发</b><small>按活动角色与写入所有权完成路由</small></span>
+                  <span><i>03</i><b>证据回收</b><small>处理阻塞和冲突，核验后统一汇总</small></span>
+                </div>
+                <p>该内核由 GSB 在运行时永久注入，所有模板必须且只能保留一个 Hub。下方内容只会追加能力，不能覆盖这些职责。</p>
+              </section>
+
+              <div class="prompt-toolbar">
+                <label id="prompt-template-field" class="field prompt-template-field">
+                  <span>提示词模板</span>
+                  <select id="prompt-template"></select>
+                </label>
+                <div id="hub-extension-heading" class="hub-extension-heading" hidden>
+                  <span>HUB CAPABILITY EXTENSION</span>
+                  <b>增加 Hub 能力 <small>可选，不会替换内核</small></b>
+                </div>
+                <div class="prompt-stats"><span id="prompt-lines">0 lines</span><span id="prompt-chars">0 chars</span></div>
+              </div>
+              <div id="spoke-prompt-editor" class="spoke-prompt-editor" hidden>
+                <label class="field intent-field">
+                  <span>本角色意图 <small>一句话即可，其余由系统基座补齐</small></span>
+                  <textarea id="role-intent" rows="3" spellcheck="false" placeholder="例如：负责前端，与 coder 协作"></textarea>
+                </label>
+                <details id="prompt-base-details" class="prompt-layer-details">
+                  <summary>系统默认基座 <small>协议已自动注入，无需重写</small></summary>
+                  <pre id="role-prompt-base" tabindex="0"></pre>
+                </details>
+                <details id="prompt-advanced-details" class="prompt-layer-details advanced-prompt-details">
+                  <summary>高级：自定义全文 <small>旧项目或完全自定义时使用</small></summary>
+                  <p>编辑下方全文会切换到自定义模式，不再自动合成系统基座。</p>
+                  <label class="field prompt-field">
+                    <span class="sr-only">自定义角色提示词全文</span>
+                    <textarea id="role-custom-prompt" spellcheck="false"></textarea>
+                  </label>
+                </details>
+                <details id="prompt-final-details" class="prompt-layer-details final-prompt-details">
+                  <summary>最终提示词预览 <small>READ-ONLY · 基座与意图合成结果</small></summary>
+                  <pre id="role-final-prompt" tabindex="0"></pre>
+                </details>
+              </div>
+              <label id="hub-prompt-field" class="field prompt-field">
+                <span id="prompt-input-label" class="sr-only">角色提示词</span>
+                <textarea id="role-prompt" spellcheck="false"></textarea>
+              </label>
+              <div id="hub-extension-presets" class="hub-extension-presets" hidden>
+                <span>QUICK ADD</span>
+                <button type="button" data-hub-capability="architecture">+ 架构决策</button>
+                <button type="button" data-hub-capability="quality">+ 质量门禁</button>
+                <button type="button" data-hub-capability="delivery">+ 进度治理</button>
+                <button type="button" data-hub-capability="product">+ 产品判断</button>
+              </div>
+              <p id="prompt-lock-note" class="lock-note">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                <span id="prompt-lock-copy">Relay、安全边界和运行路径由 GSB 协议层追加，不会被这里的角色提示词覆盖。</span>
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="sec-runtime" class="stage" data-stage="3">
+          <div class="runtime-grid">
+            <div class="runtime-main">
+              <div class="section-label"><span>PROJECT TARGET</span><i></i></div>
+              <div class="path-control">
+                <label class="field grow">
+                  <span>项目绝对路径</span>
+                  <input id="workspace-path" autocomplete="off" spellcheck="false" />
+                </label>
+                <button id="browse-project" class="secondary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
+                  选择目录
+                </button>
+              </div>
+
+              <div class="runtime-browser" aria-label="项目与会话浏览器">
+                <section class="resource-column project-column">
+                  <header class="resource-head">
+                    <span><b>PROJECTS</b><small>已配置与最近使用</small></span>
+                    <em id="project-count">00</em>
+                  </header>
+                  <div id="project-options" class="resource-list" aria-label="可选项目"></div>
+                </section>
+                <section class="resource-column session-column">
+                  <header class="resource-head">
+                    <span><b>SESSIONS</b><small>选择后可载入关联项目</small></span>
+                    <button id="refresh-resources" class="resource-refresh" type="button" aria-label="刷新项目和会话" title="刷新项目和会话">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M18.3 9A7 7 0 0 0 6.1 6.1L4 8"/><path d="M5.7 15A7 7 0 0 0 17.9 17.9L20 16"/></svg>
+                    </button>
+                  </header>
+                  <div class="resource-filter" role="group" aria-label="会话筛选">
+                    <button class="is-active" type="button" data-session-filter="project">当前项目</button>
+                    <button type="button" data-session-filter="all">全部会话</button>
+                  </div>
+                  <div id="session-options" class="resource-list" aria-label="可选会话"></div>
+                </section>
+              </div>
+              <p class="resource-note"><span aria-hidden="true">↳</span> 选择项目会载入它保存的角色配置；选择会话会同时定位到它关联的项目，但不会自动重建或终止会话。</p>
+
+              <div class="form-grid two-col session-grid">
+                <label class="field">
+                  <span>会话名称</span>
+                  <input id="session-name" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="field">
+                  <span>工作台名称</span>
+                  <input id="workbench-name" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+
+            <aside class="runtime-options">
+              <div class="section-label"><span>RUNTIME POLICY</span><i></i></div>
+              <fieldset class="permission-set">
+                <legend>权限策略</legend>
+                <label class="choice-card">
+                  <input type="radio" name="permission" value="balanced" checked />
+                  <span><b>Balanced</b><small>常规编辑自动放行，危险操作再询问</small></span>
+                </label>
+                <label class="choice-card danger-choice">
+                  <input type="radio" name="permission" value="full-access" />
+                  <span><b>Full Access</b><small>绕过内置审批与沙箱，仅限可信项目</small></span>
+                </label>
+              </fieldset>
+              <label class="switch-row">
+                <span><b>Watchdog</b><small>监控 API 错误和卡死 Pane</small></span>
+                <input id="watchdog-enabled" type="checkbox" checked /><i aria-hidden="true"></i>
+              </label>
+              <label class="switch-row">
+                <span><b>重建同名会话</b><small>保留 TASK、合同和报告</small></span>
+                <input id="rebuild-session" type="checkbox" /><i aria-hidden="true"></i>
+              </label>
+            </aside>
+          </div>
+        </section>
+
+      </section>
+
+      <aside class="summary-panel" aria-label="当前工作台摘要">
+        <div class="summary-head">
+          <div class="summary-save-state">
+            <span id="summary-save-state">LIVE SPEC</span>
+            <button id="discard-changes" class="text-button discard-changes" type="button" hidden>放弃修改</button>
+          </div>
+          <b id="summary-count">00</b>
+        </div>
+        <div class="topology-mark" aria-hidden="true">
+          <div class="hub-node">H</div><i></i><div id="spoke-dots" class="spoke-dots"></div>
+        </div>
+        <h2 id="summary-name">Workbench</h2>
+        <p id="summary-path">尚未选择项目</p>
+        <dl class="summary-meta">
+          <div><dt>PROFILE</dt><dd id="summary-profile">—</dd></div>
+          <div><dt>SESSION</dt><dd id="summary-session">seed-gsb</dd></div>
+          <div><dt>POLICY</dt><dd id="summary-permission">BALANCED</dd></div>
+          <div><dt>WATCH</dt><dd id="summary-watch">ON</dd></div>
+        </dl>
+        <div class="summary-roster-label">ROLE / AGENT / MODEL</div>
+        <ol id="summary-roster" class="summary-roster"></ol>
+      </aside>
+    </main>
+
+    <aside id="detail-panel" class="detail-panel" aria-labelledby="detail-heading" aria-hidden="true" inert>
+      <header class="detail-head">
+        <span class="readonly-badge"><small>READ-ONLY</small><b>只读预览</b></span>
+        <span id="detail-edit-state" class="detail-edit-state">EDIT STATE · —</span>
+        <button id="close-detail" class="icon-button detail-close" type="button" aria-label="关闭只读预览">×</button>
+      </header>
+      <div class="detail-body">
+        <span id="detail-kind" class="detail-kind">INSPECT</span>
+        <h2 id="detail-heading" tabindex="-1">详情</h2>
+        <p id="detail-summary" class="detail-summary"></p>
+        <dl id="detail-facts" class="detail-facts"></dl>
+        <div id="detail-content" class="detail-content"></div>
+        <div id="detail-actions" class="detail-actions" aria-label="预览可用动作"></div>
+      </div>
+    </aside>
+
+    <aside id="validation-drawer" class="validation-drawer" aria-label="校验与配置预览" aria-hidden="true" inert>
+      <header class="drawer-head">
+        <span><small>PRE-FLIGHT CHECK</small><b>校验与配置预览</b></span>
+        <button id="close-validation" class="icon-button" type="button" aria-label="收起校验抽屉">×</button>
+      </header>
+      <div class="drawer-body">
+        <div class="review-grid">
+          <div id="validation-box" class="validation-box is-loading" aria-live="polite">
+            <div class="validation-spinner" aria-hidden="true"></div>
+            <p>正在检查角色、命令、项目和会话配置…</p>
+          </div>
+          <div class="config-preview">
+            <div class="preview-tabs" role="tablist" aria-label="生成配置预览">
+              <button class="preview-tab is-active" data-preview="agents" role="tab">agents.conf</button>
+              <button class="preview-tab" data-preview="models" role="tab">models.conf</button>
+              <button class="preview-tab" data-preview="manifest" role="tab">workbench.json</button>
+            </div>
+            <pre id="config-output" tabindex="0"></pre>
+          </div>
+        </div>
+        <div id="launch-result" class="launch-result" aria-live="polite" hidden></div>
+      </div>
+    </aside>
+
+    <footer class="actionbar">
+      <div class="actionbar-left">
+        <button id="save-template" class="text-button" type="button">保存为模板</button>
+        <button id="save-config" class="text-button" type="button">仅保存配置</button>
+      </div>
+      <div class="actionbar-right">
+        <button id="toggle-validation" class="secondary-button" type="button" aria-expanded="false" aria-controls="validation-drawer">校验</button>
+        <button id="launch-workbench" class="primary-button launch-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z" /></svg>
+          保存并后台启动
+        </button>
+      </div>
+    </footer>
+
+    <dialog id="template-dialog" class="studio-dialog">
+      <form method="dialog">
+        <span class="eyebrow">SAVE REUSABLE SPEC</span>
+        <h2>保存为工作台模板</h2>
+        <p>模板保存角色、模型、提示词和权限，不绑定当前项目与会话。</p>
+        <label class="field"><span>模板名称 <small>支持中文、空格、符号与 Emoji</small></span><input id="template-name" required autocomplete="off" /></label>
+        <div class="dialog-actions">
+          <button value="cancel" class="secondary-button">取消</button>
+          <button id="confirm-template" value="default" class="primary-button">保存模板</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="role-dialog" class="studio-dialog">
+      <form method="dialog">
+        <span class="eyebrow">ADD / MINIMAL ROLE</span>
+        <h2>添加角色</h2>
+        <p>只需角色 ID 和 Agent；名称、职责、模型与提示词基座会自动补齐，创建后仍可细化。</p>
+        <div class="form-grid two-col">
+          <label class="field"><span>角色 ID</span><input id="new-role-id" required pattern="[a-z][a-z0-9-]*" autocomplete="off" spellcheck="false" /></label>
+          <label class="field"><span>Agent</span><input id="new-role-agent" required list="agent-options" value="codex" autocomplete="off" spellcheck="false" /></label>
+        </div>
+        <div class="dialog-actions">
+          <button value="cancel" class="secondary-button">取消</button>
+          <button id="confirm-role" value="default" class="primary-button">添加并细化意图</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="create-template-dialog" class="studio-dialog create-dialog">
+      <form method="dialog">
+        <span class="eyebrow">NEW / INDEPENDENT TOPOLOGY</span>
+        <h2>创建独立模板</h2>
+        <p>新模板只包含 GSB 必需的 Hub 入口，不复制任何内置角色。创建后即可逐个添加和定义角色。</p>
+        <label class="field"><span>模板名称 <small>支持中文、空格、符号与 Emoji</small></span><input id="new-template-name" required autocomplete="off" placeholder="例如：前端突击队 🚀 / Kimi + Codex" /></label>
+        <div class="template-baseline">
+          <span class="baseline-node">H</span>
+          <span><b>MINIMAL HUB BASELINE</b><small>Hub 默认使用 claude-glm-5.3，可在下一步修改</small></span>
+        </div>
+        <div class="dialog-actions">
+          <button value="cancel" class="secondary-button">取消</button>
+          <button id="confirm-create-template" value="default" class="primary-button">创建并配置角色</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

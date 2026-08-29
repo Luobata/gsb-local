@@ -1,0 +1,859 @@
+#!/usr/bin/env node
+
+import { createServer } from "node:http";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import {
+  composeRolePrompt,
+  loadProjectState as loadStoredProjectState,
+  parseRoleMap,
+  PROMPT_INTENT_MARKER,
+  saveProjectState as saveStoredProjectState,
+  serializeAgents,
+  serializeModels,
+  serializeWorkbenchSidecar,
+} from "./store.mjs";
+
+export { parseRoleMap, serializeAgents, serializeModels } from "./store.mjs";
+
+const STUDIO_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.dirname(STUDIO_DIR);
+const PUBLIC_DIR = path.join(STUDIO_DIR, "public");
+const ROLE_PATTERN = /^[a-z][a-z0-9-]*$/;
+const SESSION_PATTERN = /^[A-Za-z0-9._-]+$/;
+const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const STUDIO_API_VERSION = 2;
+const SPAWN_TIMEOUT_MS = 5_000;
+const DEFAULT_CONFIG_HOME = path.join(os.homedir(), ".config", "gsb-local", "studio");
+
+function configHome() {
+  return process.env.GSB_STUDIO_CONFIG_HOME || DEFAULT_CONFIG_HOME;
+}
+
+const ROLE_DEFINITIONS = {
+  hub: { name: "Hub", type: "orchestrator", description: "目标澄清、任务拆解、分发、冲突处理与最终汇总" },
+  coder: { name: "Coder", type: "executor", description: "默认生产实现、测试与验证" },
+  "core-bug": { name: "Core Bug", type: "specialist", description: "故障复现、根因定位和最小修复建议" },
+  "ops-gov": { name: "Ops Gov", type: "governance", description: "权限、构建、依赖、CI、资源和上线风险" },
+  "plan-backup": { name: "Plan Backup", type: "reviewer", description: "反证主方案，准备备选、回滚与覆盖计划" },
+  ui: { name: "UI", type: "specialist", description: "产品设计、交互、视觉、响应式、可访问性和 UI 实现" },
+  frontend: { name: "Frontend", type: "specialist", description: "前端界面、交互、可访问性与浏览器验证" },
+  backend: { name: "Backend", type: "specialist", description: "服务接口、数据路径、兼容性与运行可靠性" },
+  test: { name: "Test", type: "reviewer", description: "测试设计、缺陷复现、回归验证与覆盖评估" },
+  docs: { name: "Docs", type: "specialist", description: "技术文档、可执行示例、术语一致性与读者路径" },
+  fe: { base: "frontend" },
+  be: { base: "backend" },
+  qa: { base: "test" },
+  testing: { base: "test" },
+  writer: { base: "docs" },
+  documentation: { base: "docs" },
+};
+
+function canonicalRole(role) {
+  return ROLE_DEFINITIONS[role]?.base || role;
+}
+
+function metadataForRole(role) {
+  const definition = ROLE_DEFINITIONS[canonicalRole(role)];
+  return definition?.name ? definition : {};
+}
+
+const roleMeta = Object.fromEntries(Object.keys(ROLE_DEFINITIONS)
+  .map((role) => [role, metadataForRole(role)])
+  .filter(([, metadata]) => metadata.name));
+const roleBaseAliases = Object.fromEntries(Object.entries(ROLE_DEFINITIONS)
+  .filter(([, definition]) => definition.base)
+  .map(([role, definition]) => [role, definition.base]));
+
+const MODEL_SUGGESTIONS = [
+  { family: "Codex", value: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+  { family: "Kimi", value: "kimi-code/k3-256k", label: "Kimi K3 · 256K" },
+  { family: "Kimi", value: "kimi-code/k3", label: "Kimi K3" },
+  { family: "Claude", value: "opus", label: "Claude Opus alias" },
+  { family: "Claude", value: "sonnet", label: "Claude Sonnet alias" },
+];
+
+export function parseArgs(argv) {
+  const options = { project: "", port: 0, open: true };
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg === "--project") {
+      options.project = argv[++index];
+      if (!options.project) throw new Error("--project requires a path");
+    }
+    else if (arg === "--port") options.port = Number(argv[++index]);
+    else if (arg === "--no-open") options.open = false;
+    else if (arg === "--help") options.help = true;
+    else throw new Error(`Unknown studio option: ${arg}`);
+  }
+  if (options.project) options.project = path.resolve(options.project);
+  if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
+    throw new Error("--port must be an integer from 0 to 65535");
+  }
+  return options;
+}
+
+function readText(file, fallback = "") {
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return fallback;
+  }
+}
+
+function atomicWrite(file, content) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${randomBytes(3).toString("hex")}.tmp`;
+  writeFileSync(temporary, content, { mode: 0o600 });
+  renameSync(temporary, file);
+}
+
+function loadPromptTemplates() {
+  return readdirSync(path.join(ROOT_DIR, "prompts"))
+    .filter((name) => name.endsWith(".md"))
+    .sort()
+    .map((name) => {
+      const id = name.slice(0, -3);
+      return { id, name: metadataForRole(id).name || id, body: readText(path.join(ROOT_DIR, "prompts", name)) };
+    });
+}
+
+export function parseProfileHeader(content, id) {
+  const comments = content.split(/\r?\n/)
+    .map((line) => line.match(/^\s*#\s*(.*?)\s*$/)?.[1])
+    .filter((line) => line !== undefined);
+  const label = comments.find((line) => /^label\s*:/i.test(line))?.replace(/^label\s*:\s*/i, "").trim();
+  const description = comments.find((line) => !/^label\s*:/i.test(line)) || "";
+  return { name: label || id, description };
+}
+
+function loadProfiles() {
+  return readdirSync(path.join(ROOT_DIR, "profiles"))
+    .filter((name) => name.endsWith(".conf"))
+    .sort()
+    .map((name) => {
+      const id = name.slice(0, -5);
+      const content = readText(path.join(ROOT_DIR, "profiles", name));
+      const header = parseProfileHeader(content, id);
+      return {
+        id,
+        ...header,
+        roles: parseRoleMap(content).map(({ id: role, value: agent }) => ({ role, agent })),
+      };
+    });
+}
+
+function readModelMap(workspace) {
+  const file = path.join(workspace, ".gsb-local", "models.conf");
+  if (!existsSync(file)) return new Map();
+  return new Map(parseRoleMap(readText(file)).map(({ id, value }) => [id, value]));
+}
+
+function codexDefaultModel() {
+  const config = readText(path.join(os.homedir(), ".codex", "config.toml"));
+  return config.match(/^model\s*=\s*"([^"]+)"/m)?.[1] || "gpt-5.6-sol";
+}
+
+function inferredModel(agent) {
+  if (agent === "codex" || agent.startsWith("codex:")) return codexDefaultModel();
+  if (agent === "kimi" || agent.startsWith("kimi:")) return "kimi-code/k3-256k";
+  return "";
+}
+
+function normalizeHubExtension(value) {
+  const prompt = typeof value === "string" ? value : "";
+  const looksLikeLegacyCore = prompt.includes("Your responsibilities:")
+    && prompt.includes("write a complete five-section contract")
+    && prompt.includes("Do not claim that a Spoke has completed work");
+  return looksLikeLegacyCore ? "" : prompt;
+}
+
+function normalizeWorkbench(workbench) {
+  if (!workbench || typeof workbench !== "object") return workbench;
+  return {
+    ...workbench,
+    hubCore: { source: "builtin", locked: true, version: 1 },
+    roles: Array.isArray(workbench.roles) ? workbench.roles.map((role) => role?.id === "hub" ? {
+      ...role,
+      promptTemplate: "",
+      prompt: normalizeHubExtension(role.prompt),
+    } : role) : workbench.roles,
+  };
+}
+
+function promptLayers(body, { source, template }) {
+  const content = typeof body === "string" ? body : "";
+  const marker = content.indexOf(PROMPT_INTENT_MARKER);
+  if (marker >= 0) {
+    return {
+      template,
+      body: content,
+      source,
+      promptBase: content.slice(0, marker).trim(),
+      intent: content.slice(marker + PROMPT_INTENT_MARKER.length).trim(),
+      promptMode: "layered",
+    };
+  }
+  if (source === "project") {
+    return { template, body: content, source, promptBase: "", intent: "", promptMode: "custom" };
+  }
+  return { template, body: content, source, promptBase: content.trim(), intent: "", promptMode: "layered" };
+}
+
+function roleBaseTemplate(role, promptTemplates) {
+  const template = canonicalRole(role);
+  return promptTemplates.find((prompt) => prompt.id === template)
+    || promptTemplates.find((prompt) => prompt.id === "generic");
+}
+
+function roleBase(role, promptTemplates) {
+  const builtin = roleBaseTemplate(role, promptTemplates);
+  return builtin?.body?.trim() || `You are the ${role} Spoke. Apply the most relevant domain method and produce a concrete, verified result.`;
+}
+
+function prepareWorkbenchPrompts(workbench, promptTemplates = loadPromptTemplates()) {
+  return {
+    ...workbench,
+    roles: (workbench.roles || []).map((role) => {
+      if (role.id === "hub") return role;
+      if (role.promptMode === "custom" && typeof role.prompt === "string" && role.prompt.trim()) return role;
+      if (role.promptMode !== "layered" && typeof role.prompt === "string" && role.prompt.trim()) {
+        return { ...role, promptMode: "custom", promptBase: "", intent: "" };
+      }
+      const promptBase = typeof role.promptBase === "string" && role.promptBase.trim()
+        ? role.promptBase.trim()
+        : roleBase(role.id, promptTemplates);
+      const layered = { ...role, promptMode: "layered", promptBase, intent: (role.intent || "").trim() };
+      return { ...layered, prompt: composeRolePrompt(layered) };
+    }),
+  };
+}
+
+function promptForRole(workspace, role, promptTemplates) {
+  const projectPrompt = path.join(workspace, ".gsb-local", "prompts", `${role}.md`);
+  if (role === "hub") {
+    const extension = path.join(workspace, ".gsb-local", "prompts", "hub-extension.md");
+    const source = existsSync(extension) ? extension : projectPrompt;
+    return {
+      template: "",
+      body: existsSync(source) ? normalizeHubExtension(readText(source)) : "",
+      source: existsSync(source) ? "project-extension" : "builtin-core-only",
+    };
+  }
+  if (existsSync(projectPrompt)) return promptLayers(readText(projectPrompt), { template: role, source: "project" });
+  const builtin = roleBaseTemplate(role, promptTemplates);
+  if (builtin) return promptLayers(builtin.body, { template: builtin.id, source: builtin.id === role ? "builtin" : "builtin-fallback" });
+  return promptLayers(roleBase(role, promptTemplates), { template: "", source: "generated" });
+}
+
+function defaultSession(workspace) {
+  const basename = path.basename(workspace);
+  return SESSION_PATTERN.test(basename) ? basename : "seed-gsb";
+}
+
+function defaultWorkbench(workspace, profile, promptTemplates) {
+  const projectAgents = path.join(workspace, ".gsb-local", "agents.conf");
+  const mappings = existsSync(projectAgents)
+    ? parseRoleMap(readText(projectAgents)).map(({ id: role, value: agent }) => ({ role, agent }))
+    : profile.roles;
+  const models = readModelMap(workspace);
+  return normalizeWorkbench({
+    version: 1,
+    name: `${path.basename(workspace)} workbench`,
+    profile: profile.id,
+    workspace,
+    session: defaultSession(workspace),
+    permission: "balanced",
+    watchdog: true,
+    rebuild: false,
+    roles: mappings.map(({ role, agent }) => {
+      const prompt = promptForRole(workspace, role, promptTemplates);
+      return {
+        id: role,
+        name: metadataForRole(role).name || role,
+        type: metadataForRole(role).type || "specialist",
+        description: metadataForRole(role).description || "自定义协作角色",
+        agent,
+        model: models.get(role) || inferredModel(agent),
+        promptTemplate: prompt.template,
+        prompt: prompt.body,
+        promptBase: prompt.promptBase,
+        intent: prompt.intent,
+        promptMode: prompt.promptMode,
+      };
+    }),
+  });
+}
+
+export function validateWorkbench(input) {
+  const errors = [];
+  const warnings = [];
+  const workbench = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  if (typeof workbench.workspace !== "string" || !path.isAbsolute(workbench.workspace)) errors.push("项目路径必须是绝对路径");
+  else if (!existsSync(workbench.workspace)) errors.push("项目路径不存在");
+  else {
+    try {
+      if (!statSync(workbench.workspace).isDirectory()) errors.push("项目路径不是目录");
+    } catch {
+      errors.push("无法检查项目路径");
+    }
+  }
+  if (typeof workbench.session !== "string" || !SESSION_PATTERN.test(workbench.session)) errors.push("会话名只能包含字母、数字、点、下划线和连字符");
+  if (!Array.isArray(workbench.roles) || !workbench.roles.length) errors.push("至少需要一个角色");
+  const seen = new Set();
+  for (const [index, role] of (workbench.roles || []).entries()) {
+    if (!role || typeof role !== "object") {
+      errors.push(`第 ${index + 1} 个角色配置无效`);
+      continue;
+    }
+    if (!ROLE_PATTERN.test(role.id || "")) errors.push(`角色 ID 无效：${role.id || `<第 ${index + 1} 项>`}`);
+    else if (seen.has(role.id)) errors.push(`角色重复：${role.id}`);
+    else seen.add(role.id);
+    if (typeof role.agent !== "string" || !role.agent.trim()) errors.push(`角色 ${role.id || index + 1} 缺少 Agent`);
+    else if (CONTROL_PATTERN.test(role.agent)) errors.push(`角色 ${role.id || index + 1} 的 Agent 不能包含换行或控制字符`);
+    else if (/^(claude|codex|kimi|shell):\s*$/.test(role.agent)) errors.push(`角色 ${role.id || index + 1} 的 Agent 冒号后必须提供命令`);
+    if (role.model != null && typeof role.model !== "string") errors.push(`角色 ${role.id || index + 1} 的模型必须是文本`);
+    else if (CONTROL_PATTERN.test(role.model || "")) errors.push(`角色 ${role.id || index + 1} 的模型不能包含换行或控制字符`);
+  }
+  const hubCount = (workbench.roles || []).filter((role) => role?.id === "hub").length;
+  if (hubCount !== 1) errors.push("每个模板必须且只能包含一个 hub 角色");
+  if (!seen.has("coder")) warnings.push("没有 coder：生产实现可能重新落回 Hub");
+  const hub = (workbench.roles || []).find((role) => role.id === "hub");
+  if (hub && hub.agent !== "claude-glm-5.3") warnings.push("Hub 未使用当前推荐的 claude-glm-5.3");
+  if (workbench.permission === "full-access") warnings.push("Full Access 会绕过内置 Agent 的常规审批与沙箱保护");
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+function commandForAgent(agent) {
+  if (agent === "claude" || agent === "codex" || agent === "kimi") return agent;
+  if (/^(claude|codex|kimi):/.test(agent)) return agent.slice(agent.indexOf(":") + 1).trim();
+  if (agent.startsWith("shell:")) return null;
+  return agent;
+}
+
+function commandAvailable(command) {
+  if (!command) return true;
+  const hasZsh = existsSync("/bin/zsh");
+  // The /bin/sh fallback intentionally checks executables only; aliases require interactive zsh.
+  const result = spawnSync(hasZsh ? "/bin/zsh" : "/bin/sh", hasZsh
+    ? ["-ic", 'whence -w -- "$1" >/dev/null 2>&1', "gsb-studio", command]
+    : ["-c", 'command -v "$1" >/dev/null 2>&1', "gsb-studio", command], { timeout: SPAWN_TIMEOUT_MS });
+  return result.status === 0;
+}
+
+function validationWithRuntime(workbench) {
+  const result = validateWorkbench(workbench);
+  for (const role of workbench.roles || []) {
+    const command = commandForAgent(role.agent || "");
+    if (command && !commandAvailable(command)) result.errors.push(`${role.id}: 找不到命令或 alias ${command}`);
+  }
+  if (SESSION_PATTERN.test(workbench.session || "")) {
+    const existing = listSessionOptions().find((session) => session.name === workbench.session);
+    if (existing?.workspace && existing.workspace !== workbench.workspace) {
+      result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
+    } else if (existing?.status === "running" && !workbench.rebuild) {
+      result.warnings.push(`会话 ${workbench.session} 已在运行；当前配置不会覆盖它。请勾选「重建同名会话」或更换会话名称`);
+    }
+  }
+  result.valid = result.errors.length === 0;
+  return result;
+}
+
+function configPreview(workbench) {
+  return {
+    agents: serializeAgents(workbench),
+    models: serializeModels(workbench),
+    manifest: serializeWorkbenchSidecar(workbench),
+  };
+}
+
+function persistProjectState(workbench) {
+  const normalized = prepareWorkbenchPrompts(normalizeWorkbench(workbench));
+  const validation = validationWithRuntime(normalized);
+  if (!validation.valid) return { validation };
+  saveStoredProjectState(normalized);
+  rememberProject(normalized.workspace);
+  const templateUpdated = syncActiveUserTemplate(normalized);
+  return { validation, files: configPreview(normalized), templateUpdated };
+}
+
+function recentProjectsFile() {
+  return path.join(configHome(), "recent-projects.json");
+}
+
+function loadRecentProjects() {
+  try {
+    const rows = JSON.parse(readText(recentProjectsFile(), "[]"));
+    return Array.isArray(rows) ? rows.filter((item) => typeof item === "string" && existsSync(item)).slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberProject(project) {
+  const next = [project, ...loadRecentProjects().filter((item) => item !== project)].slice(0, 12);
+  atomicWrite(recentProjectsFile(), `${JSON.stringify(next, null, 2)}\n`);
+}
+
+function normalizeTemplateName(name) {
+  const source = String(name || "")
+    .normalize("NFC")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!source) throw new Error("模板名称不能为空");
+  return source;
+}
+
+function templateSlug(name) {
+  const source = normalizeTemplateName(name);
+  const digest = createHash("sha256").update(source).digest("hex").slice(0, 10);
+  let slug = source
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug) slug = `template-${digest}`;
+  else if (!PROFILE_PATTERN.test(slug)) slug = `template-${slug}`;
+  if (slug.length > 72) slug = `${slug.slice(0, 58).replace(/[._-]+$/g, "")}-${digest}`;
+  return slug;
+}
+
+function loadUserTemplates() {
+  const directory = path.join(configHome(), "templates");
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .flatMap((name) => {
+      try {
+        const template = JSON.parse(readText(path.join(directory, name)));
+        return [{ id: name.slice(0, -5), ...template }];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function saveTemplate(name, workbench, preferredId = "") {
+  const normalizedName = normalizeTemplateName(name);
+  const slug = preferredId && PROFILE_PATTERN.test(preferredId) ? preferredId : templateSlug(normalizedName);
+  const normalized = normalizeWorkbench(workbench);
+  const validation = validateWorkbench(normalized);
+  const relevantErrors = validation.errors.filter((error) => !error.startsWith("项目路径"));
+  if (relevantErrors.length) throw new Error(relevantErrors.join("；"));
+  const template = {
+    name: normalizedName,
+    hubCore: normalized.hubCore,
+    permission: normalized.permission,
+    watchdog: normalized.watchdog,
+    roles: normalized.roles,
+    savedAt: new Date().toISOString(),
+  };
+  const file = path.join(configHome(), "templates", `${slug}.json`);
+  if (!preferredId && existsSync(file)) {
+    let existing = null;
+    try {
+      existing = JSON.parse(readText(file));
+    } catch {
+      // An unreadable target is still a collision and must not be overwritten.
+    }
+    if (existing?.name !== normalizedName) {
+      const error = new Error(`模板标识 ${slug} 已被「${existing?.name || "未知模板"}」使用，请换一个名称`);
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  atomicWrite(file, `${JSON.stringify(template, null, 2)}\n`);
+  return { id: slug, ...template };
+}
+
+function syncActiveUserTemplate(workbench) {
+  const match = typeof workbench.profile === "string" ? workbench.profile.match(/^user:([A-Za-z0-9][A-Za-z0-9._-]*)$/) : null;
+  if (!match) return null;
+  const id = match[1];
+  const file = path.join(configHome(), "templates", `${id}.json`);
+  if (!existsSync(file)) return null;
+  let existing;
+  try {
+    existing = JSON.parse(readText(file));
+  } catch {
+    return null;
+  }
+  return saveTemplate(existing.name || workbench.name || id, workbench, id);
+}
+
+function listSessions() {
+  const result = spawnSync("zellij", ["list-sessions", "--no-formatting"], { encoding: "utf8", timeout: SPAWN_TIMEOUT_MS });
+  return (result.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function activeSessionLine(session) {
+  return listSessions().find((line) => line.split(/\s+/, 1)[0] === session && !/\bEXITED\b/.test(line));
+}
+
+function stateRoot() {
+  return process.env.GSB_STUDIO_STATE_HOME
+    || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "gsb-local");
+}
+
+function sessionState(name, directory, liveLine = "") {
+  const roster = readText(path.join(directory, "ROLES.md"));
+  const task = readText(path.join(directory, "TASK.md"));
+  const workspace = roster.match(/^Workspace:\s*(.+)$/m)?.[1]?.trim()
+    || task.match(/^Workspace:\s*(.+)$/m)?.[1]?.trim()
+    || "";
+  const roles = [...roster.matchAll(/^- ([a-z][a-z0-9-]*):/gm)].map((match) => match[1]);
+  let updatedAt = 0;
+  try {
+    updatedAt = statSync(directory).mtimeMs;
+  } catch {
+    // A disappearing state directory is simply omitted from freshness sorting.
+  }
+  const status = liveLine ? (/\bEXITED\b/.test(liveLine) ? "exited" : "running") : "saved";
+  return {
+    name,
+    status,
+    workspace,
+    roles,
+    updatedAt,
+    raw: liveLine,
+  };
+}
+
+function listSessionOptions() {
+  const liveLines = listSessions();
+  const liveByName = new Map(liveLines.map((line) => [line.split(/\s+/, 1)[0], line]));
+  const options = new Map();
+  const root = stateRoot();
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !SESSION_PATTERN.test(entry.name)) continue;
+      options.set(entry.name, sessionState(entry.name, path.join(root, entry.name), liveByName.get(entry.name) || ""));
+    }
+  } catch {
+    // A first-time Studio user can legitimately have no GSB state directory.
+  }
+  for (const [name, line] of liveByName) {
+    if (!SESSION_PATTERN.test(name) || options.has(name)) continue;
+    options.set(name, sessionState(name, path.join(root, name), line));
+  }
+  const rank = { running: 0, exited: 1, saved: 2 };
+  return [...options.values()].sort((left, right) => (
+    rank[left.status] - rank[right.status]
+    || right.updatedAt - left.updatedAt
+    || left.name.localeCompare(right.name)
+  ));
+}
+
+function listProjectOptions(currentProject, sessions = listSessionOptions()) {
+  const paths = [];
+  const append = (project) => {
+    if (typeof project !== "string" || !path.isAbsolute(project) || paths.includes(project)) return;
+    try {
+      if (!statSync(project).isDirectory()) return;
+    } catch {
+      return;
+    }
+    paths.push(project);
+  };
+  append(currentProject);
+  loadRecentProjects().forEach(append);
+  sessions.forEach((session) => append(session.workspace));
+  return paths.map((project) => {
+    const related = sessions.filter((session) => session.workspace === project);
+    return {
+      path: project,
+      name: path.basename(project) || project,
+      configured: existsSync(path.join(project, ".gsb-local", "agents.conf")),
+      sessions: related.length,
+      running: related.filter((session) => session.status === "running").length,
+    };
+  });
+}
+
+export function loadProjectState(workspace, profiles = loadProfiles(), prompts = loadPromptTemplates()) {
+  return loadStoredProjectState(workspace, {
+    profiles,
+    prompts,
+    roleMeta,
+    roleBaseAliases,
+    defaultWorkbench,
+    promptForRole,
+    normalizeWorkbench,
+    validateWorkbench,
+  });
+}
+
+function bootstrap(project) {
+  const profiles = loadProfiles();
+  const prompts = loadPromptTemplates();
+  const userTemplates = loadUserTemplates().map((template) => ({ ...template, ...normalizeWorkbench(template) }));
+  const sessionOptions = listSessionOptions();
+  return {
+    product: { name: "GSB Studio", version: 1, apiVersion: STUDIO_API_VERSION },
+    platform: process.platform,
+    profiles,
+    prompts,
+    roleMeta,
+    roleBaseAliases,
+    modelSuggestions: MODEL_SUGGESTIONS,
+    recentProjects: project ? [project, ...loadRecentProjects().filter((item) => item !== project)] : loadRecentProjects(),
+    userTemplates,
+    sessions: sessionOptions.filter((session) => session.raw).map((session) => session.raw),
+    sessionOptions,
+    projectOptions: listProjectOptions(project, sessionOptions),
+    workbench: project ? loadProjectState(project, profiles, prompts) : null,
+  };
+}
+
+function projectWorkbench(workspace, { remember = true } = {}) {
+  if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw new Error("项目路径必须是绝对路径");
+  if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw new Error("项目路径不存在或不是目录");
+  const profiles = loadProfiles();
+  const prompts = loadPromptTemplates();
+  if (remember) rememberProject(workspace);
+  const sessionOptions = listSessionOptions();
+  return {
+    workbench: loadProjectState(workspace, profiles, prompts),
+    sessionOptions,
+    projectOptions: listProjectOptions(workspace, sessionOptions),
+  };
+}
+
+function runtimeResources(project) {
+  const sessionOptions = listSessionOptions();
+  return {
+    sessionOptions,
+    projectOptions: listProjectOptions(project, sessionOptions),
+  };
+}
+
+function jsonResponse(response, status, payload) {
+  const body = `${JSON.stringify(payload)}\n`;
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(body);
+}
+
+function readJson(request) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("请求内容过大"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch {
+        reject(new Error("JSON 格式无效"));
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+function staticFile(response, pathname) {
+  const files = {
+    "/": ["index.html", "text/html; charset=utf-8"],
+    "/index.html": ["index.html", "text/html; charset=utf-8"],
+    "/styles.css": ["styles.css", "text/css; charset=utf-8"],
+    "/app.js": ["app.js", "text/javascript; charset=utf-8"],
+  };
+  const entry = files[pathname];
+  if (!entry) return false;
+  const body = readFileSync(path.join(PUBLIC_DIR, entry[0]));
+  response.writeHead(200, {
+    "content-type": entry[1],
+    "content-length": body.length,
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(body);
+  return true;
+}
+
+function pickDirectory() {
+  if (process.platform !== "darwin") throw new Error("当前平台请直接输入绝对项目路径");
+  const result = spawnSync("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择 GSB 项目目录")'], { encoding: "utf8", timeout: 10_000 });
+  if (result.error?.code === "ETIMEDOUT") throw new Error("目录选择超时，请直接输入绝对项目路径");
+  if (result.status !== 0) throw new Error("已取消目录选择");
+  return result.stdout.trim().replace(/\/$/, "");
+}
+
+function launchWorkbench(workbench) {
+  const saved = persistProjectState(workbench);
+  if (!saved.validation.valid) return { ...saved, launched: false };
+  const args = ["--background"];
+  if (workbench.rebuild) args.push("--rebuild");
+  if (workbench.permission === "full-access") args.push("--full-access");
+  args.push(workbench.workspace, workbench.session);
+  const command = ["gsb-local", ...args].map((part) => (/^[A-Za-z0-9_./-]+$/.test(part) ? part : JSON.stringify(part))).join(" ");
+  const openCommand = `gsb-local open ${workbench.session}`;
+  const existing = activeSessionLine(workbench.session);
+  if (existing && !workbench.rebuild) {
+    return {
+      ...saved,
+      launched: false,
+      command,
+      openCommand,
+      stdout: "",
+      stderr: `同名 Zellij 会话已在运行：${workbench.session}\n请勾选「重建同名会话」以应用当前配置，或换一个会话名称以保留旧会话。\n`,
+      status: 64,
+      error: "当前配置没有启动：同名旧会话仍在运行",
+    };
+  }
+  const env = { ...process.env, GSB_WATCHDOG_ENABLED: workbench.watchdog === false ? "false" : "true" };
+  const result = spawnSync(path.join(ROOT_DIR, "gsb"), args, { encoding: "utf8", env, timeout: 45_000 });
+  return {
+    ...saved,
+    launched: result.status === 0,
+    command,
+    openCommand,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+    status: result.status,
+  };
+}
+
+export function openTerminalSession(session, { platform = process.platform, spawnImpl = spawn } = {}) {
+  if (typeof session !== "string" || !SESSION_PATTERN.test(session)) {
+    const error = new Error("会话名只能包含字母、数字、点、下划线和连字符");
+    error.statusCode = 400;
+    throw error;
+  }
+  const command = `gsb-local open ${session}`;
+  if (platform !== "darwin") return { command, opened: false };
+  const script = `tell application "Terminal" to do script "${command}"`;
+  const terminal = spawnImpl("osascript", ["-e", script], { detached: true, stdio: "ignore" });
+  terminal.unref();
+  return { command, opened: true };
+}
+
+export function createStudioServer({ project, token, platform = process.platform, terminalSpawner = spawn }) {
+  return createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url || "/", "http://127.0.0.1");
+      if (!url.pathname.startsWith("/api/")) {
+        if (!staticFile(response, url.pathname)) jsonResponse(response, 404, { error: "Not found" });
+        return;
+      }
+      if (request.headers["x-gsb-token"] !== token) {
+        jsonResponse(response, 403, { error: "Invalid Studio token" });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/bootstrap") {
+        jsonResponse(response, 200, bootstrap(project));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/resources") {
+        const requestedProject = url.searchParams.get("project") || project;
+        jsonResponse(response, 200, runtimeResources(requestedProject));
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/project") {
+        const body = await readJson(request);
+        jsonResponse(response, 200, projectWorkbench(body.workspace, { remember: body.remember !== false }));
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/validate") {
+        const body = await readJson(request);
+        jsonResponse(response, 200, { validation: validationWithRuntime(body.workbench), files: configPreview(body.workbench) });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/save") {
+        const body = await readJson(request);
+        const result = persistProjectState(body.workbench);
+        jsonResponse(response, result.validation.valid ? 200 : 422, result);
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/launch") {
+        const body = await readJson(request);
+        const result = launchWorkbench(body.workbench);
+        jsonResponse(response, result.launched ? 200 : 422, result);
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/open-terminal") {
+        const body = await readJson(request);
+        jsonResponse(response, 200, openTerminalSession(body.session, { platform, spawnImpl: terminalSpawner }));
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/templates") {
+        const body = await readJson(request);
+        jsonResponse(response, 200, { template: saveTemplate(body.name, body.workbench), templates: loadUserTemplates() });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/pick-directory") {
+        jsonResponse(response, 200, { path: pickDirectory() });
+        return;
+      }
+      jsonResponse(response, 404, { error: "Unknown API route" });
+    } catch (error) {
+      jsonResponse(response, Number.isInteger(error?.statusCode) ? error.statusCode : 500, { error: error?.message || String(error) });
+    }
+  });
+}
+
+function printHelp() {
+  console.log(`Usage: gsb-local studio [--project PATH] [--port PORT] [--no-open]
+
+Starts the local-only GSB Studio configuration UI. Port 0 chooses a free port.`);
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    printHelp();
+    return;
+  }
+  if (options.project && !existsSync(options.project)) throw new Error(`Project does not exist: ${options.project}`);
+  const token = randomBytes(24).toString("hex");
+  const server = createStudioServer({ project: options.project, token });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const url = `http://127.0.0.1:${address.port}/?token=${token}`;
+  console.log(`GSB Studio: ${url}`);
+  console.log("Only this local machine can connect. Press Ctrl-C to stop Studio; running Zellij sessions continue.");
+  if (options.open && process.platform === "darwin") {
+    const opener = spawn("open", [url], { detached: true, stdio: "ignore" });
+    opener.unref();
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`gsb-studio: ${error.message}`);
+    process.exit(1);
+  });
+}
