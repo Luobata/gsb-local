@@ -2,7 +2,7 @@
 
 ## Authority
 
-- Hub is owner-facing and is the only role that makes final decisions or edits production files by default.
+- Hub is owner-facing and is the only role that makes final decisions. Production edits belong to the single path-scoped writer named in the Hub contract; the thin Hub does not edit production files by default.
 - The active role roster is the authority for which roles currently exist. A prompt or historical file does not activate a removed role.
 - Each Spoke has contract-only authority. It may inspect, diagnose, verify, and write its report, but it must not expand scope or infer approval.
 - A message being delivered does not grant permission, acceptance, or control authority.

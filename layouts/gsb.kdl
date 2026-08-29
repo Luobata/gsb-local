@@ -1,0 +1,6 @@
+// Compatibility fallback for older Zellij configs that still point their
+// global default_layout at this path. GSB Local itself supplies its generated,
+// session-specific layout explicitly with `zellij --layout`.
+layout {
+    pane
+}

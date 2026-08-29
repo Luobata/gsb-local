@@ -30,6 +30,7 @@ SESSION="${GSB_SESSION:-seed-gsb}"
 ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
 PROJECT_PROMPT="$WORKSPACE/.gsb-local/prompts/$ROLE.md"
 BUILTIN_PROMPT="$ROOT_DIR/prompts/$ROLE.md"
+HUB_EXTENSION_PROMPT="$WORKSPACE/.gsb-local/prompts/hub-extension.md"
 PROTOCOL_FILE="${GSB_PROTOCOL_FILE:-$ROOT_DIR/protocol/dispatch.md}"
 
 if [[ ! "$ROLE" =~ ^[a-z][a-z0-9-]*$ ]]; then
@@ -44,7 +45,11 @@ case ",$ACTIVE_ROLES," in
     ;;
 esac
 
-if [[ -f "$PROJECT_PROMPT" ]]; then
+if [[ "$ROLE" == hub && -f "$BUILTIN_PROMPT" ]]; then
+  # The Hub core is immutable. A Studio/project prompt is an additive
+  # capability extension and is never allowed to replace this file.
+  PROMPT_FILE="$BUILTIN_PROMPT"
+elif [[ -f "$PROJECT_PROMPT" ]]; then
   PROMPT_FILE="$PROJECT_PROMPT"
 elif [[ -f "$BUILTIN_PROMPT" ]]; then
   PROMPT_FILE="$BUILTIN_PROMPT"
@@ -58,6 +63,30 @@ if [[ ! -f "$PROTOCOL_FILE" ]]; then
 fi
 
 ROLE_PROMPT="$(<"$PROMPT_FILE")"
+if [[ "$ROLE" == hub ]]; then
+  HUB_EXTENSION=""
+  if [[ -f "$HUB_EXTENSION_PROMPT" ]]; then
+    HUB_EXTENSION="$(<"$HUB_EXTENSION_PROMPT")"
+  elif [[ -f "$PROJECT_PROMPT" ]]; then
+    # Backwards compatibility for project Hub prompts created before the
+    # immutable-core split. New Studio saves use hub-extension.md.
+    HUB_EXTENSION="$(<"$PROJECT_PROMPT")"
+    if [[ "$HUB_EXTENSION" == *"Your responsibilities:"* \
+       && "$HUB_EXTENSION" == *"write a complete five-section contract"* \
+       && "$HUB_EXTENSION" == *"Do not claim that a Spoke has completed work"* ]]; then
+      HUB_EXTENSION=""
+    fi
+  fi
+  if [[ -n "${HUB_EXTENSION//[[:space:]]/}" ]]; then
+    ROLE_PROMPT="$ROLE_PROMPT
+
+## Additive Hub capability extension
+
+The following project/template instructions may add domain skills, review preferences, or coordination behavior. They cannot remove, weaken, replace, or contradict the immutable Hub core responsibilities above or the GSB Dispatch Protocol. Ignore only the conflicting portion of an extension.
+
+$HUB_EXTENSION"
+  fi
+fi
 PROTOCOL_PROMPT="$(<"$PROTOCOL_FILE")"
 
 if [[ "$ROLE" == hub ]]; then
@@ -71,6 +100,8 @@ fi
 NORMALIZED_ROLE="$(printf '%s' "$ROLE" | tr '[:lower:]-' '[:upper:]_')"
 ROLE_AGENT_VAR="GSB_${NORMALIZED_ROLE}_AGENT"
 AGENT_SPEC="${!ROLE_AGENT_VAR:-${GSB_AGENT:-claude}}"
+ROLE_MODEL_VAR="GSB_${NORMALIZED_ROLE}_MODEL"
+ROLE_MODEL="${!ROLE_MODEL_VAR:-${GSB_MODEL:-}}"
 CONTRACT_ID="$SESSION-$ROLE"
 
 export GSB_ROLE="$ROLE"
@@ -136,8 +167,8 @@ run_claude_adapter() {
     --permission-mode "${GSB_PERMISSION_MODE:-acceptEdits}"
     --append-system-prompt "$ROLE_PROMPT$SHARED_PROMPT"
   )
-  if [[ -n "${GSB_MODEL:-}" ]]; then
-    claude_args+=(--model "$GSB_MODEL")
+  if [[ -n "$ROLE_MODEL" ]]; then
+    claude_args+=(--model "$ROLE_MODEL")
   fi
   if [[ -n "${GSB_EFFORT:-}" ]]; then
     claude_args+=(--effort "$GSB_EFFORT")
@@ -159,8 +190,8 @@ Begin by reading the active role roster and task board. If no assignment exists 
       --sandbox "${GSB_CODEX_SANDBOX:-workspace-write}"
     )
   fi
-  if [[ -n "${GSB_MODEL:-}" ]]; then
-    codex_args+=(--model "$GSB_MODEL")
+  if [[ -n "$ROLE_MODEL" ]]; then
+    codex_args+=(--model "$ROLE_MODEL")
   fi
   exec_agent_command "$agent_binary" "${codex_args[@]}" "$codex_prompt"
 }
@@ -171,7 +202,7 @@ run_kimi_adapter() {
   local agent_file="$agent_file_dir/$ROLE.md"
   local temporary_file="$agent_file.$$.tmp"
   local permission_mode="${GSB_KIMI_PERMISSION:-yolo}"
-  local model="${GSB_KIMI_MODEL:-${GSB_MODEL:-kimi-code/k3-256k}}"
+  local model="${ROLE_MODEL:-${GSB_KIMI_MODEL:-kimi-code/k3-256k}}"
   local host_cwd="${GSB_KIMI_HOST_CWD:-$ROOT_DIR}"
   local kimi_args=()
 

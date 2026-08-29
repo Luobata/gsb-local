@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import { readFileSync } from "node:fs";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -21,10 +23,54 @@ for (const role of roles) {
 }
 
 const quote = (value) => JSON.stringify(value);
-const command = (role) => `exec \"$GSB_LOCAL_ROOT/bin/supervise\" ${role}`;
-const title = (role) => role === "hub" ? `hub.${session}.main` : `spk.${session}.${role}`;
+const shellQuote = (value) => `'${String(value).replaceAll("'", `'\\''`)}'`;
+const sessionEnvFile = process.env.GSB_SESSION_ENV_FILE;
+const rootDir = process.env.GSB_LOCAL_ROOT;
+if (!sessionEnvFile || !path.isAbsolute(sessionEnvFile)) fail("GSB_SESSION_ENV_FILE must be an absolute path");
+if (!rootDir || !path.isAbsolute(rootDir)) fail("GSB_LOCAL_ROOT must be an absolute path");
+const command = (role) => `source ${shellQuote(sessionEnvFile)} && exec ${shellQuote(path.join(rootDir, "bin", "supervise"))} ${shellQuote(role)}`;
+
+function agentSpec(role) {
+  const key = `GSB_${role.replaceAll("-", "_").toUpperCase()}_AGENT`;
+  return process.env[key] || "agent";
+}
+
+function roleModel(role) {
+  const key = `GSB_${role.replaceAll("-", "_").toUpperCase()}_MODEL`;
+  return process.env[key] || null;
+}
+
+function codexDefaultModel() {
+  try {
+    const config = readFileSync(path.join(os.homedir(), ".codex", "config.toml"), "utf8");
+    return config.match(/^model\s*=\s*"([^"]+)"/m)?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function modelLabel(role) {
+  const spec = agentSpec(role);
+  const configured = roleModel(role);
+  if (configured) return configured;
+  if (spec === "codex" || spec.startsWith("codex:")) {
+    return process.env.GSB_MODEL || codexDefaultModel() || spec.replace(/^codex:/, "");
+  }
+  if (spec === "kimi" || spec.startsWith("kimi:")) {
+    return process.env.GSB_KIMI_MODEL || process.env.GSB_MODEL || "kimi-code/k3-256k";
+  }
+  if (spec.startsWith("claude:")) {
+    return process.env.GSB_MODEL || spec.slice("claude:".length);
+  }
+  if (spec === "claude") return process.env.GSB_MODEL || spec;
+  if (spec.startsWith("shell:")) return "custom-shell";
+  return process.env.GSB_MODEL || spec;
+}
+
+const baseTitle = (role) => role === "hub" ? `hub.${session}.main` : `spk.${session}.${role}`;
+const title = (role) => `${baseTitle(role)} · ${modelLabel(role)}`;
 const pane = (role, indent, options = "") => [
-  `${indent}pane${options} name=${quote(title(role))} command=${quote("/bin/zsh")} {`,
+  `${indent}pane start_suspended=false${options} name=${quote(title(role))} command=${quote("/bin/zsh")} {`,
   `${indent}    args ${quote("-lc")} ${quote(command(role))}`,
   `${indent}}`,
 ];
