@@ -6,6 +6,38 @@ ROOT_DIR="$(cd "$NUDGE_DIR/.." && pwd)"
 TARGET_ROLE="${1:-}"
 MODE="${2:-}"
 SESSION="${GSB_SESSION:-${ZELLIJ_SESSION_NAME:-seed-gsb}}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$SESSION"
+SESSION_ENV="$STATE_DIR/session.env"
+SOCKET_FROM_SESSION_ENV=false
+
+gsb_socket_dir() {
+  local cache_root
+  if [[ -n "${GSB_SOCKET_DIR_OVERRIDE:-}" ]]; then
+    printf '%s\n' "${GSB_SOCKET_DIR_OVERRIDE%/}"
+  else
+    cache_root="${XDG_CACHE_HOME:-$HOME/.cache}"
+    printf '%s/gsb-zsock\n' "${cache_root%/}"
+  fi
+}
+
+session_socket_dir_from_env() {
+  local env_file="$1"
+  [[ -f "$env_file" ]] || return 0
+  (
+    unset ZELLIJ_SOCKET_DIR
+    source "$env_file" 2>/dev/null || exit 0
+    printf '%s' "${ZELLIJ_SOCKET_DIR:-}"
+  )
+}
+
+SAVED_SOCKET_DIR="$(session_socket_dir_from_env "$SESSION_ENV" || true)"
+if [[ -n "$SAVED_SOCKET_DIR" ]]; then
+  export ZELLIJ_SOCKET_DIR="$SAVED_SOCKET_DIR"
+  SOCKET_FROM_SESSION_ENV=true
+fi
+if [[ "$SOCKET_FROM_SESSION_ENV" != true ]]; then
+  export ZELLIJ_SOCKET_DIR="$(gsb_socket_dir)"
+fi
 SOURCE_ROLE="${GSB_ROLE:-external}"
 ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
 
@@ -44,8 +76,10 @@ if [[ "$MODE" != "--dry-run" ]]; then
   fi
 fi
 
-PANE_JSON="$(ZELLIJ_SESSION_NAME="$SESSION" zellij action list-panes --json --all)"
-PANE_MATCH="$(printf '%s' "$PANE_JSON" | node -e '
+resolve_target_pane() {
+  local pane_json
+  pane_json="$(ZELLIJ_SESSION_NAME="$SESSION" zellij action list-panes --json --all 2>/dev/null)" || return 1
+  printf '%s' "$pane_json" | node -e '
   let raw = "";
   process.stdin.on("data", chunk => raw += chunk);
   process.stdin.on("end", () => {
@@ -56,17 +90,26 @@ PANE_MATCH="$(printf '%s' "$PANE_JSON" | node -e '
     if (hits.length !== 1) process.exit(3);
     process.stdout.write(`${hits[0].id}\t${hits[0].title}`);
   });
-' "$TARGET_TITLE")" || {
+' "$TARGET_TITLE"
+}
+
+PANE_MATCH=""
+if ! PANE_MATCH="$(resolve_target_pane)"; then
+  if [[ "$SOCKET_FROM_SESSION_ENV" != true ]]; then
+    unset ZELLIJ_SOCKET_DIR
+    PANE_MATCH="$(resolve_target_pane)" || PANE_MATCH=""
+  fi
+fi
+if [[ -z "$PANE_MATCH" ]]; then
   printf 'Could not resolve exactly one live pane matching %s in %s.\n' "$TARGET_TITLE" "$SESSION" >&2
   exit 3
-}
+fi
 PANE_ID="${PANE_MATCH%%$'\t'*}"
 PANE_TITLE="${PANE_MATCH#*$'\t'}"
 
 TARGET_AGENT_VAR="GSB_$(printf '%s' "$TARGET_ROLE" | tr '[:lower:]-' '[:upper:]_')_AGENT"
 TARGET_AGENT_SPEC="${!TARGET_AGENT_VAR:-}"
 if [[ -z "$TARGET_AGENT_SPEC" ]]; then
-  STATE_DIR="${GSB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$SESSION}"
   ROSTER_FILE="${GSB_ROLE_ROSTER:-$STATE_DIR/ROLES.md}"
   if [[ -f "$ROSTER_FILE" ]]; then
     TARGET_AGENT_SPEC="$(awk -v role="$TARGET_ROLE" '

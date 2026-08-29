@@ -594,9 +594,56 @@ function syncActiveUserTemplate(workbench) {
   return saveTemplate(existing.name || workbench.name || id, workbench, id);
 }
 
-function listSessions() {
-  const result = spawnSync("zellij", ["list-sessions", "--no-formatting"], { encoding: "utf8", timeout: SPAWN_TIMEOUT_MS });
-  return (result.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+export function gsbSocketDir({ env = process.env, home = os.homedir() } = {}) {
+  if (env.GSB_SOCKET_DIR_OVERRIDE) return env.GSB_SOCKET_DIR_OVERRIDE;
+  return path.join(env.XDG_CACHE_HOME || path.join(home, ".cache"), "gsb-zsock");
+}
+
+export function defaultZellijSocketDir({ env = process.env, uid = process.getuid?.() ?? 0 } = {}) {
+  return path.join(env.TMPDIR || os.tmpdir(), `zellij-${uid}`);
+}
+
+export function zellijSocketPathInfo(socketDir, session) {
+  const socketPath = path.join(socketDir, "contract_version_1", session);
+  const length = Buffer.byteLength(socketPath);
+  return { path: socketPath, length, valid: length <= 103 };
+}
+
+function savedSessionSocketDirs() {
+  const dirs = [];
+  try {
+    for (const entry of readdirSync(stateRoot(), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const match = readText(path.join(stateRoot(), entry.name, "session.env")).match(/^export ZELLIJ_SOCKET_DIR=(.+)$/m);
+      if (match && !match[1].startsWith("$'")) dirs.push(match[1].replace(/\\(.)/g, "$1"));
+    }
+  } catch {
+    // Sessions created before W12 legitimately have no saved socket directory.
+  }
+  return dirs;
+}
+
+export function listSessions({ spawnSyncImpl = spawnSync, env = process.env, home, uid, socketDirs } = {}) {
+  const lines = new Map();
+  const unified = gsbSocketDir({ env, home });
+  const legacy = defaultZellijSocketDir({ env, uid });
+  for (const socketDir of [...new Set(socketDirs || [unified, legacy, ...savedSessionSocketDirs()])]) {
+    const childEnv = { ...env };
+    delete childEnv.ZELLIJ_SESSION_NAME;
+    delete childEnv.ZELLIJ_SESSION_DIR;
+    if (socketDir === legacy) delete childEnv.ZELLIJ_SOCKET_DIR;
+    else childEnv.ZELLIJ_SOCKET_DIR = socketDir;
+    const result = spawnSyncImpl("zellij", ["list-sessions", "--no-formatting"], {
+      encoding: "utf8",
+      env: childEnv,
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+    for (const line of (result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      const name = line.split(/\s+/, 1)[0];
+      if (!lines.has(name) || (/\bEXITED\b/.test(lines.get(name)) && !/\bEXITED\b/.test(line))) lines.set(name, line);
+    }
+  }
+  return [...lines.values()];
 }
 
 function activeSessionLine(session) {
@@ -805,7 +852,20 @@ function pickDirectory() {
   return result.stdout.trim().replace(/\/$/, "");
 }
 
-function launchWorkbench(workbench) {
+export function studioLaunchEnv(sourceEnv, watchdogEnabled) {
+  const passthrough = sourceEnv.GSB_STUDIO_ENV_PASSTHROUGH === "1";
+  const env = passthrough
+    ? { ...sourceEnv }
+    : Object.fromEntries(Object.entries(sourceEnv).filter(([name]) => !/^(GSB_|ZELLIJ_)/.test(name)));
+  env.GSB_WATCHDOG_ENABLED = watchdogEnabled ? "true" : "false";
+  return env;
+}
+
+export function launchWorkbench(workbench, {
+  spawnSyncImpl = spawnSync,
+  sourceEnv = process.env,
+  activeSessionLineImpl = activeSessionLine,
+} = {}) {
   const saved = persistProjectState(workbench);
   if (!saved.validation.valid) return { ...saved, launched: false };
   const args = ["--background"];
@@ -814,7 +874,7 @@ function launchWorkbench(workbench) {
   args.push(workbench.workspace, workbench.session);
   const command = ["gsb-local", ...args].map((part) => (/^[A-Za-z0-9_./-]+$/.test(part) ? part : JSON.stringify(part))).join(" ");
   const openCommand = `gsb-local open ${workbench.session}`;
-  const existing = activeSessionLine(workbench.session);
+  const existing = activeSessionLineImpl(workbench.session);
   if (existing && !workbench.rebuild) {
     return {
       ...saved,
@@ -827,8 +887,8 @@ function launchWorkbench(workbench) {
       error: "当前配置没有启动：同名旧会话仍在运行",
     };
   }
-  const env = { ...process.env, GSB_WATCHDOG_ENABLED: workbench.watchdog === false ? "false" : "true" };
-  const result = spawnSync(path.join(ROOT_DIR, "gsb"), args, { encoding: "utf8", env, timeout: 45_000 });
+  const env = studioLaunchEnv(sourceEnv, workbench.watchdog !== false);
+  const result = spawnSyncImpl(path.join(ROOT_DIR, "gsb"), args, { encoding: "utf8", env, timeout: 45_000 });
   return {
     ...saved,
     launched: result.status === 0,

@@ -9,6 +9,10 @@ import { fileURLToPath } from "node:url";
 import {
   createRuntimeValidator,
   createStudioServer,
+  defaultZellijSocketDir,
+  gsbSocketDir,
+  launchWorkbench,
+  listSessions,
   loadProjectState,
   openTerminalSession,
   parseArgs,
@@ -16,7 +20,9 @@ import {
   parseRoleMap,
   serializeAgents,
   serializeModels,
+  studioLaunchEnv,
   validateWorkbench,
+  zellijSocketPathInfo,
 } from "./server.mjs";
 import { PROMPT_INTENT_MARKER, saveProjectState } from "./store.mjs";
 
@@ -111,6 +117,79 @@ test("terminal opening validates sessions and has a portable command fallback", 
   assert.equal(unrefCalled, true);
 });
 
+test("Studio launches with pane-scoped GSB and Zellij variables removed", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-launch-env-"));
+  let spawned;
+  try {
+    const result = launchWorkbench(fixture(workspace), {
+      sourceEnv: {
+        PATH: "/usr/bin:/bin",
+        GSB_STATE_DIR: "/wrong/session",
+        GSB_SESSION: "caller-session",
+        GSB_SOCKET_DIR_OVERRIDE: "/wrong/socket",
+        ZELLIJ_SESSION_NAME: "caller-session",
+        ZELLIJ_SOCKET_DIR: "/wrong/socket",
+      },
+      activeSessionLineImpl: () => null,
+      spawnSyncImpl(command, args, options) {
+        spawned = { command, args, options };
+        return { status: 0, stdout: "created\n", stderr: "" };
+      },
+    });
+    assert.equal(result.launched, true);
+    assert.equal(spawned.options.env.PATH, "/usr/bin:/bin");
+    assert.equal(spawned.options.env.GSB_WATCHDOG_ENABLED, "true");
+    for (const name of ["GSB_STATE_DIR", "GSB_SESSION", "GSB_SOCKET_DIR_OVERRIDE", "ZELLIJ_SESSION_NAME", "ZELLIJ_SOCKET_DIR"]) {
+      assert.equal(name in spawned.options.env, false, name);
+    }
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("Studio launch passthrough rollback preserves inherited variables", () => {
+  const env = studioLaunchEnv({
+    GSB_STUDIO_ENV_PASSTHROUGH: "1",
+    GSB_STATE_DIR: "/legacy/state",
+    ZELLIJ_SESSION_NAME: "legacy-session",
+  }, false);
+  assert.equal(env.GSB_STATE_DIR, "/legacy/state");
+  assert.equal(env.ZELLIJ_SESSION_NAME, "legacy-session");
+  assert.equal(env.GSB_WATCHDOG_ENABLED, "false");
+});
+
+test("socket directory and 103-byte boundary calculations are stable", () => {
+  assert.equal(gsbSocketDir({ env: {}, home: "/Users/test" }), "/Users/test/.cache/gsb-zsock");
+  assert.equal(gsbSocketDir({ env: { XDG_CACHE_HOME: "/cache" }, home: "/ignored" }), "/cache/gsb-zsock");
+  assert.equal(gsbSocketDir({ env: { GSB_SOCKET_DIR_OVERRIDE: "/override" } }), "/override");
+  assert.equal(defaultZellijSocketDir({ env: { TMPDIR: "/tmp/root/" }, uid: 501 }), "/tmp/root/zellij-501");
+  assert.equal(zellijSocketPathInfo("/tmp/gsb-501", "x".repeat(44)).length, 76);
+  assert.deepEqual(
+    [zellijSocketPathInfo("/tmp/gsb-501", "x".repeat(71)).valid, zellijSocketPathInfo("/tmp/gsb-501", "x".repeat(72)).valid],
+    [true, false],
+  );
+});
+
+test("Studio merges unified and default Zellij session views", () => {
+  const calls = [];
+  const sessions = listSessions({
+    env: { PATH: "/usr/bin:/bin", TMPDIR: "/tmp" },
+    home: "/Users/test",
+    uid: 501,
+    socketDirs: ["/Users/test/.cache/gsb-zsock", "/tmp/zellij-501"],
+    spawnSyncImpl(command, args, options) {
+      calls.push({ command, args, options });
+      return options.env.ZELLIJ_SOCKET_DIR
+        ? { stdout: "shared [Created now] (EXITED - attach to resurrect)\nunified [Created now]\n" }
+        : { stdout: "shared [Created now]\nlegacy [Created now]\n" };
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(sessions.includes("shared [Created now]"));
+  assert.ok(sessions.some((line) => line.startsWith("unified ")));
+  assert.ok(sessions.some((line) => line.startsWith("legacy ")));
+});
+
 test("role maps and generated configuration round-trip", () => {
   assert.deepEqual(parseRoleMap("# comment\nhub=claude-glm-5.3\ncore_bug=codex\n"), [
     { id: "hub", value: "claude-glm-5.3" },
@@ -140,6 +219,78 @@ test("the default role map is sourced from config1 without changing its CLI path
   assert.deepEqual(parseRoleMap(readFileSync(defaults, "utf8")), parseRoleMap(readFileSync(config1, "utf8")));
 });
 
+test("pane GSB decisions classify every direct environment fallback", () => {
+  const source = readFileSync(path.join(ROOT_DIR, "gsb"), "utf8");
+  const expectedStripped = new Set(`
+    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR
+    GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE
+    GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE
+    GSB_SESSION_METADATA_FILE GSB_ROLES GSB_WATCHDOG_ENABLED GSB_FULL_ACCESS
+    GSB_PERMISSION_PROFILE GSB_PERMISSION_MODE GSB_CODEX_APPROVAL
+    GSB_CODEX_SANDBOX GSB_KIMI_PERMISSION
+  `.trim().split(/\s+/));
+  const preserved = new Set(`
+    GSB_MODEL GSB_EFFORT GSB_KIMI_MODEL GSB_KIMI_HOST_CWD GSB_CONFIG
+    GSB_MODELS_CONFIG GSB_SOCKET_DIR_OVERRIDE
+  `.trim().split(/\s+/));
+  const denylistBlock = source.match(/PANE_RUNTIME_VARS=\(\n([\s\S]*?)\n\)/);
+  assert.ok(denylistBlock, "pane runtime denylist must remain explicit");
+  const actualStripped = new Set(denylistBlock[1].match(/GSB_[A-Z0-9_]+/g) || []);
+  assert.deepEqual([...actualStripped].sort(), [...expectedStripped].sort());
+  assert.deepEqual([...actualStripped].filter((name) => preserved.has(name)), []);
+
+  const reads = [...source.matchAll(/\$\{(GSB_[A-Z0-9_]+):-/g)].map((match) => match[1]);
+  const unclassified = [...new Set(reads.filter((name) => !actualStripped.has(name) && !preserved.has(name)))];
+  assert.deepEqual(unclassified, []);
+  for (const name of ["GSB_STATE_DIR", "GSB_AGENT", "GSB_WATCHDOG_ENABLED"]) assert.ok(actualStripped.has(name));
+});
+
+test("nudge isolates session.env and extracts only its Zellij socket", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gsb-nudge-env-"));
+  const stateHome = path.join(root, "state");
+  const sessionState = path.join(stateHome, "gsb-local", "isolated");
+  const fakeBin = path.join(root, "bin");
+  const seenEnv = path.join(root, "seen-env");
+  try {
+    mkdirSync(sessionState, { recursive: true });
+    mkdirSync(fakeBin);
+    writeFileSync(path.join(sessionState, "session.env"), [
+      "export ZELLIJ_SOCKET_DIR=/session/socket",
+      "export GSB_ROLES=rogue",
+      "export GSB_ROLE=rogue",
+      "",
+    ].join("\n"));
+    const fakeZellij = path.join(fakeBin, "zellij");
+    writeFileSync(fakeZellij, [
+      "#!/usr/bin/env bash",
+      "printf '%s' \"$GSB_ROLES|$GSB_ROLE|$ZELLIJ_SOCKET_DIR\" > " + JSON.stringify(seenEnv),
+      "printf '%s\n' '[{\"id\":\"terminal_1\",\"title\":\"hub.isolated.main\",\"is_plugin\":false,\"exited\":false}]'",
+      "",
+    ].join("\n"));
+    chmodSync(fakeZellij, 0o755);
+    const result = spawnSync(path.join(ROOT_DIR, "bin", "nudge"), ["hub", "--dry-run"], {
+      encoding: "utf8",
+      env: testEnv({
+        PATH: fakeBin + ":" + (process.env.PATH || "/usr/bin:/bin"),
+        XDG_STATE_HOME: stateHome,
+        GSB_SESSION: "isolated",
+        GSB_ROLES: "hub",
+        GSB_ROLE: "external",
+      }),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /session=isolated role=hub pane_id=terminal_1/);
+    assert.equal(readFileSync(seenEnv, "utf8"), "hub|external|/session/socket");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Studio confirmation rejects reentry before changing dialog content", () => {
+  const source = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  assert.match(source, /const dialog = \$\("#confirm-dialog"\);\n  if \(dialog\.open\) return false;\n  const cancel/);
+});
+
 test("the CLI still resolves an unconfigured project through defaults/agents.conf", () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-default-config-"));
   try {
@@ -152,6 +303,30 @@ test("the CLI still resolves an unconfigured project through defaults/agents.con
     assert.match(result.stdout, /Roles:\s+hub,coder,core-bug,ops-gov,plan-backup,ui/);
     assert.match(result.stdout, /hub:\s+claude-glm-5\.3/);
     assert.match(result.stdout, /coder:\s+codex/);
+    const overridden = spawnSync(path.join(ROOT_DIR, "gsb"), ["--print-config", workspace, "default-config-test"], {
+      encoding: "utf8",
+      env: testEnv({ GSB_CODER_AGENT: "shell:printf override" }),
+    });
+    assert.equal(overridden.status, 0, overridden.stderr);
+    assert.match(overridden.stdout, /coder:\s+shell:printf override/);
+
+    const paneOverridden = spawnSync(path.join(ROOT_DIR, "gsb"), ["--print-config", workspace, "default-config-test"], {
+      encoding: "utf8",
+      env: testEnv({
+        ZELLIJ_SESSION_NAME: "caller-session",
+        GSB_MODEL: "pane-global-model",
+        GSB_CODER_AGENT: "shell:printf pane-override",
+        GSB_CODER_MODEL: "pane-role-model",
+        GSB_AGENT: "shell:printf inherited-default",
+        GSB_STATE_DIR: "/wrong/session",
+        GSB_WATCHDOG_ENABLED: "false",
+        GSB_PERMISSION_MODE: "bypassPermissions",
+      }),
+    });
+    assert.equal(paneOverridden.status, 0, paneOverridden.stderr);
+    assert.match(paneOverridden.stdout, /hub:\s+claude-glm-5\.3/);
+    assert.match(paneOverridden.stdout, /coder:\s+shell:printf pane-override\s+model=pane-role-model/);
+    assert.equal(paneOverridden.stderr, "warning: inherited GSB_PERMISSION_MODE was stripped in pane context; use a clean shell to override permissions.\n");
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
@@ -241,7 +416,7 @@ test("active sessions are never rebound or rewritten by a second launch", () => 
     }
     mkdirSync(state, { recursive: true });
     mkdirSync(fakeBin, { recursive: true });
-    writeFileSync(fakeZellij, "#!/usr/bin/env bash\nif [[ \"$*\" == \"list-sessions --no-formatting\" ]]; then echo 'owned-session [Created now]'; exit 0; fi\nexit 99\n");
+    writeFileSync(fakeZellij, "#!/usr/bin/env bash\nif [[ \"$*\" == \"list-sessions --no-formatting\" ]]; then [[ -n \"${ZELLIJ_SOCKET_DIR:-}\" ]] && echo 'owned-session [Created now]' || echo 'owned-session [Created now] (EXITED - attach to resurrect)'; exit 0; fi\nexit 99\n");
     chmodSync(fakeZellij, 0o755);
     writeFileSync(path.join(state, "session.env"), "do-not-overwrite\n");
     const metadataWrite = spawnSync(process.execPath, [path.join(ROOT_DIR, "bin", "session-meta.mjs"), "write", path.join(state, "session.json")], {
@@ -271,6 +446,72 @@ test("active sessions are never rebound or rewritten by a second launch", () => 
     assert.equal(readFileSync(path.join(state, "session.env"), "utf8"), "do-not-overwrite\n");
     assert.equal(readFileSync(path.join(state, "session.json"), "utf8"), originalMetadata);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI create ignores inherited session state and records its socket directory", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gsb-clean-create-"));
+  const workspace = path.join(root, "project");
+  const stateHome = path.join(root, "state");
+  const fakeBin = path.join(root, "bin");
+  const marker = path.join(root, "created");
+  const createEnvLog = path.join(root, "create-env");
+  const socketDir = "/tmp/gsb-w12-unit-socket";
+  const taintedState = path.join(root, "wrong-state");
+  const createdState = path.join(stateHome, "gsb-local", "clean-create");
+  try {
+    mkdirSync(path.join(workspace, ".gsb-local"), { recursive: true });
+    mkdirSync(fakeBin);
+    writeFileSync(path.join(workspace, ".gsb-local", "agents.conf"), "hub=shell:printf hub\ncoder=shell:printf coder\n");
+    const fakeZellij = path.join(fakeBin, "zellij");
+    writeFileSync(fakeZellij, `#!/usr/bin/env bash
+if [[ "$*" == "list-sessions --no-formatting" ]]; then
+  [[ -f ${JSON.stringify(marker)} ]] && echo 'clean-create [Created now]'
+  exit 0
+fi
+if [[ "$*" == *"--create-background clean-create"* ]]; then
+  printf '%s' "\${ZELLIJ_SESSION_NAME:-}" > ${JSON.stringify(createEnvLog)}
+  touch ${JSON.stringify(marker)}
+  exit 0
+fi
+exit 99
+`);
+    chmodSync(fakeZellij, 0o755);
+    const result = spawnSync(path.join(ROOT_DIR, "gsb"), ["--background", workspace, "clean-create"], {
+      encoding: "utf8",
+      env: testEnv({
+        PATH: `${fakeBin}:${process.env.PATH || "/usr/bin:/bin"}`,
+        XDG_STATE_HOME: stateHome,
+        GSB_STATE_DIR: taintedState,
+        GSB_SESSION: "caller-session",
+        GSB_AGENT: "shell:printf inherited-default",
+        GSB_MODEL: "pane-global-model",
+        GSB_HUB_AGENT: "shell:printf pane-override",
+        GSB_HUB_MODEL: "pane-role-model",
+        GSB_SOCKET_DIR_OVERRIDE: socketDir,
+        GSB_WATCHDOG_ENABLED: "false",
+        ZELLIJ_SESSION_NAME: "caller-session",
+        ZELLIJ_SESSION_DIR: "/wrong/session-dir",
+      }),
+    });
+    const watchdogLog = path.join(createdState, "watchdog.log");
+    const sessionEnvFile = path.join(createdState, "session.env");
+    assert.equal(result.status, 0, `${result.stderr}${existsSync(watchdogLog) ? readFileSync(watchdogLog, "utf8") : ""}${existsSync(sessionEnvFile) ? readFileSync(sessionEnvFile, "utf8") : ""}`);
+    const sessionEnv = readFileSync(path.join(createdState, "session.env"), "utf8");
+    assert.match(sessionEnv, new RegExp(`^export ZELLIJ_SOCKET_DIR=${socketDir}$`, "m"));
+    assert.match(sessionEnv, /^export GSB_AGENT=claude$/m);
+    assert.match(sessionEnv, /^export GSB_WATCHDOG_ENABLED=true$/m);
+    assert.match(sessionEnv, /^export GSB_MODEL=pane-global-model$/m);
+    assert.ok(sessionEnv.includes("export GSB_HUB_AGENT=shell:printf\\ pane-override\n"));
+    assert.match(sessionEnv, /^export GSB_HUB_MODEL=pane-role-model$/m);
+    assert.equal(readFileSync(createEnvLog, "utf8"), "");
+    assert.equal(existsSync(taintedState), false);
+  } finally {
+    const watchdogPidFile = path.join(createdState, "watchdog.pid");
+    if (existsSync(watchdogPidFile)) {
+      try { process.kill(Number(readFileSync(watchdogPidFile, "utf8").trim()), "SIGTERM"); } catch {}
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });

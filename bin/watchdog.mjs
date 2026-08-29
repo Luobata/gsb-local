@@ -187,12 +187,23 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 const log = (msg) => console.log(`${new Date().toISOString()} watchdog: ${msg}`);
 
+function zellijFallbackAllowed(args) {
+  return args[0] === "action" && (args[1] === "list-panes" || args[1] === "dump-screen");
+}
+
 function zellij(args) {
-  return execFileSync("zellij", args, {
+  const options = {
     env: { ...process.env, ZELLIJ_SESSION_NAME: SESSION },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-  });
+  };
+  try {
+    return execFileSync("zellij", args, options);
+  } catch (error) {
+    if (!process.env.ZELLIJ_SOCKET_DIR || !zellijFallbackAllowed(args)) throw error;
+    delete options.env.ZELLIJ_SOCKET_DIR;
+    return execFileSync("zellij", args, options);
+  }
 }
 
 function listPanes() {
@@ -565,6 +576,8 @@ function runSelfTest() {
   test("parseWatchdogPid accepts a positive integer", parseWatchdogPid("123\n") === 123);
   test("parseWatchdogPid rejects malformed content", parseWatchdogPid("12x") === null);
   test("watchdogPidIsAlive sees the self-test process", watchdogPidIsAlive(process.pid));
+  test("Zellij fallback allows read actions", zellijFallbackAllowed(["action", "list-panes"]) && zellijFallbackAllowed(["action", "dump-screen"]));
+  test("Zellij fallback rejects write actions", !zellijFallbackAllowed(["action", "write-chars"]) && !zellijFallbackAllowed(["action", "send-keys"]));
   test(
     "wakePrefixForRole matches the fixed spoke wake-up",
     wakePrefixForRole("coder") === "A durable GSB contract or mailbox message is available for coder.",

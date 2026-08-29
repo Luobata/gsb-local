@@ -29,7 +29,7 @@ gsb-local studio --project /path/to/your/repository
 
 Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--project` 启动时，首屏按最近项目展示配置和运行会话；可直接载入项目、用上次配置启动，或从运行中项目点「在终端打开」。进入工作台后既可以选择 `config1-4`，也可以从最小 Hub 骨架创建独立个人模板；模板卡也支持校验后直接启动。新项目默认用合法的目录 basename 作为会话名，不合法时回退为 `seed-gsb`。
 
-非 Hub 角色默认使用“系统基座 + 一句话意图”两层编辑，保存时仍合成为完整的 `.gsb-local/prompts/<role>.md`；无标记的旧提示词继续按自定义全文编辑。新建角色只需角色 ID 和 Agent，内置基座覆盖 `coder`、`core-bug`、`ops-gov`、`plan-backup`、`frontend`、`backend`、`test`、`docs` 与通用兜底。模板显示名称支持中文、空格、符号与 Emoji，个人模板保存在 `~/.config/gsb-local/studio/templates/`，不绑定创建时的项目和会话。Profile 友好名来自各 `profiles/*.conf` 文件头的 `# label:`；`profiles/config1.conf` 同时是默认角色映射的单一事实源，`defaults/agents.conf` 以相对符号链接保留原 CLI 路径。最终启动仍调用同一套 `gsb-local` CLI，不存在第二套运行逻辑。`Ctrl-C` 只关闭 Studio 页面服务，不会关闭已经启动的 Zellij 会话。
+非 Hub 角色默认使用“系统基座 + 一句话意图”两层编辑，保存时仍合成为完整的 `.gsb-local/prompts/<role>.md`；无标记的旧提示词继续按自定义全文编辑。新建角色只需角色 ID 和 Agent，内置基座覆盖 `coder`、`core-bug`、`ops-gov`、`plan-backup`、`frontend`、`backend`、`test`、`docs` 与通用兜底。模板显示名称支持中文、空格、符号与 Emoji，个人模板保存在 `~/.config/gsb-local/studio/templates/`，不绑定创建时的项目和会话。Profile 友好名来自各 `profiles/*.conf` 文件头的 `# label:`；`profiles/config1.conf` 同时是默认角色映射的单一事实源，`defaults/agents.conf` 以相对符号链接保留原 CLI 路径。最终启动仍调用同一套 `gsb-local` CLI，不存在第二套运行逻辑。Studio 启动工作台时会剥离调用方 Pane 的 `GSB_*`/`ZELLIJ_*` 会话环境；仅排障对照时可设置 `GSB_STUDIO_ENV_PASSTHROUGH=1` 恢复旧透传。`Ctrl-C` 只关闭 Studio 页面服务，不会关闭已经启动的 Zellij 会话。
 
 项目配置的事实源是 `.gsb-local/agents.conf`、`.gsb-local/models.conf` 和 `.gsb-local/prompts/`；`.gsb-local/workbench.json` 仅作为 Studio 的 UI 草稿与展示元数据 sidecar，不覆盖手工修改的配置事实。
 
@@ -48,6 +48,8 @@ gsb-local open my-task
 ```
 
 `open` 会从 `~/.local/state/gsb-local/<session>/session.json` 读取最初绑定的绝对项目路径、配置来源、权限和 watchdog 策略。活跃会话只会 attach；已关闭的会话会保留任务板、合同和报告，并由 GSB 按持久化配置重新创建。不要用 `zellij attach <session>` 复活已退出的 GSB 会话；GSB 会禁用该会话的 Zellij 磁盘恢复，避免 Agent 完整提示词被还原成 `start_suspended` 待确认命令。
+
+新会话的 Zellij socket 默认放在 `${XDG_CACHE_HOME:-$HOME/.cache}/gsb-zsock`，实际目录会写入该会话的 `session.env`，因此 attach、nudge 和 watchdog 应走 `gsb-local open`/GSB 脚本。旧默认目录中的运行会话仍可只读发现并 attach，不会被自动迁移或删除。路径有特殊约束时可在创建前设置 `GSB_SOCKET_DIR_OVERRIDE=/short/path`；完整 socket 路径超过 103 字节会在创建前明确报错。
 
 Zellij 0.44.x 在快速结束并立即重建同名会话时偶尔会卡在 server/client 初始化。GSB 为创建过程设置 15 秒硬超时并只重试一次；如果仍失败会明确退出并给出 Zellij 日志路径，不会无限卡住。
 
@@ -380,6 +382,7 @@ Hub 收到 `from: watchdog` 的 blocker 说明自动恢复已失败，需要人�
 ```bash
 # 1. 只读定位 Pane；记录输出里的 pane_id
 bash "$GSB_LOCAL_ROOT/bin/nudge" <role> --dry-run
+source ~/.local/state/gsb-local/<session>/session.env
 ZELLIJ_SESSION_NAME=<session> zellij action dump-screen --pane-id <pane_id> | tail -20
 
 # 2. 完整唤醒语只差提交时，补一个 Enter
