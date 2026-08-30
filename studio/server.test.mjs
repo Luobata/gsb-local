@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  commandCacheFile,
   createRuntimeValidator,
   createStudioServer,
   defaultZellijSocketDir,
   gsbSocketDir,
   launchWorkbench,
+  invalidateSessionCache,
   listSessions,
   loadProjectState,
   openTerminalSession,
@@ -76,14 +80,31 @@ function fakeRuntimeValidator(spawnSyncImpl, options = {}) {
   return createRuntimeValidator({
     spawnSyncImpl,
     now: options.now || Date.now,
-    env: options.env || {},
+    env: { GSB_STUDIO_VALIDATE_SYNC: "1", ...(options.env || {}) },
     hasZsh: options.hasZsh ?? true,
     listSessionOptionsImpl: () => [],
+    cacheFile: false,
   });
 }
 
 function interactiveOutput(...available) {
   return available.map((value) => `__GSB_STUDIO_COMMAND__${value ? 1 : 0}`).join("\n") + "\n";
+}
+
+function asyncSpawnStub(handler) {
+  return (command, args, options) => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+    });
+    const result = handler(command, args, options) || {};
+    setTimeout(() => {
+      if (result.stdout) child.stdout.write(result.stdout);
+      if (result.stderr) child.stderr.write(result.stderr);
+      if (result.error) child.emit("error", result.error);
+      else child.emit("close", result.status ?? 0, result.signal ?? null);
+    }, result.delay || 0);
+    return child;
+  };
 }
 
 test("Studio accepts an omitted project and still validates explicit project arguments", () => {
@@ -117,11 +138,12 @@ test("terminal opening validates sessions and has a portable command fallback", 
   assert.equal(unrefCalled, true);
 });
 
-test("Studio launches with pane-scoped GSB and Zellij variables removed", () => {
+test("Studio launches with pane-scoped GSB and Zellij variables removed", async () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-launch-env-"));
   let spawned;
+  let invalidations = 0;
   try {
-    const result = launchWorkbench(fixture(workspace), {
+    const result = await launchWorkbench(fixture(workspace), {
       sourceEnv: {
         PATH: "/usr/bin:/bin",
         GSB_STATE_DIR: "/wrong/session",
@@ -135,8 +157,10 @@ test("Studio launches with pane-scoped GSB and Zellij variables removed", () => 
         spawned = { command, args, options };
         return { status: 0, stdout: "created\n", stderr: "" };
       },
+      invalidateSessionCacheImpl: () => { invalidations += 1; },
     });
     assert.equal(result.launched, true);
+    assert.equal(invalidations, 1);
     assert.equal(spawned.options.env.PATH, "/usr/bin:/bin");
     assert.equal(spawned.options.env.GSB_WATCHDOG_ENABLED, "true");
     for (const name of ["GSB_STATE_DIR", "GSB_SESSION", "GSB_SOCKET_DIR_OVERRIDE", "ZELLIJ_SESSION_NAME", "ZELLIJ_SOCKET_DIR"]) {
@@ -170,10 +194,10 @@ test("socket directory and 103-byte boundary calculations are stable", () => {
   );
 });
 
-test("Studio merges unified and default Zellij session views", () => {
+test("Studio merges unified and default Zellij session views", async () => {
   const calls = [];
-  const sessions = listSessions({
-    env: { PATH: "/usr/bin:/bin", TMPDIR: "/tmp" },
+  const sessions = await listSessions({
+    env: { PATH: "/usr/bin:/bin", TMPDIR: "/tmp", GSB_STUDIO_VALIDATE_SYNC: "1" },
     home: "/Users/test",
     uid: 501,
     socketDirs: ["/Users/test/.cache/gsb-zsock", "/tmp/zellij-501"],
@@ -544,18 +568,103 @@ test("workbench validation protects Hub and role identity", () => {
   }
 });
 
-test("runtime command validation caches a repeated available command", () => {
+test("async runtime validation yields and deduplicates in-flight command probes", async () => {
+  let calls = 0;
+  const validator = createRuntimeValidator({
+    spawnImpl: asyncSpawnStub(() => { calls += 1; return { status: 0, delay: 60 }; }),
+    spawnSyncImpl: () => { throw new Error("sync path used"); },
+    env: {}, cacheFile: false, listSessionOptionsImpl: () => [],
+  });
+  const workbench = fixture(os.tmpdir());
+  workbench.roles.forEach((role) => { role.agent = "slow-agent"; });
+  const first = validator.validate(workbench);
+  assert.equal(calls, 0, "pure validation runs before async probing begins");
+  await Promise.resolve();
+  const second = validator.validate(workbench);
+  let timerAdvanced = false;
+  setTimeout(() => { timerAdvanced = true; }, 10);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(timerAdvanced, true);
+  assert.equal(calls, 1);
+  assert.deepEqual([(await first).valid, (await second).valid], [true, true]);
+});
+
+test("persistent command cache stores only positive results and follows shell fingerprints", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-cache-"));
+  const home = path.join(root, "home");
+  const env = { HOME: home, GSB_STUDIO_STATE_HOME: path.join(root, "state"), GSB_STUDIO_VALIDATE_SYNC: "1" };
+  mkdirSync(home);
+  writeFileSync(path.join(home, ".zshrc"), "alias cached='true'\n");
+  writeFileSync(path.join(home, ".zshenv"), "# env\n");
+  try {
+    const makeValidator = (validatorEnv, spawnSyncImpl) => createRuntimeValidator({
+      env: validatorEnv, home, spawnSyncImpl, listSessionOptionsImpl: () => [],
+    });
+    const first = makeValidator(env, (command, args) => command === "/bin/zsh"
+        ? { status: 0, stdout: interactiveOutput(false), signal: null, error: null }
+        : { status: args.at(-1) === "codex" ? 0 : 1, signal: null, error: null });
+    await first.checkCommands(["codex", "missing-agent"]);
+    const file = commandCacheFile({ env, home });
+    assert.equal(file, path.join(env.GSB_STUDIO_STATE_HOME, "cache", "command-cache.json"));
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).commands, { codex: true });
+
+    let restarts = 0;
+    const restarted = makeValidator(env, () => { restarts += 1; return { status: 0, signal: null, error: null }; });
+    assert.equal((await restarted.checkCommands(["codex"])).get("codex").available, true);
+    assert.equal(restarts, 0, "matching disk cache skips every spawn");
+    writeFileSync(path.join(home, ".zshrc"), "alias cached='true'\n# fingerprint changed\n");
+    await restarted.checkCommands(["codex"]);
+    assert.equal(restarts, 1, "changed shell fingerprint forces one new probe");
+
+    const offEnv = { ...env, GSB_STUDIO_STATE_HOME: path.join(root, "off-state"), GSB_STUDIO_CMD_CACHE: "off" };
+    let uncachedCalls = 0;
+    const uncached = makeValidator(offEnv, () => { uncachedCalls += 1; return { status: 0, signal: null, error: null }; });
+    await uncached.checkCommands(["codex"]);
+    await uncached.checkCommands(["codex"]);
+    assert.equal(uncachedCalls, 2);
+    assert.equal(existsSync(commandCacheFile({ env: offEnv, home })), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session listing caches for 30 seconds and supports explicit invalidation", async () => {
+  const cache = new Map();
+  let currentTime = 1_000;
+  let calls = 0;
+  const options = {
+    cache, now: () => currentTime,
+    env: { PATH: "/usr/bin:/bin", TMPDIR: "/tmp" },
+    home: "/Users/test", uid: 501, socketDirs: ["/unified", "/legacy"],
+    spawnImpl: asyncSpawnStub((_command, _args, spawnOptions) => {
+      calls += 1;
+      return { stdout: spawnOptions.env.ZELLIJ_SOCKET_DIR === "/unified" ? "shared [Created now]\n" : "legacy [Created now]\n" };
+    }),
+  };
+  assert.equal((await listSessions(options)).length, 2);
+  assert.equal((await listSessions(options)).length, 2);
+  assert.equal(calls, 2);
+  currentTime += 29_999; await listSessions(options);
+  assert.equal(calls, 2);
+  currentTime += 2; await listSessions(options);
+  assert.equal(calls, 4);
+  invalidateSessionCache(cache); await listSessions(options);
+  assert.equal(calls, 6);
+});
+
+test("runtime command validation caches a repeated available command", async () => {
   const calls = [];
   const validator = fakeRuntimeValidator((command, args) => {
     calls.push({ command, args });
     return { status: 0, signal: null, error: null };
   });
-  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
-  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal((await validator.checkCommands(["codex"])).get("codex").available, true);
+  assert.equal((await validator.checkCommands(["codex"])).get("codex").available, true);
   assert.equal(calls.length, 1);
 });
 
-test("runtime command validation expires negative cache entries after 30 seconds", () => {
+test("runtime command validation expires negative cache entries after 30 seconds", async () => {
   let currentTime = 1_000;
   const calls = [];
   const validator = fakeRuntimeValidator((command) => {
@@ -564,30 +673,30 @@ test("runtime command validation expires negative cache entries after 30 seconds
       ? { status: 0, signal: null, error: null, stdout: interactiveOutput(false) }
       : { status: 1, signal: null, error: null };
   }, { now: () => currentTime });
-  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal((await validator.checkCommands(["missing-agent"])).get("missing-agent").available, false);
   assert.equal(calls.length, 2);
   currentTime += 29_999;
-  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal((await validator.checkCommands(["missing-agent"])).get("missing-agent").available, false);
   assert.equal(calls.length, 2);
   currentTime += 2;
-  assert.equal(validator.checkCommands(["missing-agent"]).get("missing-agent").available, false);
+  assert.equal((await validator.checkCommands(["missing-agent"])).get("missing-agent").available, false);
   assert.equal(calls.length, 4);
 });
 
-test("runtime command validation keeps positive cache entries across TTL periods", () => {
+test("runtime command validation keeps positive cache entries across TTL periods", async () => {
   let currentTime = 1_000;
   let calls = 0;
   const validator = fakeRuntimeValidator(() => {
     calls += 1;
     return { status: 0, signal: null, error: null };
   }, { now: () => currentTime });
-  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal((await validator.checkCommands(["codex"])).get("codex").available, true);
   currentTime += 300_000;
-  assert.equal(validator.checkCommands(["codex"]).get("codex").available, true);
+  assert.equal((await validator.checkCommands(["codex"])).get("codex").available, true);
   assert.equal(calls, 1);
 });
 
-test("runtime command timeout is a warning and does not invalidate the workbench", () => {
+test("runtime command timeout is a warning and does not invalidate the workbench", async () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-timeout-"));
   try {
     const validator = fakeRuntimeValidator((command) => command === "/bin/zsh"
@@ -595,7 +704,7 @@ test("runtime command timeout is a warning and does not invalidate the workbench
       : { status: 1, signal: null, error: null });
     const workbench = fixture(workspace);
     workbench.roles[0].agent = "slow-agent";
-    const result = validator.validate(workbench);
+    const result = await validator.validate(workbench);
     assert.equal(result.valid, true);
     assert.ok(result.warnings.some((message) => message.includes("slow-agent") && message.includes("检查超时")));
     assert.ok(!result.errors.some((message) => message.includes("slow-agent")));
@@ -604,13 +713,13 @@ test("runtime command timeout is a warning and does not invalidate the workbench
   }
 });
 
-test("runtime command clean exit 1 is a not-found error", () => {
+test("runtime command clean exit 1 is a not-found error", async () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-missing-"));
   try {
     const validator = fakeRuntimeValidator(() => ({ status: 1, signal: null, error: null }));
     const workbench = fixture(workspace);
     workbench.roles[0].agent = "missing-agent";
-    const result = validator.validate(workbench);
+    const result = await validator.validate(workbench);
     assert.equal(result.valid, false);
     assert.ok(result.errors.some((message) => message.includes("找不到命令或 alias missing-agent")));
   } finally {
@@ -618,19 +727,19 @@ test("runtime command clean exit 1 is a not-found error", () => {
   }
 });
 
-test("runtime command precheck avoids interactive shells when every command is available", () => {
+test("runtime command precheck avoids interactive shells when every command is available", async () => {
   const calls = [];
   const validator = fakeRuntimeValidator((command, args) => {
     calls.push({ command, args });
     return { status: 0, signal: null, error: null };
   });
   const commands = ["claude", "codex", "kimi", "zellij"];
-  assert.deepEqual([...validator.checkCommands(commands).values()].map(({ available }) => available), [true, true, true, true]);
+  assert.deepEqual([...(await validator.checkCommands(commands)).values()].map(({ available }) => available), [true, true, true, true]);
   assert.equal(calls.filter(({ command }) => command === "/bin/zsh").length, 0);
   assert.equal(calls.filter(({ command }) => command === "/bin/sh").length, 4);
 });
 
-test("runtime command misses use one positional-argument interactive batch", () => {
+test("runtime command misses use one positional-argument interactive batch", async () => {
   const calls = [];
   const commands = ["alias-one", "alias two", "$(unsafe)"];
   const validator = fakeRuntimeValidator((command, args) => {
@@ -639,7 +748,7 @@ test("runtime command misses use one positional-argument interactive batch", () 
       ? { status: 0, signal: null, error: null, stdout: interactiveOutput(true, false, true) }
       : { status: 1, signal: null, error: null };
   });
-  const result = validator.checkCommands(commands);
+  const result = await validator.checkCommands(commands);
   assert.deepEqual([...result.values()].map(({ available }) => available), [true, false, true]);
   const interactive = calls.filter(({ command }) => command === "/bin/zsh");
   assert.equal(interactive.length, 1);
@@ -647,7 +756,7 @@ test("runtime command misses use one positional-argument interactive batch", () 
   assert.ok(commands.every((command) => !interactive[0].args[1].includes(command)));
 });
 
-test("runtime command rollback switches restore strict and uncached behavior", () => {
+test("runtime command rollback switches restore strict and uncached behavior", async () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-command-switches-"));
   try {
     const strictValidator = fakeRuntimeValidator((command) => command === "/bin/zsh"
@@ -655,7 +764,7 @@ test("runtime command rollback switches restore strict and uncached behavior", (
       : { status: 1, signal: null, error: null }, { env: { GSB_STUDIO_CHECK_STRICT: "on" } });
     const workbench = fixture(workspace);
     workbench.roles[0].agent = "slow-agent";
-    const strict = strictValidator.validate(workbench);
+    const strict = await strictValidator.validate(workbench);
     assert.equal(strict.valid, false);
     assert.ok(strict.errors.some((message) => message.includes("slow-agent") && message.includes("检查超时")));
 
@@ -664,8 +773,8 @@ test("runtime command rollback switches restore strict and uncached behavior", (
       calls += 1;
       return { status: 0, signal: null, error: null };
     }, { env: { GSB_STUDIO_CMD_CACHE: "off" } });
-    uncachedValidator.checkCommands(["codex"]);
-    uncachedValidator.checkCommands(["codex"]);
+    await uncachedValidator.checkCommands(["codex"]);
+    await uncachedValidator.checkCommands(["codex"]);
     assert.equal(calls, 2);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
@@ -898,7 +1007,11 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
   process.env.GSB_STUDIO_STATE_HOME = stateRoot;
   process.env.GSB_STUDIO_CONFIG_HOME = path.join(workspace, ".studio-config");
   const token = "test-token";
-  const server = createStudioServer({ project: workspace, token, platform: "linux" });
+  let cacheWriteAttempted = false;
+  const validator = createRuntimeValidator({ env: { GSB_STUDIO_VALIDATE_SYNC: "1" }, cacheFile: "ignored",
+    atomicWriteImpl: () => { cacheWriteAttempted = true; throw new Error("disk full"); },
+    spawnSyncImpl: () => ({ status: 0, signal: null, error: null }), listSessionOptionsImpl: () => [{ name: "foreign-session", workspace: otherWorkspace, status: "saved" }] });
+  const server = createStudioServer({ project: workspace, token, platform: "linux", validator });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -955,6 +1068,15 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
     const resources = await request(`/api/resources?project=${encodeURIComponent(workspace)}`);
     assert.equal(resources.status, 200);
     assert.ok((await resources.json()).sessionOptions.some((session) => session.name === "saved-session"));
+
+    await t.test("validate survives command-cache write failures", async () => {
+      const workbench = fixture(workspace);
+      workbench.roles[1].agent = "codex";
+      const response = await request("/api/validate", { method: "POST", body: JSON.stringify({ workbench }) });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).validation.valid, true);
+      assert.equal(cacheWriteAttempted, true);
+    });
 
     await t.test("validate rejects empty prefixed agents and control characters", async () => {
       for (const agent of ["shell:", "codex:"]) {

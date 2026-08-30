@@ -41,6 +41,7 @@ const STUDIO_API_VERSION = 2;
 const SPAWN_TIMEOUT_MS = 5_000;
 const INTERACTIVE_COMMAND_TIMEOUT_MS = 8_000;
 const COMMAND_NEGATIVE_TTL_MS = 30_000;
+const SESSION_LIST_TTL_MS = 30_000;
 const COMMAND_RESULT_MARKER = "__GSB_STUDIO_COMMAND__";
 const DEFAULT_CONFIG_HOME = path.join(os.homedir(), ".config", "gsb-local", "studio");
 
@@ -124,6 +125,39 @@ function atomicWrite(file, content) {
   const temporary = `${file}.${process.pid}.${randomBytes(3).toString("hex")}.tmp`;
   writeFileSync(temporary, content, { mode: 0o600 });
   renameSync(temporary, file);
+}
+
+function spawnResult(spawnImpl, command, args, options, timeout) {
+  return new Promise((resolve) => {
+    let child, timer;
+    let stdout = "", stderr = "", settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ stdout, stderr, ...result });
+    };
+    try { child = spawnImpl(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (error) { finish({ status: null, signal: null, error }); return; }
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => finish({ status: null, signal: null, error }));
+    child.once("close", (status, signal) => finish({ status, signal, error: null }));
+    if (!settled) {
+      timer = setTimeout(() => {
+        child.kill?.("SIGTERM");
+        const error = Object.assign(new Error(`command exceeded ${timeout}ms`), { code: "ETIMEDOUT" });
+        finish({ status: null, signal: "SIGTERM", error });
+      }, timeout);
+      timer.unref?.();
+    }
+  });
+}
+
+export function commandCacheFile({ env = process.env, home = env.HOME || os.homedir() } = {}) {
+  const root = env.GSB_STUDIO_STATE_HOME ? path.join(env.GSB_STUDIO_STATE_HOME, "cache")
+    : path.join(env.XDG_CACHE_HOME || path.join(home, ".cache"), "gsb-local");
+  return path.join(root, "command-cache.json");
 }
 
 function loadPromptTemplates() {
@@ -350,16 +384,75 @@ function commandForAgent(agent) {
 }
 
 export function createRuntimeValidator({
+  spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
   now = Date.now,
   env = process.env,
+  home = env.HOME || os.homedir(),
+  statImpl = statSync,
+  atomicWriteImpl = atomicWrite,
+  cacheFile,
   hasZsh = existsSync("/bin/zsh"),
   listSessionOptionsImpl = listSessionOptions,
 } = {}) {
   const commandCache = new Map();
+  const inFlight = new Map();
+  let loadedFingerprint = null;
+  let loadedCacheFile = null;
+
+  function shellFingerprint() {
+    // Indirect files sourced by these shell entrypoints are intentionally not
+    // tracked: following arbitrary source/eval chains would require shell parsing.
+    return [".zshrc", ".zshenv"].map((name) => {
+      try {
+        const stat = statImpl(path.join(home, name));
+        return `${stat.mtimeMs}:${stat.size}`;
+      } catch {
+        return "missing";
+      }
+    }).join("|");
+  }
+
+  function persistentCacheFile() {
+    return cacheFile === false ? "" : (cacheFile || commandCacheFile({ env, home }));
+  }
+
+  function ensurePersistentCache() {
+    if (env.GSB_STUDIO_CMD_CACHE === "off") return;
+    const file = persistentCacheFile();
+    const fingerprint = shellFingerprint();
+    if (loadedCacheFile === file && loadedFingerprint === fingerprint) return;
+    commandCache.clear();
+    loadedCacheFile = file;
+    loadedFingerprint = fingerprint;
+    if (!file) return;
+    try {
+      const stored = JSON.parse(readText(file, "{}"));
+      if (stored.fingerprint !== fingerprint || !stored.commands || typeof stored.commands !== "object") return;
+      for (const [command, available] of Object.entries(stored.commands)) {
+        if (available === true) commandCache.set(command, { available: true, ts: now() });
+      }
+    } catch {
+      // A missing or damaged cache is rebuilt by the next successful probe.
+    }
+  }
+
+  function persistPositiveCommands() {
+    const file = persistentCacheFile();
+    if (!file || env.GSB_STUDIO_CMD_CACHE === "off") return;
+    const commands = Object.fromEntries([...commandCache]
+      .filter(([, cached]) => cached.available)
+      .map(([command]) => [command, true]));
+    try {
+      atomicWriteImpl(file, `${JSON.stringify({ fingerprint: loadedFingerprint, commands }, null, 2)}\n`);
+    } catch {
+      // Persistent command caching is best-effort; the in-memory result remains valid.
+    }
+  }
 
   function cachedCommand(command) {
     if (env.GSB_STUDIO_CMD_CACHE === "off") return null;
+    ensurePersistentCache();
     const cached = commandCache.get(command);
     if (!cached) return null;
     if (cached.available || now() - cached.ts < COMMAND_NEGATIVE_TTL_MS) {
@@ -370,29 +463,39 @@ export function createRuntimeValidator({
   }
 
   function cacheCommand(command, available) {
-    if (env.GSB_STUDIO_CMD_CACHE !== "off") commandCache.set(command, { available, ts: now() });
+    if (env.GSB_STUDIO_CMD_CACHE === "off") return;
+    ensurePersistentCache();
+    commandCache.set(command, { available, ts: now() });
+    if (available) persistPositiveCommands();
   }
 
-  function precheckCommand(command) {
-    const checked = spawnSyncImpl("/bin/sh", [
+  function runProcess(command, args, options, timeout) {
+    if (env.GSB_STUDIO_VALIDATE_SYNC === "1") {
+      return Promise.resolve(spawnSyncImpl(command, args, { ...options, timeout }));
+    }
+    return spawnResult(spawnImpl, command, args, options, timeout);
+  }
+
+  async function precheckCommand(command) {
+    const checked = await runProcess("/bin/sh", [
       "-c",
       'command -v "$1" >/dev/null 2>&1',
       "gsb-studio",
       command,
-    ], { timeout: SPAWN_TIMEOUT_MS });
+    ], {}, SPAWN_TIMEOUT_MS);
     return checked.status === 0;
   }
 
-  function interactiveCommandResults(commands) {
+  async function interactiveCommandResults(commands) {
     if (!commands.length) return new Map();
     const lookup = hasZsh ? 'whence -w -- "$command"' : 'command -v "$command"';
     const script = `for command in "$@"; do if ${lookup} >/dev/null 2>&1; then printf '${COMMAND_RESULT_MARKER}1\\n'; else printf '${COMMAND_RESULT_MARKER}0\\n'; fi; done`;
-    const checked = spawnSyncImpl(hasZsh ? "/bin/zsh" : "/bin/sh", [
+    const checked = await runProcess(hasZsh ? "/bin/zsh" : "/bin/sh", [
       hasZsh ? "-ic" : "-c",
       script,
       "gsb-studio",
       ...commands,
-    ], { encoding: "utf8", timeout: INTERACTIVE_COMMAND_TIMEOUT_MS });
+    ], {}, INTERACTIVE_COMMAND_TIMEOUT_MS);
     if (checked.error || checked.signal) {
       const reason = checked.error?.code === "ETIMEDOUT" ? "检查超时" : "检查失败";
       return new Map(commands.map((command) => [command, { available: false, uncertain: true, reason }]));
@@ -409,14 +512,12 @@ export function createRuntimeValidator({
     }));
   }
 
-  function checkCommands(commands) {
+  async function probeCommands(commands) {
     const results = new Map();
     const interactive = [];
-    for (const command of new Set(commands.filter(Boolean))) {
-      const cached = cachedCommand(command);
-      if (cached) {
-        results.set(command, cached);
-      } else if (precheckCommand(command)) {
+    const prechecked = await Promise.all(commands.map(async (command) => [command, await precheckCommand(command)]));
+    for (const [command, availableOnPath] of prechecked) {
+      if (availableOnPath) {
         const available = { available: true, uncertain: false };
         cacheCommand(command, true);
         results.set(command, available);
@@ -424,21 +525,50 @@ export function createRuntimeValidator({
         interactive.push(command);
       }
     }
-    for (const [command, checked] of interactiveCommandResults(interactive)) {
+    for (const [command, checked] of await interactiveCommandResults(interactive)) {
       if (!checked.uncertain) cacheCommand(command, checked.available);
       results.set(command, checked);
     }
     return results;
   }
 
-  function validate(workbench) {
+  async function checkCommands(commands) {
+    const unique = [...new Set(commands.filter(Boolean))];
+    const results = new Map();
+    const pending = new Map();
+    const fresh = [];
+    for (const command of unique) {
+      const cached = cachedCommand(command);
+      if (cached) results.set(command, cached);
+      else if (env.GSB_STUDIO_CMD_CACHE !== "off" && inFlight.has(command)) pending.set(command, inFlight.get(command));
+      else fresh.push(command);
+    }
+    if (fresh.length) {
+      const batch = probeCommands(fresh);
+      for (const command of fresh) {
+        let promise = batch.then((checked) => checked.get(command));
+        if (env.GSB_STUDIO_CMD_CACHE !== "off") {
+          promise = promise.finally(() => {
+            if (inFlight.get(command) === promise) inFlight.delete(command);
+          });
+          inFlight.set(command, promise);
+        }
+        pending.set(command, promise);
+      }
+    }
+    await Promise.all([...pending].map(async ([command, promise]) => results.set(command, await promise)));
+    return new Map(unique.map((command) => [command, results.get(command)]));
+  }
+
+  async function validate(workbench) {
     const result = validateWorkbench(workbench);
+    await Promise.resolve();
     const roles = workbench?.roles || [];
     const roleCommands = roles.map((role) => ({
       role,
       command: commandForAgent(typeof role?.agent === "string" ? role.agent : ""),
     }));
-    const commands = checkCommands(roleCommands.map(({ command }) => command));
+    const commands = await checkCommands(roleCommands.map(({ command }) => command));
     for (const { role, command } of roleCommands) {
       if (!command) continue;
       const checked = commands.get(command);
@@ -450,7 +580,7 @@ export function createRuntimeValidator({
       }
     }
     if (SESSION_PATTERN.test(workbench?.session || "")) {
-      const existing = listSessionOptionsImpl().find((session) => session.name === workbench.session);
+      const existing = (await listSessionOptionsImpl()).find((session) => session.name === workbench.session);
       if (existing?.workspace && existing.workspace !== workbench.workspace) {
         result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
       } else if (existing?.status === "running" && !workbench.rebuild) {
@@ -466,7 +596,7 @@ export function createRuntimeValidator({
 
 const runtimeValidator = createRuntimeValidator();
 
-function validationWithRuntime(workbench) {
+async function validationWithRuntime(workbench) {
   return runtimeValidator.validate(workbench);
 }
 
@@ -478,9 +608,9 @@ function configPreview(workbench) {
   };
 }
 
-function persistProjectState(workbench) {
+async function persistProjectState(workbench) {
   const normalized = prepareWorkbenchPrompts(normalizeWorkbench(workbench));
-  const validation = validationWithRuntime(normalized);
+  const validation = await validationWithRuntime(normalized);
   if (!validation.valid) return { validation };
   saveStoredProjectState(normalized);
   rememberProject(normalized.workspace);
@@ -623,31 +753,61 @@ function savedSessionSocketDirs() {
   return dirs;
 }
 
-export function listSessions({ spawnSyncImpl = spawnSync, env = process.env, home, uid, socketDirs } = {}) {
-  const lines = new Map();
+const sessionListCache = new Map();
+
+export function invalidateSessionCache(cache = sessionListCache) {
+  cache.clear();
+}
+
+export async function listSessions({
+  spawnImpl = spawn,
+  spawnSyncImpl = spawnSync,
+  env = process.env,
+  home,
+  uid,
+  socketDirs,
+  cache = sessionListCache,
+  now = Date.now,
+} = {}) {
   const unified = gsbSocketDir({ env, home });
   const legacy = defaultZellijSocketDir({ env, uid });
-  for (const socketDir of [...new Set(socketDirs || [unified, legacy, ...savedSessionSocketDirs()])]) {
+  const dirs = [...new Set(socketDirs || [unified, legacy, ...savedSessionSocketDirs()])];
+  const cacheKey = JSON.stringify([dirs, env.GSB_STUDIO_VALIDATE_SYNC === "1"]);
+  const cached = cache.get(cacheKey);
+  if (cached?.value && now() < cached.expiresAt) return [...cached.value];
+  if (cached?.pending) return [...await cached.pending];
+
+  const pending = Promise.all(dirs.map(async (socketDir) => {
     const childEnv = { ...env };
     delete childEnv.ZELLIJ_SESSION_NAME;
     delete childEnv.ZELLIJ_SESSION_DIR;
     if (socketDir === legacy) delete childEnv.ZELLIJ_SOCKET_DIR;
     else childEnv.ZELLIJ_SOCKET_DIR = socketDir;
-    const result = spawnSyncImpl("zellij", ["list-sessions", "--no-formatting"], {
-      encoding: "utf8",
-      env: childEnv,
-      timeout: SPAWN_TIMEOUT_MS,
-    });
-    for (const line of (result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    const result = env.GSB_STUDIO_VALIDATE_SYNC === "1"
+      ? spawnSyncImpl("zellij", ["list-sessions", "--no-formatting"], { encoding: "utf8", env: childEnv, timeout: SPAWN_TIMEOUT_MS })
+      : await spawnResult(spawnImpl, "zellij", ["list-sessions", "--no-formatting"], { env: childEnv }, SPAWN_TIMEOUT_MS);
+    return String(result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  })).then((outputs) => {
+    const lines = new Map();
+    for (const output of outputs) for (const line of output) {
       const name = line.split(/\s+/, 1)[0];
       if (!lines.has(name) || (/\bEXITED\b/.test(lines.get(name)) && !/\bEXITED\b/.test(line))) lines.set(name, line);
     }
+    return [...lines.values()];
+  });
+  cache.set(cacheKey, { pending });
+  try {
+    const value = await pending;
+    cache.set(cacheKey, { value, expiresAt: now() + SESSION_LIST_TTL_MS });
+    return [...value];
+  } catch (error) {
+    cache.delete(cacheKey);
+    throw error;
   }
-  return [...lines.values()];
 }
 
-function activeSessionLine(session) {
-  return listSessions().find((line) => line.split(/\s+/, 1)[0] === session && !/\bEXITED\b/.test(line));
+async function activeSessionLine(session) {
+  return (await listSessions()).find((line) => line.split(/\s+/, 1)[0] === session && !/\bEXITED\b/.test(line));
 }
 
 function stateRoot() {
@@ -679,14 +839,14 @@ function sessionState(name, directory, liveLine = "") {
   };
 }
 
-function listSessionOptions() {
-  const liveLines = listSessions();
+async function listSessionOptions() {
+  const liveLines = await listSessions();
   const liveByName = new Map(liveLines.map((line) => [line.split(/\s+/, 1)[0], line]));
   const options = new Map();
   const root = stateRoot();
   try {
     for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !SESSION_PATTERN.test(entry.name)) continue;
+      if (!entry.isDirectory() || entry.name === "cache" || !SESSION_PATTERN.test(entry.name)) continue;
       options.set(entry.name, sessionState(entry.name, path.join(root, entry.name), liveByName.get(entry.name) || ""));
     }
   } catch {
@@ -704,7 +864,7 @@ function listSessionOptions() {
   ));
 }
 
-function listProjectOptions(currentProject, sessions = listSessionOptions()) {
+function listProjectOptions(currentProject, sessions) {
   const paths = [];
   const append = (project) => {
     if (typeof project !== "string" || !path.isAbsolute(project) || paths.includes(project)) return;
@@ -743,11 +903,11 @@ export function loadProjectState(workspace, profiles = loadProfiles(), prompts =
   });
 }
 
-function bootstrap(project) {
+async function bootstrap(project) {
   const profiles = loadProfiles();
   const prompts = loadPromptTemplates();
   const userTemplates = loadUserTemplates().map((template) => ({ ...template, ...normalizeWorkbench(template) }));
-  const sessionOptions = listSessionOptions();
+  const sessionOptions = await listSessionOptions();
   return {
     product: { name: "GSB Studio", version: 1, apiVersion: STUDIO_API_VERSION },
     platform: process.platform,
@@ -765,13 +925,13 @@ function bootstrap(project) {
   };
 }
 
-function projectWorkbench(workspace, { remember = true } = {}) {
+async function projectWorkbench(workspace, { remember = true } = {}) {
   if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw new Error("项目路径必须是绝对路径");
   if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw new Error("项目路径不存在或不是目录");
   const profiles = loadProfiles();
   const prompts = loadPromptTemplates();
   if (remember) rememberProject(workspace);
-  const sessionOptions = listSessionOptions();
+  const sessionOptions = await listSessionOptions();
   return {
     workbench: loadProjectState(workspace, profiles, prompts),
     sessionOptions,
@@ -779,8 +939,8 @@ function projectWorkbench(workspace, { remember = true } = {}) {
   };
 }
 
-function runtimeResources(project) {
-  const sessionOptions = listSessionOptions();
+async function runtimeResources(project) {
+  const sessionOptions = await listSessionOptions();
   return {
     sessionOptions,
     projectOptions: listProjectOptions(project, sessionOptions),
@@ -861,12 +1021,13 @@ export function studioLaunchEnv(sourceEnv, watchdogEnabled) {
   return env;
 }
 
-export function launchWorkbench(workbench, {
+export async function launchWorkbench(workbench, {
   spawnSyncImpl = spawnSync,
   sourceEnv = process.env,
   activeSessionLineImpl = activeSessionLine,
+  invalidateSessionCacheImpl = invalidateSessionCache,
 } = {}) {
-  const saved = persistProjectState(workbench);
+  const saved = await persistProjectState(workbench);
   if (!saved.validation.valid) return { ...saved, launched: false };
   const args = ["--background"];
   if (workbench.rebuild) args.push("--rebuild");
@@ -874,7 +1035,7 @@ export function launchWorkbench(workbench, {
   args.push(workbench.workspace, workbench.session);
   const command = ["gsb-local", ...args].map((part) => (/^[A-Za-z0-9_./-]+$/.test(part) ? part : JSON.stringify(part))).join(" ");
   const openCommand = `gsb-local open ${workbench.session}`;
-  const existing = activeSessionLineImpl(workbench.session);
+  const existing = await activeSessionLineImpl(workbench.session);
   if (existing && !workbench.rebuild) {
     return {
       ...saved,
@@ -889,6 +1050,7 @@ export function launchWorkbench(workbench, {
   }
   const env = studioLaunchEnv(sourceEnv, workbench.watchdog !== false);
   const result = spawnSyncImpl(path.join(ROOT_DIR, "gsb"), args, { encoding: "utf8", env, timeout: 45_000 });
+  if (result.status === 0) invalidateSessionCacheImpl();
   return {
     ...saved,
     launched: result.status === 0,
@@ -914,7 +1076,7 @@ export function openTerminalSession(session, { platform = process.platform, spaw
   return { command, opened: true };
 }
 
-export function createStudioServer({ project, token, platform = process.platform, terminalSpawner = spawn }) {
+export function createStudioServer({ project, token, platform = process.platform, terminalSpawner = spawn, validator = runtimeValidator }) {
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", "http://127.0.0.1");
@@ -927,33 +1089,33 @@ export function createStudioServer({ project, token, platform = process.platform
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/bootstrap") {
-        jsonResponse(response, 200, bootstrap(project));
+        jsonResponse(response, 200, await bootstrap(project));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/resources") {
         const requestedProject = url.searchParams.get("project") || project;
-        jsonResponse(response, 200, runtimeResources(requestedProject));
+        jsonResponse(response, 200, await runtimeResources(requestedProject));
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/project") {
         const body = await readJson(request);
-        jsonResponse(response, 200, projectWorkbench(body.workspace, { remember: body.remember !== false }));
+        jsonResponse(response, 200, await projectWorkbench(body.workspace, { remember: body.remember !== false }));
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/validate") {
         const body = await readJson(request);
-        jsonResponse(response, 200, { validation: validationWithRuntime(body.workbench), files: configPreview(body.workbench) });
+        jsonResponse(response, 200, { validation: await validator.validate(body.workbench), files: configPreview(body.workbench) });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/save") {
         const body = await readJson(request);
-        const result = persistProjectState(body.workbench);
+        const result = await persistProjectState(body.workbench);
         jsonResponse(response, result.validation.valid ? 200 : 422, result);
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/launch") {
         const body = await readJson(request);
-        const result = launchWorkbench(body.workbench);
+        const result = await launchWorkbench(body.workbench);
         jsonResponse(response, result.launched ? 200 : 422, result);
         return;
       }
@@ -978,6 +1140,8 @@ export function createStudioServer({ project, token, platform = process.platform
   });
 }
 
+export function warmupRuntimeCommands(validator = runtimeValidator) { return validator.checkCommands(["claude-glm-5.3", "claude-0812", "claude-relay", "codex", "claude", "kimi"]); }
+
 function printHelp() {
   console.log(`Usage: gsb-local studio [--project PATH] [--port PORT] [--no-open]
 
@@ -1001,6 +1165,7 @@ async function main() {
   const url = `http://127.0.0.1:${address.port}/?token=${token}`;
   console.log(`GSB Studio: ${url}`);
   console.log("Only this local machine can connect. Press Ctrl-C to stop Studio; running Zellij sessions continue.");
+  setImmediate(() => { warmupRuntimeCommands().catch(() => {}); listSessions().catch(() => {}); });
   if (options.open && process.platform === "darwin") {
     const opener = spawn("open", [url], { detached: true, stdio: "ignore" });
     opener.unref();
