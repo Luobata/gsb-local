@@ -253,6 +253,7 @@ Spoke 默认只调查并写报告。Hub 可以在契约中授予精确路径的�
 - Hub 给每个 Spoke 写五段契约：Objective、Scope、Validation、Stop conditions、Reply route。
 - 跨 Pane 内容通过原子 JSON 文件信箱传递，消息只按数据读取，不自动产生批准或提权。
 - `nudge` 只发送固定唤醒语，不把任务 payload 直接注入另一个 Agent；提交使用 Zellij 的真实 `Enter` 键事件。所有 Agent 在字符突发后默认等待 250ms（`GSB_NUDGE_SETTLE_SECONDS`）再提交；Kimi 仍兼容旧变量 `GSB_KIMI_NUDGE_SETTLE_SECONDS`。提交后会用 `dump-screen` 区分输入区草稿与历史区已提交消息：草稿残留时按 0.3/0.6/1.2 秒补发最多三次 Enter，仍失败则 `Ctrl-U` 清行并完整重发一次，最后向 Hub 投递 blocker 并返回非零。`GSB_NUDGE_VERIFY=false` 可回退为只发送不验证。Kimi 的重复唤醒仅在历史区确认已提交时合并，输入框残留不会再被误判为已排队。
+- `nudge` 的 pane 定位与送达检查默认最多等待 5 秒（`GSB_NUDGE_RESOLVE_TIMEOUT_MS`）；挂住的查询客户端会被回收，并对没有 socket 记录的旧会话按「默认目录 → 统一目录」重试。紧急排障时可用 `GSB_SOCKET_DIR_OVERRIDE=/path/to/socket-dir` 指定第二探测目录。
 - 启动 Zellij 和 Agent 前会清除继承自父 Claude 的 child-session 标记，避免独立 Pane 被误判为嵌套会话。
 
 运行态目录：
@@ -302,6 +303,8 @@ Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错�
 
 看门狗随会话启动自动在独立进程组后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。`gsb-local open <session>` 在 attach 前会检查 PID；若进程已死，会清理残留 pid/ready/lock 并从该会话的 `session.env` 自动复活。看门狗自身启动时也会在确认旧 PID 已死后接管陈旧锁。关闭：`GSB_WATCHDOG_ENABLED=false`。
 
+看门狗的单次 Zellij 查询默认 10 秒超时（`GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS`）。超时只回收本轮新建的查询客户端，并沿用既有本轮失败容错；不会终止或重启 Zellij 会话、Agent 或看门狗本身。
+
 日志与自检：
 
 ```bash
@@ -324,6 +327,7 @@ node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区
 | `GSB_WATCHDOG_DRAFT_RECOVERY` | `true` | 是否补交持续滞留的 GSB 唤醒草稿 |
 | `GSB_WATCHDOG_DRAFT_POLLS` | `2` | 草稿连续静止多少轮后补 Enter |
 | `GSB_WATCHDOG_DRAFT_MAX_ENTER` | `3` | 草稿补 Enter 多少次后升级 blocker |
+| `GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS` | `10000` | 单次 Zellij 查询的超时毫秒数 |
 | `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
 | `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
 

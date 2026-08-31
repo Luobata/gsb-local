@@ -18,17 +18,21 @@ import {
   invalidateSessionCache,
   listSessions,
   loadProjectState,
+  mergeSessionLines,
   openTerminalSession,
   parseArgs,
   parseProfileHeader,
   parseRoleMap,
   serializeAgents,
   serializeModels,
+  sessionSocketLabel,
+  sessionState,
   studioLaunchEnv,
   validateWorkbench,
   zellijSocketPathInfo,
 } from "./server.mjs";
 import { PROMPT_INTENT_MARKER, saveProjectState } from "./store.mjs";
+import { runZellijTimed } from "../bin/zellij-timed.mjs";
 
 const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -194,6 +198,71 @@ test("socket directory and 103-byte boundary calculations are stable", () => {
   );
 });
 
+test("session merging preserves the winning socket and cross-socket EXITED evidence", () => {
+  const dirs = ["/cache/gsb-zsock", "/tmp/zellij-501"];
+  const merged = mergeSessionLines([
+    ["shared [Created now] (EXITED - attach to resurrect)", "dead [Created before] (EXITED - attach to resurrect)"],
+    ["shared [Created now]", "legacy [Created now]"],
+  ], dirs);
+  assert.deepEqual(merged.lines, [
+    "shared [Created now]",
+    "dead [Created before] (EXITED - attach to resurrect)",
+    "legacy [Created now]",
+  ]);
+  assert.deepEqual(merged.byName.get("shared"), {
+    line: "shared [Created now]",
+    socketDir: "/tmp/zellij-501",
+    crossSocketExited: true,
+    exitedEverywhere: false,
+  });
+  assert.equal(merged.byName.get("dead").exitedEverywhere, true);
+});
+
+test("session provenance labels attachable live sessions and hides behind its rollback switch", () => {
+  const options = { env: { TMPDIR: "/tmp" }, home: "/Users/test", uid: 501 };
+  assert.equal(sessionSocketLabel("/Users/test/.cache/gsb-zsock", options), "统一目录 (~/.cache/gsb-zsock)");
+  assert.equal(sessionSocketLabel("/tmp/zellij-501", options), "默认目录 (/tmp/zellij-501)");
+  assert.equal(sessionSocketLabel("/custom/socket", options), "/custom/socket");
+
+  const provenance = { socketDir: "/tmp/zellij-501", crossSocketExited: true };
+  const running = sessionState("shared", "/missing", "shared [Created now]", provenance, options);
+  assert.equal(running.socketDir, "/tmp/zellij-501");
+  assert.equal(running.socketLabel, "默认目录 (/tmp/zellij-501)");
+  assert.equal(running.crossSocketExited, true);
+  assert.equal(running.attachHint, "ZELLIJ_SOCKET_DIR=/tmp/zellij-501 zellij attach shared");
+
+  const exited = sessionState("dead", "/missing", "dead (EXITED - attach to resurrect)", {
+    socketDir: "/Users/test/.cache/gsb-zsock",
+    crossSocketExited: false,
+  }, options);
+  assert.equal(exited.status, "exited");
+  assert.equal(exited.attachHint, null);
+
+  const hidden = sessionState("shared", "/missing", "shared [Created now]", provenance, {
+    ...options,
+    env: { ...options.env, GSB_STUDIO_SESSION_PROVENANCE: "false" },
+  });
+  for (const field of ["socketDir", "socketLabel", "attachHint", "crossSocketExited"]) {
+    assert.equal(field in hidden, false, field);
+  }
+});
+
+test("timed Zellij wrapper forwards bounded execution options", () => {
+  let call;
+  const stdout = runZellijTimed(["action", "list-panes"], 321, {
+    env: { GSB_ZELLIJ_BIN: "/fake/zellij" },
+    execImpl(command, args, options) {
+      call = { command, args, options };
+      return "[]\n";
+    },
+  });
+  assert.equal(stdout, "[]\n");
+  assert.equal(call.command, "/fake/zellij");
+  assert.deepEqual(call.args, ["action", "list-panes"]);
+  assert.equal(call.options.timeout, 321);
+  assert.equal(call.options.killSignal, "SIGKILL");
+});
+
 test("Studio merges unified and default Zellij session views", async () => {
   const calls = [];
   const sessions = await listSessions({
@@ -308,6 +377,59 @@ test("nudge isolates session.env and extracts only its Zellij socket", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("nudge bounds a hung default-socket lookup and falls back to the unified directory", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gsb-nudge-timeout-"));
+  const fakeBin = path.join(root, "bin");
+  const seenSockets = path.join(root, "seen-sockets");
+  try {
+    mkdirSync(fakeBin);
+    const fakeZellij = path.join(fakeBin, "zellij");
+    writeFileSync(fakeZellij, [
+      "#!/usr/bin/env bash",
+      "printf '%s\\n' \"${ZELLIJ_SOCKET_DIR:-<default>}\" >> \"$GSB_TEST_SEEN_SOCKETS\"",
+      "if [[ -z \"${ZELLIJ_SOCKET_DIR:-}\" ]]; then exec sleep 100; fi",
+      "printf '%s\\n' '[{\"id\":\"terminal_7\",\"title\":\"hub.legacy.main\",\"is_plugin\":false,\"exited\":false}]'",
+      "",
+    ].join("\n"));
+    chmodSync(fakeZellij, 0o755);
+    const cacheHome = path.join(root, "cache");
+    const started = Date.now();
+    const result = spawnSync(path.join(ROOT_DIR, "bin", "nudge"), ["hub", "--dry-run"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: testEnv({
+        PATH: fakeBin + ":" + (process.env.PATH || "/usr/bin:/bin"),
+        XDG_CACHE_HOME: cacheHome,
+        XDG_STATE_HOME: path.join(root, "state"),
+        GSB_SESSION: "legacy",
+        GSB_ROLES: "hub",
+        GSB_ROLE: "external",
+        GSB_NUDGE_RESOLVE_TIMEOUT_MS: "2000",
+        GSB_TEST_SEEN_SOCKETS: seenSockets,
+      }),
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(elapsed >= 1_800, `nudge returned before the 2000ms timeout: ${elapsed}ms`);
+    assert.ok(elapsed < 4_500, `nudge took ${elapsed}ms`);
+    assert.match(result.stdout, /session=legacy role=hub pane_id=terminal_7/);
+    assert.equal(readFileSync(seenSockets, "utf8").trim().split("\n").at(-1), path.join(cacheHome, "gsb-zsock"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Studio frontend renders provenance only when structured fields are present", () => {
+  const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  assert.match(app, /const hasProvenance = Object\.hasOwn\(target, "crossSocketExited"\)/);
+  assert.match(app, /if \(session\.socketLabel\)/);
+  assert.match(app, /if \(target\.attachHint && \(target\.status === "running" \|\| target\.crossSocketExited\)\)/);
+  assert.match(app, /else if \(hasProvenance && target\.status === "exited"\)/);
+  assert.match(styles, /\.resource-badge\.socket/);
+  assert.match(styles, /\.detail-code/);
 });
 
 test("Studio confirmation rejects reentry before changing dialog content", () => {

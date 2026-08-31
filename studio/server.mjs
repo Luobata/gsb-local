@@ -759,7 +759,43 @@ export function invalidateSessionCache(cache = sessionListCache) {
   cache.clear();
 }
 
-export async function listSessions({
+export function mergeSessionLines(outputs, dirs) {
+  const selected = new Map();
+  const observations = new Map();
+  outputs.forEach((output, index) => {
+    for (const line of output) {
+      const name = line.split(/\s+/, 1)[0];
+      const exited = /\bEXITED\b/.test(line);
+      const observed = observations.get(name) || { sawRunning: false, sawExited: false };
+      if (exited) observed.sawExited = true;
+      else observed.sawRunning = true;
+      observations.set(name, observed);
+      const current = selected.get(name);
+      if (!current || (current.exited && !exited)) {
+        selected.set(name, { line, socketDir: dirs[index] || null, exited });
+      }
+    }
+  });
+  const byName = new Map([...selected].map(([name, value]) => {
+    const observed = observations.get(name);
+    return [name, {
+      line: value.line,
+      socketDir: value.socketDir,
+      crossSocketExited: observed.sawRunning && observed.sawExited,
+      exitedEverywhere: !observed.sawRunning,
+    }];
+  }));
+  return { lines: [...selected.values()].map(({ line }) => line), byName };
+}
+
+function cloneSessionListing(listing) {
+  return {
+    lines: [...listing.lines],
+    byName: new Map([...listing.byName].map(([name, value]) => [name, { ...value }])),
+  };
+}
+
+export async function listSessionsDetailed({
   spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
   env = process.env,
@@ -774,8 +810,8 @@ export async function listSessions({
   const dirs = [...new Set(socketDirs || [unified, legacy, ...savedSessionSocketDirs()])];
   const cacheKey = JSON.stringify([dirs, env.GSB_STUDIO_VALIDATE_SYNC === "1"]);
   const cached = cache.get(cacheKey);
-  if (cached?.value && now() < cached.expiresAt) return [...cached.value];
-  if (cached?.pending) return [...await cached.pending];
+  if (cached?.value && now() < cached.expiresAt) return cloneSessionListing(cached.value);
+  if (cached?.pending) return cloneSessionListing(await cached.pending);
 
   const pending = Promise.all(dirs.map(async (socketDir) => {
     const childEnv = { ...env };
@@ -787,23 +823,20 @@ export async function listSessions({
       ? spawnSyncImpl("zellij", ["list-sessions", "--no-formatting"], { encoding: "utf8", env: childEnv, timeout: SPAWN_TIMEOUT_MS })
       : await spawnResult(spawnImpl, "zellij", ["list-sessions", "--no-formatting"], { env: childEnv }, SPAWN_TIMEOUT_MS);
     return String(result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-  })).then((outputs) => {
-    const lines = new Map();
-    for (const output of outputs) for (const line of output) {
-      const name = line.split(/\s+/, 1)[0];
-      if (!lines.has(name) || (/\bEXITED\b/.test(lines.get(name)) && !/\bEXITED\b/.test(line))) lines.set(name, line);
-    }
-    return [...lines.values()];
-  });
+  })).then((outputs) => mergeSessionLines(outputs, dirs));
   cache.set(cacheKey, { pending });
   try {
     const value = await pending;
     cache.set(cacheKey, { value, expiresAt: now() + SESSION_LIST_TTL_MS });
-    return [...value];
+    return cloneSessionListing(value);
   } catch (error) {
     cache.delete(cacheKey);
     throw error;
   }
+}
+
+export async function listSessions(options = {}) {
+  return (await listSessionsDetailed(options)).lines;
 }
 
 async function activeSessionLine(session) {
@@ -815,7 +848,29 @@ function stateRoot() {
     || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "gsb-local");
 }
 
-function sessionState(name, directory, liveLine = "") {
+function shortSocketDir(socketDir, home) {
+  const prefix = `${home}${path.sep}`;
+  return socketDir === home ? "~" : (socketDir.startsWith(prefix) ? `~/${socketDir.slice(prefix.length)}` : socketDir);
+}
+
+export function sessionSocketLabel(socketDir, { env = process.env, home = os.homedir(), uid } = {}) {
+  if (!socketDir) return null;
+  const display = shortSocketDir(socketDir, home);
+  if (socketDir === gsbSocketDir({ env, home })) return `统一目录 (${display})`;
+  if (socketDir === defaultZellijSocketDir({ env, uid })) return `默认目录 (${display})`;
+  return display;
+}
+
+function shellWord(value) {
+  const text = String(value);
+  return /^[A-Za-z0-9_./:-]+$/.test(text) ? text : `'${text.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function sessionState(name, directory, liveLine = "", provenance = null, {
+  env = process.env,
+  home = os.homedir(),
+  uid,
+} = {}) {
   const roster = readText(path.join(directory, "ROLES.md"));
   const task = readText(path.join(directory, "TASK.md"));
   const workspace = roster.match(/^Workspace:\s*(.+)$/m)?.[1]?.trim()
@@ -829,7 +884,7 @@ function sessionState(name, directory, liveLine = "") {
     // A disappearing state directory is simply omitted from freshness sorting.
   }
   const status = liveLine ? (/\bEXITED\b/.test(liveLine) ? "exited" : "running") : "saved";
-  return {
+  const state = {
     name,
     status,
     workspace,
@@ -837,24 +892,39 @@ function sessionState(name, directory, liveLine = "") {
     updatedAt,
     raw: liveLine,
   };
+  if (env.GSB_STUDIO_SESSION_PROVENANCE !== "false") {
+    const socketDir = provenance?.socketDir || null;
+    state.socketDir = socketDir;
+    state.socketLabel = sessionSocketLabel(socketDir, { env, home, uid });
+    state.crossSocketExited = Boolean(provenance?.crossSocketExited);
+    state.attachHint = socketDir && (status === "running" || state.crossSocketExited)
+      ? `ZELLIJ_SOCKET_DIR=${shellWord(socketDir)} zellij attach ${name}`
+      : null;
+  }
+  return state;
 }
 
 async function listSessionOptions() {
-  const liveLines = await listSessions();
+  const { lines: liveLines, byName: provenanceByName } = await listSessionsDetailed();
   const liveByName = new Map(liveLines.map((line) => [line.split(/\s+/, 1)[0], line]));
   const options = new Map();
   const root = stateRoot();
   try {
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name === "cache" || !SESSION_PATTERN.test(entry.name)) continue;
-      options.set(entry.name, sessionState(entry.name, path.join(root, entry.name), liveByName.get(entry.name) || ""));
+      options.set(entry.name, sessionState(
+        entry.name,
+        path.join(root, entry.name),
+        liveByName.get(entry.name) || "",
+        provenanceByName.get(entry.name),
+      ));
     }
   } catch {
     // A first-time Studio user can legitimately have no GSB state directory.
   }
   for (const [name, line] of liveByName) {
     if (!SESSION_PATTERN.test(name) || options.has(name)) continue;
-    options.set(name, sessionState(name, path.join(root, name), line));
+    options.set(name, sessionState(name, path.join(root, name), line, provenanceByName.get(name)));
   }
   const rank = { running: 0, exited: 1, saved: 2 };
   return [...options.values()].sort((left, right) => (

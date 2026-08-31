@@ -19,7 +19,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -165,6 +165,10 @@ const SPOKES = (process.env.GSB_ROLES || "hub,core-bug,ops-gov,plan-backup,ui")
   .split(",")
   .map((role) => role.trim())
   .filter((role) => role && role !== "hub");
+function positiveTimeoutMs(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 const CONFIG = {
   interval: Number(process.env.GSB_WATCHDOG_INTERVAL || 60),
   bottomLines: Number(process.env.GSB_WATCHDOG_BOTTOM_LINES || 15),
@@ -178,7 +182,9 @@ const CONFIG = {
   draftRecovery: process.env.GSB_WATCHDOG_DRAFT_RECOVERY !== "false",
   draftPolls: Number(process.env.GSB_WATCHDOG_DRAFT_POLLS || 2),
   draftMaxEnter: Number(process.env.GSB_WATCHDOG_DRAFT_MAX_ENTER || 3),
+  zellijTimeoutMs: positiveTimeoutMs(process.env.GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS, 10_000),
 };
+const ZELLIJ_BIN = process.env.GSB_ZELLIJ_BIN || "zellij";
 const PATTERNS_FILE =
   process.env.GSB_WATCHDOG_PATTERNS ||
   (ROOT ? path.join(ROOT, "defaults", "watchdog-patterns.conf") : "");
@@ -191,18 +197,43 @@ function zellijFallbackAllowed(args) {
   return args[0] === "action" && (args[1] === "list-panes" || args[1] === "dump-screen");
 }
 
+function runZellijCommand(args, options, { execImpl = execFileSync, bin = ZELLIJ_BIN, logImpl = log } = {}) {
+  try {
+    return execImpl(bin, args, options);
+  } catch (error) {
+    if (error?.code === "ETIMEDOUT" || error?.signal === "SIGKILL") {
+      logImpl(`zellij timed out after ${options.timeout}ms (SIGKILL)`);
+    }
+    throw error;
+  }
+}
+
 function zellij(args) {
   const options = {
     env: { ...process.env, ZELLIJ_SESSION_NAME: SESSION },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: CONFIG.zellijTimeoutMs,
+    killSignal: "SIGKILL",
   };
   try {
-    return execFileSync("zellij", args, options);
+    return runZellijCommand(args, options);
   } catch (error) {
     if (!process.env.ZELLIJ_SOCKET_DIR || !zellijFallbackAllowed(args)) throw error;
     delete options.env.ZELLIJ_SOCKET_DIR;
-    return execFileSync("zellij", args, options);
+    return runZellijCommand(args, options);
+  }
+}
+
+function runHubNudge({ execImpl = execFileSync, nudgePath = path.join(ROOT, "bin", "nudge"), timeoutMs = 30_000, logImpl = log } = {}) {
+  try {
+    execImpl("bash", [nudgePath, "hub"], {
+      env: { ...process.env, GSB_ROLE: "" }, stdio: "ignore", timeout: timeoutMs, killSignal: "SIGKILL",
+    });
+    return true;
+  } catch (error) {
+    if (error?.code === "ETIMEDOUT" || error?.signal === "SIGKILL") logImpl(`hub nudge timed out after ${timeoutMs}ms (SIGKILL)`);
+    return false;
   }
 }
 
@@ -278,14 +309,7 @@ function notifyHub(role, detail, issue = "error") {
     flag: "wx",
     mode: 0o600,
   });
-  try {
-    execFileSync("bash", [path.join(ROOT, "bin", "nudge"), "hub"], {
-      env: { ...process.env, GSB_ROLE: "" },
-      stdio: "ignore",
-    });
-  } catch {
-    // Hub pane may be gone; the durable message still waits in the inbox.
-  }
+  runHubNudge(); // The durable message remains in the inbox if waking Hub fails or times out.
 }
 
 function applyAction(role, pane, st, action, now) {
@@ -578,6 +602,42 @@ function runSelfTest() {
   test("watchdogPidIsAlive sees the self-test process", watchdogPidIsAlive(process.pid));
   test("Zellij fallback allows read actions", zellijFallbackAllowed(["action", "list-panes"]) && zellijFallbackAllowed(["action", "dump-screen"]));
   test("Zellij fallback rejects write actions", !zellijFallbackAllowed(["action", "write-chars"]) && !zellijFallbackAllowed(["action", "send-keys"]));
+  test("watchdog timeout config fails closed", positiveTimeoutMs("0", 10_000) === 10_000 && positiveTimeoutMs("bad", 10_000) === 10_000 && positiveTimeoutMs("250", 10_000) === 250);
+  const hungZellij = path.join(tmpdir(), `gsb-wd-hung-zellij-${process.pid}`);
+  writeFileSync(hungZellij, "#!/usr/bin/env bash\nexec sleep 100\n");
+  chmodSync(hungZellij, 0o755);
+  const timeoutState = freshState();
+  timeoutState.errorStreak = 2;
+  timeoutState.draftStreak = 1;
+  const stateBeforeTimeout = JSON.stringify(timeoutState);
+  const timeoutLogs = [];
+  const timeoutStarted = Date.now();
+  let timeoutError;
+  try {
+    runZellijCommand(["action", "list-panes"], {
+      env: process.env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 200,
+      killSignal: "SIGKILL",
+    }, { bin: hungZellij, logImpl: (message) => timeoutLogs.push(message) });
+  } catch (error) {
+    timeoutError = error;
+  } finally {
+    unlinkSync(hungZellij);
+  }
+  const timeoutElapsed = Date.now() - timeoutStarted;
+  test("hung Zellij query is killed within its timeout", timeoutElapsed < 700 && timeoutError?.signal === "SIGKILL");
+  test("Zellij timeout emits a specific diagnostic", timeoutLogs[0] === "zellij timed out after 200ms (SIGKILL)");
+  test("Zellij timeout leaves recovery streaks unchanged", JSON.stringify(timeoutState) === stateBeforeTimeout);
+  let hubNudgeOptions;
+  const hubNudgeLogs = [];
+  const hubNudgeResult = runHubNudge({ nudgePath: "/fake/nudge", timeoutMs: 200, logImpl: (message) => hubNudgeLogs.push(message), execImpl(_command, _args, options) {
+    hubNudgeOptions = options;
+    throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT", signal: "SIGKILL" });
+  } });
+  test("hub nudge is bounded and timeout-safe", !hubNudgeResult && hubNudgeOptions.timeout === 200 && hubNudgeOptions.killSignal === "SIGKILL");
+  test("hub nudge timeout emits a specific diagnostic", hubNudgeLogs[0] === "hub nudge timed out after 200ms (SIGKILL)");
   test(
     "wakePrefixForRole matches the fixed spoke wake-up",
     wakePrefixForRole("coder") === "A durable GSB contract or mailbox message is available for coder.",

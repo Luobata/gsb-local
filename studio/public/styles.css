@@ -382,6 +382,7 @@ input[readonly] { border-style: dashed; color: var(--signal-dim); cursor: not-al
 .resource-badge.running { border-color: #536b2a; color: var(--signal); }
 .resource-badge.exited { border-color: #765345; color: var(--warning); }
 .resource-badge.configured { color: var(--cyan); }
+.resource-badge.socket { max-width: 180px; overflow: hidden; border-color: rgba(98,210,220,.42); color: var(--cyan); text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
 .resource-stat { color: var(--faint); font: 10px var(--mono); white-space: nowrap; }
 .resource-empty { min-height: 150px; display: grid; place-items: center; align-content: center; gap: 5px; color: var(--faint); text-align: center; }
 .resource-empty b { color: var(--muted); font-size: 11px; }
@@ -466,6 +467,7 @@ body.has-detail-open { overflow: hidden; }
 .detail-list li.is-pending::before { width: 9px; height: 9px; margin-top: 3px; border: 1px solid var(--line-strong); border-top-color: var(--cyan); border-radius: 50%; content: ""; animation: spin .7s linear infinite; }
 .detail-list li b { display: block; color: var(--ink); font: 11px var(--mono); }
 .detail-list li small { display: block; margin-top: 2px; color: var(--faint); font: 10px/1.5 var(--mono); white-space: pre-line; }
+.detail-code { display: block; margin-top: 6px; overflow-x: auto; color: var(--cyan); font: 10px/1.5 var(--mono); white-space: nowrap; }
 .detail-empty { margin: 0; padding: 12px 0; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; }
 .detail-actions { position: sticky; bottom: 0; margin: 28px -26px 0; padding: 14px 26px 18px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; border-top: 1px solid rgba(98,210,220,.32); background: linear-gradient(180deg, rgba(8,17,18,.94), #081011 35%); }
 

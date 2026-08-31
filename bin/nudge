@@ -9,6 +9,7 @@ SESSION="${GSB_SESSION:-${ZELLIJ_SESSION_NAME:-seed-gsb}}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$SESSION"
 SESSION_ENV="$STATE_DIR/session.env"
 SOCKET_FROM_SESSION_ENV=false
+NUDGE_RESOLVE_TIMEOUT_MS="${GSB_NUDGE_RESOLVE_TIMEOUT_MS:-5000}"
 
 gsb_socket_dir() {
   local cache_root
@@ -36,7 +37,7 @@ if [[ -n "$SAVED_SOCKET_DIR" ]]; then
   SOCKET_FROM_SESSION_ENV=true
 fi
 if [[ "$SOCKET_FROM_SESSION_ENV" != true ]]; then
-  export ZELLIJ_SOCKET_DIR="$(gsb_socket_dir)"
+  unset ZELLIJ_SOCKET_DIR
 fi
 SOURCE_ROLE="${GSB_ROLE:-external}"
 ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
@@ -76,9 +77,13 @@ if [[ "$MODE" != "--dry-run" ]]; then
   fi
 fi
 
+zellij_timed() {
+  node "$ROOT_DIR/bin/zellij-timed.mjs" "$NUDGE_RESOLVE_TIMEOUT_MS" "$@"
+}
+
 resolve_target_pane() {
   local pane_json
-  pane_json="$(ZELLIJ_SESSION_NAME="$SESSION" zellij action list-panes --json --all 2>/dev/null)" || return 1
+  pane_json="$(ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action list-panes --json --all 2>/dev/null)" || return 1
   printf '%s' "$pane_json" | node -e '
   let raw = "";
   process.stdin.on("data", chunk => raw += chunk);
@@ -96,7 +101,7 @@ resolve_target_pane() {
 PANE_MATCH=""
 if ! PANE_MATCH="$(resolve_target_pane)"; then
   if [[ "$SOCKET_FROM_SESSION_ENV" != true ]]; then
-    unset ZELLIJ_SOCKET_DIR
+    export ZELLIJ_SOCKET_DIR="$(gsb_socket_dir)"
     PANE_MATCH="$(resolve_target_pane)" || PANE_MATCH=""
   fi
 fi
@@ -150,7 +155,7 @@ fi
 WAKE_SCREEN=""
 WAKE_DETECTION=""
 capture_wake_state() {
-  if ! WAKE_SCREEN="$(ZELLIJ_SESSION_NAME="$SESSION" zellij action dump-screen --pane-id "$PANE_ID" 2>/dev/null)"; then
+  if ! WAKE_SCREEN="$(ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action dump-screen --pane-id "$PANE_ID" 2>/dev/null)"; then
     return 2
   fi
   if ! WAKE_DETECTION="$(printf '%s' "$WAKE_SCREEN" | node "$ROOT_DIR/bin/wake-detect.mjs" "$MESSAGE_PREFIX")"; then
@@ -221,12 +226,12 @@ if [[ "$TARGET_IS_KIMI" == true && "${GSB_KIMI_NUDGE_COALESCE:-true}" != false ]
   fi
 fi
 
-ZELLIJ_SESSION_NAME="$SESSION" zellij action write-chars --pane-id "$PANE_ID" "$MESSAGE"
+ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action write-chars --pane-id "$PANE_ID" "$MESSAGE"
 # Every supported TUI needs a short window to process the write burst before
 # Enter. Keep the original Kimi setting as a compatibility fallback.
 sleep "$SETTLE_SECONDS"
 # Let Zellij encode a real Enter key instead of writing a raw CR byte.
-ZELLIJ_SESSION_NAME="$SESSION" zellij action send-keys --pane-id "$PANE_ID" Enter
+ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
 
 if [[ "$VERIFY_DELIVERY" == false ]]; then
   printf 'nudged %s pane=%s session=%s\n' "$TARGET_ROLE" "$PANE_ID" "$SESSION"
@@ -245,7 +250,7 @@ retry_count=0
 if wake_is_draft; then
   for retry_delay in 0.3 0.6 1.2; do
     sleep "$retry_delay"
-    ZELLIJ_SESSION_NAME="$SESSION" zellij action send-keys --pane-id "$PANE_ID" Enter
+    ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
     retry_count=$((retry_count + 1))
     detection_status=0
     capture_wake_state || detection_status=$?
@@ -259,10 +264,10 @@ if wake_is_draft; then
 fi
 
 if wake_is_draft; then
-  ZELLIJ_SESSION_NAME="$SESSION" zellij action send-keys --pane-id "$PANE_ID" "Ctrl u"
-  ZELLIJ_SESSION_NAME="$SESSION" zellij action write-chars --pane-id "$PANE_ID" "$MESSAGE"
+  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" "Ctrl u"
+  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action write-chars --pane-id "$PANE_ID" "$MESSAGE"
   sleep "$SETTLE_SECONDS"
-  ZELLIJ_SESSION_NAME="$SESSION" zellij action send-keys --pane-id "$PANE_ID" Enter
+  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
   detection_status=0
   capture_wake_state || detection_status=$?
   if [[ "$detection_status" -ne 0 ]]; then

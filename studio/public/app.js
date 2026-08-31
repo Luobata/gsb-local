@@ -179,22 +179,38 @@ function detailTime(value) {
 
 function sessionDetailView(session) {
   const target = clone(session);
+  const hasProvenance = Object.hasOwn(target, "crossSocketExited");
+  let summary = "当前编辑中的工作台保持不变。只有点击下方显式动作，才会选用此会话名或切换关联项目。";
+  if (hasProvenance && target.crossSocketExited) {
+    summary += " Zellij 在其他 Socket 目录可能把它显示为 EXITED；合并视图已确认它仍在下方归属目录运行。";
+  } else if (hasProvenance && target.status === "exited") {
+    summary += " 各已知 Socket 目录均无活记录；会话已退出，可用 gsb-local open 重建。";
+  }
+  const groups = [{
+    title: "ACTIVE ROLES",
+    items: (target.roles || []).map((role) => ({ title: role, meta: "会话记录中的活动角色" })),
+    empty: "该会话没有记录角色清单。",
+  }];
+  if (target.attachHint && (target.status === "running" || target.crossSocketExited)) {
+    groups.push({
+      title: "ATTACH / READ ONLY",
+      items: [{ title: "按 Socket 归属进入", code: target.attachHint }],
+      empty: "",
+    });
+  }
   return {
     kind: "session",
     eyebrow: "SESSION / STATE SNAPSHOT",
     title: target.name,
-    summary: "当前编辑中的工作台保持不变。只有点击下方显式动作，才会选用此会话名或切换关联项目。",
+    summary,
     facts: [
       ["状态", (target.status || "unknown").toUpperCase()],
       ["关联项目", target.workspace || "未记录关联项目"],
+      ...(target.socketLabel ? [["Socket 归属", target.socketLabel]] : []),
       ["更新时间", detailTime(target.updatedAt)],
       ["角色数量", String(target.roles?.length || 0)],
     ],
-    groups: [{
-      title: "ACTIVE ROLES",
-      items: (target.roles || []).map((role) => ({ title: role, meta: "会话记录中的活动角色" })),
-      empty: "该会话没有记录角色清单。",
-    }],
+    groups,
     target,
   };
 }
@@ -406,6 +422,7 @@ function renderDetail(view = detailView) {
       row.classList.toggle("is-pending", Boolean(item.pending));
       row.append(element("b", "", item.title));
       if (item.meta) row.append(element("small", "", item.meta));
+      if (item.code) row.append(element("code", "detail-code", item.code));
       list.append(row);
     });
     section.append(list);
@@ -1055,6 +1072,11 @@ function sessionResource(session) {
   );
   const meta = element("span", "resource-meta");
   meta.append(element("span", `resource-badge ${session.status}`, session.status));
+  if (session.socketLabel) {
+    const socketBadge = element("span", "resource-badge socket", session.socketLabel);
+    socketBadge.title = `Socket 归属：${session.socketLabel}`;
+    meta.append(socketBadge);
+  }
   meta.append(element("span", "resource-stat", `${session.roles?.length || 0} ROLES`));
   button.append(copy, meta);
   button.addEventListener("click", () => openDetail(sessionDetailView(session), button));
