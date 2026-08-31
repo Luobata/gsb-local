@@ -51,6 +51,8 @@ gsb-local open my-task
 
 新会话的 Zellij socket 默认放在 `${XDG_CACHE_HOME:-$HOME/.cache}/gsb-zsock`，实际目录会写入该会话的 `session.env`，因此 attach、nudge 和 watchdog 应走 `gsb-local open`/GSB 脚本。旧默认目录中的运行会话仍可只读发现并 attach，不会被自动迁移或删除。路径有特殊约束时可在创建前设置 `GSB_SOCKET_DIR_OVERRIDE=/short/path`；完整 socket 路径超过 103 字节会在创建前明确报错。
 
+只读检查当前布局是否仍符合 Hub 左列、Spoke 右列及 canonical pane 标题：`gsb-local layout-status [SESSION]`。它会报告缺失/退出/多余 pane、漂移列和标题断链，但不会自动修复或改动会话。
+
 Zellij 0.44.x 在快速结束并立即重建同名会话时偶尔会卡在 server/client 初始化。GSB 为创建过程设置 15 秒硬超时并只重试一次；如果仍失败会明确退出并给出 Zellij 日志路径，不会无限卡住。
 
 显式以最高权限启动内置 Agent：
@@ -299,6 +301,8 @@ Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错�
 
 因为契约、信箱、报告都在磁盘上，无论哪种恢复路径，Agent 重启后重读契约即可断点续传。
 
+`bin/run-agent` 默认把收到的 `SIGTERM`/`SIGHUP` 转发给 Agent，并以 143/129 退出，使 supervise 在原 pane 内重启；`SIGKILL` 的 137 仍沿用既有重启路径。交互 `Ctrl-C`（130）和 Agent 内 `/exit`（0）不会自动重启。启动前设置 `GSB_SUPERVISE_SIGNAL_RESTART=false` 可恢复信号直达 Agent 的旧 `exec` 行为。
+
 可选**硬重启**（默认关闭）：`GSB_WATCHDOG_HARD_RESTART=true` 时，软恢复失败的 Spoke 会被 Ctrl-c 终止并由 supervise 重启。
 
 看门狗随会话启动自动在独立进程组后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。`gsb-local open <session>` 在 attach 前会检查 PID；若进程已死，会清理残留 pid/ready/lock 并从该会话的 `session.env` 自动复活。看门狗自身启动时也会在确认旧 PID 已死后接管陈旧锁。关闭：`GSB_WATCHDOG_ENABLED=false`。
@@ -329,6 +333,7 @@ node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区
 | `GSB_WATCHDOG_DRAFT_MAX_ENTER` | `3` | 草稿补 Enter 多少次后升级 blocker |
 | `GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS` | `10000` | 单次 Zellij 查询的超时毫秒数 |
 | `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
+| `GSB_SUPERVISE_SIGNAL_RESTART` | `true` | 转发 TERM/HUP 并让 supervise 在原 pane 内重启；`false` 恢复旧 exec 行为 |
 | `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
 
 ### 故障模型与恢复路径

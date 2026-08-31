@@ -184,6 +184,19 @@ if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
   export TERM=xterm-256color
 fi
 
+if [[ "${1:-}" == "layout-status" ]]; then
+  shift
+  LAYOUT_STATUS_SESSION="${1:-${GSB_SESSION:-${ZELLIJ_SESSION_NAME:-seed-gsb}}}"
+  if [[ -n "${1:-}" ]]; then
+    LAYOUT_STATUS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$LAYOUT_STATUS_SESSION"
+  else
+    LAYOUT_STATUS_STATE_DIR="${GSB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$LAYOUT_STATUS_SESSION}"
+  fi
+  [[ ! -f "$LAYOUT_STATUS_STATE_DIR/session.env" ]] || source "$LAYOUT_STATUS_STATE_DIR/session.env"
+  export GSB_SESSION="$LAYOUT_STATUS_SESSION" GSB_STATE_DIR="$LAYOUT_STATUS_STATE_DIR"
+  exec node "$ROOT_DIR/bin/layout-status.mjs" "$@"
+fi
+
 if [[ "${1:-}" == "studio" ]]; then
   shift
   exec node "$ROOT_DIR/studio/server.mjs" "$@"
@@ -344,6 +357,7 @@ while [[ "${1:-}" == --* ]]; do
       printf '%s\n' \
         'Usage: gsb-local [--rebuild] [--background] [--full-access] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
         '       gsb-local open [--background] SESSION' \
+        '       gsb-local layout-status [SESSION]' \
         '       gsb-local studio [--project PATH] [--port PORT] [--no-open]' \
         '       gsb-local --print-config [WORKSPACE] [SESSION]' \
         '       gsb-local --list-configs' \

@@ -1,6 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+AGENT_CHILD_PID=""
+
+forward_agent_signal() {
+  local signal="$1"
+  local exit_code="$2"
+  trap - TERM HUP
+  if [[ -n "$AGENT_CHILD_PID" ]]; then
+    kill -s "$signal" "$AGENT_CHILD_PID" 2>/dev/null || true
+    wait "$AGENT_CHILD_PID" 2>/dev/null || true
+  fi
+  exit "$exit_code"
+}
+
+run_agent_process() {
+  if [[ "${GSB_SUPERVISE_SIGNAL_RESTART:-true}" == false ]]; then
+    exec "$@"
+  fi
+  trap 'forward_agent_signal TERM 143' TERM
+  trap 'forward_agent_signal HUP 129' HUP
+  # The explicit stdin duplicate prevents Bash from redirecting an asynchronous
+  # child to /dev/null; job control stays off so TERM/HUP traps interrupt wait.
+  "$@" <&0 >&1 2>&2 &
+  AGENT_CHILD_PID=$!
+  local exit_code
+  set +e
+  wait "$AGENT_CHILD_PID"
+  exit_code=$?
+  set -e
+  AGENT_CHILD_PID=""
+  exit "$exit_code"
+}
+
+run_selftest() {
+  local test_root wrapper_pid="" child_pid="" pid_file label target signal
+  local status status_expected expected_restart actual_restart
+  test_root="$(mktemp -d "${TMPDIR:-/tmp}/gsb-run-agent.XXXXXX")"
+  trap '[[ -z "$wrapper_pid" ]] || kill -TERM "$wrapper_pid" 2>/dev/null || true; [[ -z "$child_pid" ]] || kill -TERM "$child_pid" 2>/dev/null || true; rm -rf -- "$test_root"' EXIT
+
+  for spec in 'natural:exit:NONE:0:false' 'term:wrapper:TERM:143:true' 'hup:wrapper:HUP:129:true' 'int:child:INT:130:false' 'kill:child:KILL:137:true'; do
+    IFS=: read -r label target signal status_expected expected_restart <<< "$spec"
+    status=0
+    if [[ "$target" == exit ]]; then
+      (run_agent_process /bin/bash -c "exit $status_expected") || status=$?
+    else
+      pid_file="$test_root/$label.pid"
+      if [[ "$signal" == INT ]]; then
+        (run_agent_process node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1],String(process.pid)); process.on("SIGINT",()=>process.exit(130)); setInterval(()=>{},1000)' "$pid_file") 2>"$test_root/$label.stderr" &
+      else
+        (run_agent_process /bin/bash -c 'printf "%s\n" "$$" > "$1"; exec sleep 30' gsb-test "$pid_file") 2>"$test_root/$label.stderr" &
+      fi
+      wrapper_pid=$!
+      for _ in {1..100}; do [[ -s "$pid_file" ]] && break; sleep 0.01; done
+      [[ -s "$pid_file" ]] || { printf 'run-agent selftest: %s child did not start\n' "$label" >&2; return 1; }
+      child_pid="$(<"$pid_file")"
+      if [[ "$target" == wrapper ]]; then kill -s "$signal" "$wrapper_pid"; else kill -s "$signal" "$child_pid"; fi
+      if wait "$wrapper_pid"; then status=0; else status=$?; fi
+      wrapper_pid=""
+      if kill -0 "$child_pid" 2>/dev/null; then
+        printf 'run-agent selftest: %s left child %s running\n' "$label" "$child_pid" >&2
+        return 1
+      fi
+      child_pid=""
+    fi
+    actual_restart=false
+    if [[ "$status" -ne 0 && "$status" -ne 130 ]]; then actual_restart=true; fi
+    [[ "$status" -eq "$status_expected" && "$actual_restart" == "$expected_restart" ]] || {
+      printf 'run-agent selftest: %s got status=%s restart=%s\n' "$label" "$status" "$actual_restart" >&2
+      return 1
+    }
+    printf 'ok %s status=%s restart=%s\n' "$label" "$status" "$actual_restart"
+  done
+  rm -rf -- "$test_root"
+  trap - EXIT
+  printf 'run-agent selftest: 5 passed\n'
+}
+
+if [[ "${1:-}" == --selftest ]]; then
+  run_selftest
+  exit 0
+fi
+
 # Clean both boundaries: this also protects panes in a previously polluted
 # Zellij server because the final agent process receives a clean env.
 for tainted_var in \
@@ -148,12 +229,12 @@ exec_agent_command() {
   shift
 
   if command -v "$agent_command" >/dev/null 2>&1; then
-    exec "$agent_command" "$@"
+    run_agent_process "$agent_command" "$@"
   fi
 
   if [[ "$agent_command" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then
     # Resolve aliases such as claude-relay from the user's interactive .zshrc.
-    exec /bin/zsh -ic "$agent_command \"\$@\"" gsb-agent "$@"
+    run_agent_process /bin/zsh -ic "$agent_command \"\$@\"" gsb-agent "$@"
   fi
 
   printf 'Agent command is not executable: %s\n' "$agent_command" >&2
@@ -258,7 +339,7 @@ case "$AGENT_SPEC" in
     SHELL_COMMAND="${AGENT_SPEC#shell:}"
     export GSB_ROLE_PROMPT="$ROLE_PROMPT"
     export GSB_SHARED_PROMPT="$SHARED_PROMPT"
-    exec /bin/zsh -lc "$SHELL_COMMAND"
+    run_agent_process /bin/zsh -lc "$SHELL_COMMAND"
     ;;
   [A-Za-z_][A-Za-z0-9._-]*)
     run_claude_adapter "$AGENT_SPEC"
