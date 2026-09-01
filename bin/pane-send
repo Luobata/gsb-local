@@ -1,0 +1,151 @@
+#!/usr/bin/env node
+
+// Low-level pane I/O only. GSB contracts still travel through relay, and
+// Spokes must continue to wake Hub with nudge rather than this tool.
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { runZellijTimed } from "./zellij-timed.mjs";
+
+const USAGE = 'Usage: pane-send <session> <pane-id> (--text "..." | --key Enter|Ctrl-c|Ctrl-u [--count N]) [--force]';
+const KEY_MAP = { Enter: "Enter", "Ctrl-c": "Ctrl c", "Ctrl-u": "Ctrl u" };
+const GATE_PATTERNS = [/1\.\s*Yes,\s*continue/i, /Do you trust (?:the authors of )?the files in this folder/i];
+
+class PaneSendError extends Error {
+  constructor(message, exitCode = 2) { super(message); this.exitCode = exitCode; }
+}
+
+function positiveInteger(value, label) {
+  if (!/^\d+$/.test(String(value)) || Number(value) < 1) throw new PaneSendError(`${label} must be a positive integer`);
+  return Number(value);
+}
+
+export function parseArgs(argv) {
+  const [session, paneText, ...rest] = argv;
+  if (!session || paneText === undefined) throw new PaneSendError(USAGE);
+  if (!/^\d+$/.test(paneText)) throw new PaneSendError(`invalid pane id: ${paneText}`);
+  const options = { session, paneId: Number(paneText), action: null, count: 1, force: false };
+  let countSeen = false;
+  for (let index = 0; index < rest.length; index += 1) {
+    const flag = rest[index];
+    if (flag === "--force") options.force = true;
+    else if (flag === "--text" || flag === "--key") {
+      if (options.action || rest[index + 1] === undefined) throw new PaneSendError(USAGE);
+      options.action = { type: flag.slice(2), value: rest[++index] };
+    } else if (flag === "--count") {
+      if (rest[index + 1] === undefined) throw new PaneSendError(USAGE);
+      options.count = positiveInteger(rest[++index], "count");
+      countSeen = true;
+    } else throw new PaneSendError(`unknown option: ${flag}`);
+  }
+  if (!options.action || (options.action.type === "key" && !KEY_MAP[options.action.value])) throw new PaneSendError(USAGE);
+  if (countSeen && options.action.type !== "key") throw new PaneSendError("--count requires --key");
+  return options;
+}
+
+export function detectInteractiveGate(screen) {
+  const lines = String(screen).replaceAll("\r", "").split("\n").slice(-20);
+  const tail = lines.join(" ");
+  for (const pattern of GATE_PATTERNS) {
+    const match = tail.match(pattern);
+    if (match) return lines.find((line) => pattern.test(line))?.trim() || match[0];
+  }
+  return null;
+}
+
+export function injectionArgs(options) {
+  const base = ["action", options.action.type === "text" ? "write-chars" : "send-keys", "--pane-id", String(options.paneId)];
+  if (options.action.type === "text") return [...base, options.action.value];
+  return [...base, ...Array(options.count).fill(KEY_MAP[options.action.value])];
+}
+
+function timeoutMs(env) {
+  return positiveInteger(env.GSB_PANE_SEND_TIMEOUT_MS || "5000", "GSB_PANE_SEND_TIMEOUT_MS");
+}
+
+function zellij(args, env, timeout) {
+  try {
+    return runZellijTimed(args, timeout, { env });
+  } catch (error) {
+    const stderr = String(error?.stderr || "").trim();
+    const detail = error?.code === "ETIMEDOUT" ? `timed out after ${timeout}ms` : stderr || error.message;
+    throw new PaneSendError(`zellij ${args[1] || args[0]} failed: ${detail}`, 4);
+  }
+}
+
+export async function sendToPane(options, { env = process.env, log = console.log } = {}) {
+  const scopedEnv = { ...env, ZELLIJ_SESSION_NAME: options.session };
+  const timeout = timeoutMs(scopedEnv);
+  let panes;
+  try {
+    panes = JSON.parse(zellij(["action", "list-panes", "--json", "--all"], scopedEnv, timeout));
+  } catch (error) {
+    if (error instanceof PaneSendError) throw error;
+    throw new PaneSendError(`invalid list-panes response: ${error.message}`, 4);
+  }
+  if (!panes.some((pane) => !pane.is_plugin && pane.id === options.paneId)) {
+    throw new PaneSendError(`pane ${options.paneId} not found in session ${options.session}`, 4);
+  }
+  const dumpArgs = ["action", "dump-screen", "--pane-id", String(options.paneId)];
+  const before = zellij(dumpArgs, scopedEnv, timeout);
+  const gate = detectInteractiveGate(before);
+  if (gate && !options.force) {
+    throw new PaneSendError(`refused: interactive gate detected: ${JSON.stringify(gate)}; attach manually or repeat with --force`, 3);
+  }
+  if (gate) log(`pane-send: --force accepted interactive gate ${JSON.stringify(gate)}`);
+  zellij(injectionArgs(options), scopedEnv, timeout);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const after = zellij(dumpArgs, scopedEnv, timeout);
+  const changed = before !== after;
+  log(`pane-send: session=${options.session} pane=${options.paneId} screen_changed=${changed ? "yes" : "no"}`);
+  return { before, after, changed };
+}
+
+async function selftest() {
+  let passed = 0;
+  const check = (name, fn) => { fn(); passed += 1; console.log(`ok ${name}`); };
+  check("text args", () => assert.deepEqual(injectionArgs(parseArgs(["s", "0", "--text", "hi"])), ["action", "write-chars", "--pane-id", "0", "hi"]));
+  check("Enter format", () => assert.equal(injectionArgs(parseArgs(["s", "1", "--key", "Enter"])).at(-1), "Enter"));
+  check("Ctrl-c format and count", () => assert.deepEqual(injectionArgs(parseArgs(["s", "2", "--key", "Ctrl-c", "--count", "2"])).slice(-2), ["Ctrl c", "Ctrl c"]));
+  check("Ctrl-u format", () => assert.equal(injectionArgs(parseArgs(["s", "3", "--key", "Ctrl-u"])).at(-1), "Ctrl u"));
+  check("Codex gate", () => assert(detectInteractiveGate("prompt\n1. Yes, continue\n2. No")));
+  check("trust gate", () => assert(detectInteractiveGate("Do you trust the files in this folder?")));
+  check("clean screen", () => assert.equal(detectInteractiveGate("ready\n>"), null));
+  check("timeout fails closed", () => assert.throws(() => timeoutMs({ GSB_PANE_SEND_TIMEOUT_MS: "0" })));
+
+  const temp = mkdtempSync(path.join(os.tmpdir(), "gsb-pane-send-"));
+  try {
+    const fake = path.join(temp, "fake-zellij.cjs");
+    const calls = path.join(temp, "calls.ndjson");
+    const counter = path.join(temp, "counter");
+    writeFileSync(fake, [
+      "#!/usr/bin/env node", "const fs=require('node:fs');", "const a=process.argv.slice(2);",
+      "fs.appendFileSync(process.env.FAKE_CALLS,JSON.stringify(a)+'\\n');",
+      "if(a[0]==='action'&&a[1]==='list-panes')process.stdout.write('[{\"id\":7,\"is_plugin\":false}]');",
+      "if(a[0]==='action'&&a[1]==='dump-screen'){let n=0;try{n=Number(fs.readFileSync(process.env.FAKE_COUNTER,'utf8'))}catch{}fs.writeFileSync(process.env.FAKE_COUNTER,String(n+1));process.stdout.write(n?'ready\\nhello\\n':'ready\\n');}", "",
+    ].join("\n"));
+    chmodSync(fake, 0o700);
+    const result = await sendToPane(parseArgs(["demo", "7", "--text", "hello"]), {
+      env: { ...process.env, GSB_ZELLIJ_BIN: fake, GSB_PANE_SEND_TIMEOUT_MS: "1000", FAKE_CALLS: calls, FAKE_COUNTER: counter }, log: () => {},
+    });
+    const recorded = readFileSync(calls, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(result.changed, true);
+    assert.deepEqual(recorded[2], ["action", "write-chars", "--pane-id", "7", "hello"]);
+    passed += 1;
+    console.log("ok fake zellij flow");
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+  console.log(`pane-send selftest: ${passed} passed`);
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  try {
+    if (process.argv[2] === "--selftest") await selftest();
+    else await sendToPane(parseArgs(process.argv.slice(2)));
+  } catch (error) {
+    console.error(`pane-send: ${error.message}`);
+    process.exit(error.exitCode || 1);
+  }
+}

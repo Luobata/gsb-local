@@ -404,6 +404,37 @@ bash "$GSB_LOCAL_ROOT/bin/nudge" <role>
 
 若 Pane 正显示更新、trust/权限对话框或界面已卡死，不要盲发 Enter；先人工处理对话框，或写入 `agent-files/<role>.restart-requested` 后让 `bin/supervise` 重启对应 Agent。第三方 Stop hook 失败会扩大 TUI 回合切换窗口，也应同时排查。看门狗本身不活时运行 `gsb-local open --background <session>` 即可触发 liveness 检查和复活。
 
+### Zellij 外部操作安全矩阵
+
+以下结论适用于 Zellij 0.44.3 的 headless 后台会话（没有真人交互客户端）。命令返回 0 不等于布局真的发生了变化。
+
+| 外部操作 | headless 结果 |
+| --- | --- |
+| `list-sessions`、`action list-panes --json --all`、`action dump-screen`、`action dump-layout` | 可用，只读 |
+| `action focus-pane-id` | 可用，可改变外部命令所见的焦点 |
+| `run -n <title>`、`run -d <direction>` | 可用，但只会 append 新 Pane，不能原位复活 |
+| `action close-pane`、`move-pane`、`rename-pane` | 静默 no-op：rc=0 但没有效果 |
+| `run --in-place`（含 `--close-replaced-pane`） | 静默 no-op，不能替换 exited placeholder |
+
+因此，外部自动化无法移除、替换或重跑 exited placeholder；需要真人 attach 后人工整理，或在获准时重建会话。实验证据见 `reports/studio-w15-layout-design.md` 的 E4/E5/E10/E12。
+
+### Pane 安全注入
+
+任何 `write-chars` / `send-keys` 前都必须先 `dump-screen` 核实目标状态。不要盲发 Enter：如果 Pane 停在 `1. Yes, continue` 或 `Do you trust the files in this folder` 一类信任屏，Enter 会选中当前选项并意外启动旧 runner。
+
+优先使用有超时和前后回验的低层工具：
+
+```bash
+source ~/.local/state/gsb-local/<session>/session.env
+bin/pane-send <session> <pane-id> --text "continue"
+bin/pane-send <session> <pane-id> --key Enter
+bin/pane-send <session> <pane-id> --key Ctrl-c --count 2
+```
+
+工具发现交互门时默认拒绝注入并提示人工 attach；只有核实屏幕后才可显式加 `--force`。CLI 的 `Ctrl-c` / `Ctrl-u` 会转换成 Zellij 要求的 `"Ctrl c"` / `"Ctrl u"`（中间是空格），`Enter` 保持原样。所有调用受 `GSB_PANE_SEND_TIMEOUT_MS` 约束，默认 5000ms。它不替代 GSB dispatch：合同仍走 relay，Spoke 唤醒 Hub 仍走 nudge。
+
+并行跑多个 e2e/runner 时，每个实例必须使用独立的 session/stage-state 目录（分别 `mktemp -d`），不能共享状态目录，否则会交叉写入并造成双实例互相污染。
+
 ## 常用 Zellij 操作
 
 - `Ctrl-p`：进入 Pane 模式，再用方向键切换分屏。
