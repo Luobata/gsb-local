@@ -177,6 +177,12 @@ function detailTime(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function watchdogHeartbeat(value) {
+  if (!Number.isFinite(value)) return "未运行";
+  const age = `${Math.floor(value / 1000)} 秒前`;
+  return value >= 150_000 ? `过期 · ${age}` : age;
+}
+
 function sessionDetailView(session) {
   const target = clone(session);
   const hasProvenance = Object.hasOwn(target, "crossSocketExited");
@@ -207,6 +213,7 @@ function sessionDetailView(session) {
       ["状态", (target.status || "unknown").toUpperCase()],
       ["关联项目", target.workspace || "未记录关联项目"],
       ...(target.socketLabel ? [["Socket 归属", target.socketLabel]] : []),
+      ...(Object.hasOwn(target, "watchdogHeartbeatMs") ? [["Watchdog 心跳", watchdogHeartbeat(target.watchdogHeartbeatMs)]] : []),
       ["更新时间", detailTime(target.updatedAt)],
       ["角色数量", String(target.roles?.length || 0)],
     ],

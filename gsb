@@ -11,6 +11,13 @@ while [[ -L "$SOURCE_PATH" ]]; do
 done
 ROOT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 
+gsb_env_or_default() {
+  local name="$1"
+  local fallback="$2"
+  local value="${!name:-}"
+  printf '%s\n' "${value:-$fallback}"
+}
+
 gsb_socket_dir() {
   local cache_root
   if [[ -n "${GSB_SOCKET_DIR_OVERRIDE:-}" ]]; then
@@ -35,6 +42,21 @@ zellij_session_active_in() {
   else
     sessions="$(env -u ZELLIJ_SOCKET_DIR zellij list-sessions --no-formatting 2>/dev/null || true)"
   fi
+  printf '%s\n' "$sessions" | awk -v session="$session" '$1 == session && !/EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+watchdog_zellij_session_active_in() {
+  local socket_dir="$1"
+  local session="$2"
+  local sessions timeout_ms query_status=0
+  timeout_ms="$(gsb_env_or_default GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS 10000)"
+  [[ "$timeout_ms" =~ ^[0-9]+$ && "$timeout_ms" -gt 0 ]] || timeout_ms=10000
+  if [[ -n "$socket_dir" ]]; then
+    sessions="$(ZELLIJ_SOCKET_DIR="$socket_dir" node "$ROOT_DIR/bin/zellij-timed.mjs" "$timeout_ms" list-sessions --no-formatting 2>/dev/null)" || query_status=$?
+  else
+    sessions="$(env -u ZELLIJ_SOCKET_DIR node "$ROOT_DIR/bin/zellij-timed.mjs" "$timeout_ms" list-sessions --no-formatting 2>/dev/null)" || query_status=$?
+  fi
+  (( query_status == 0 )) || return 2
   printf '%s\n' "$sessions" | awk -v session="$session" '$1 == session && !/EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'
 }
 
@@ -74,14 +96,65 @@ validate_socket_path_length() {
 
 watchdog_pid_is_alive() {
   local watchdog_pid="$1"
-  [[ "$watchdog_pid" =~ ^[0-9]+$ ]] && kill -0 "$watchdog_pid" 2>/dev/null
+  [[ "$watchdog_pid" =~ ^[0-9]+$ && "$watchdog_pid" -gt 0 ]] && kill -0 "$watchdog_pid" 2>/dev/null
+}
+
+watchdog_stale_ms() {
+  local value
+  value="$(gsb_env_or_default GSB_WATCHDOG_HEARTBEAT_STALE_MS 150000)"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || value=150000
+  printf '%s\n' "$value"
+}
+
+watchdog_heartbeat_age_ms() {
+  local watchdog_state_dir="$1"
+  local watchdog_pid="$2"
+  local heartbeat_pid heartbeat_ts heartbeat_seq now
+  [[ -f "$watchdog_state_dir/watchdog.heartbeat" ]] || return 1
+  read -r heartbeat_pid heartbeat_ts heartbeat_seq < "$watchdog_state_dir/watchdog.heartbeat" || return 1
+  [[ "$heartbeat_pid" == "$watchdog_pid" && "$heartbeat_ts" =~ ^[0-9]+$ && "$heartbeat_seq" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( heartbeat_ts <= now )) || heartbeat_ts="$now"
+  printf '%s\n' "$(( (now - heartbeat_ts) * 1000 ))"
+}
+
+watchdog_pid_is_watchdog() {
+  local watchdog_pid="$1"
+  local command_line=""
+  local ps_command
+  ps_command="$(gsb_env_or_default GSB_WATCHDOG_PS_COMMAND "")"
+  if [[ -n "$ps_command" ]]; then
+    command_line="$("$ps_command" "$watchdog_pid" 2>/dev/null || true)"
+  else
+    command_line="$(ps -p "$watchdog_pid" -o command= 2>/dev/null || true)"
+  fi
+  [[ "$command_line" == *watchdog.mjs* ]]
+}
+
+watchdog_is_healthy() {
+  local watchdog_state_dir="$1"
+  local watchdog_pid="$2"
+  local heartbeat_age
+  watchdog_pid_is_alive "$watchdog_pid" || return 1
+  watchdog_pid_is_watchdog "$watchdog_pid" || return 1
+  heartbeat_age="$(watchdog_heartbeat_age_ms "$watchdog_state_dir" "$watchdog_pid")" || return 1
+  (( heartbeat_age < $(watchdog_stale_ms) ))
+}
+
+watchdog_can_reap_frozen() {
+  local watchdog_state_dir="$1"
+  local watchdog_pid="$2"
+  local heartbeat_age
+  heartbeat_age="$(watchdog_heartbeat_age_ms "$watchdog_state_dir" "$watchdog_pid")" || return 1
+  (( heartbeat_age >= $(watchdog_stale_ms) )) && watchdog_pid_is_watchdog "$watchdog_pid"
 }
 
 cleanup_watchdog_artifacts() {
   local watchdog_state_dir="$1"
   rm -f \
     "$watchdog_state_dir/watchdog.pid" \
-    "$watchdog_state_dir/watchdog.ready"
+    "$watchdog_state_dir/watchdog.ready" \
+    "$watchdog_state_dir/watchdog.heartbeat"
   if [[ -d "$watchdog_state_dir/watchdog.lock" ]]; then
     rmdir "$watchdog_state_dir/watchdog.lock" 2>/dev/null || {
       printf 'Could not remove stale watchdog lock: %s\n' "$watchdog_state_dir/watchdog.lock" >&2
@@ -96,6 +169,8 @@ launch_watchdog_from_session() {
   local watchdog_env_file="$watchdog_state_dir/session.env"
   local watchdog_pid
   local watchdog_ready_file="$watchdog_state_dir/watchdog.ready"
+  local watchdog_heartbeat_file="$watchdog_state_dir/watchdog.heartbeat"
+  local heartbeat_pid
   local watchdog_roles
 
   if [[ -f "$watchdog_env_file" ]]; then
@@ -131,8 +206,11 @@ launch_watchdog_from_session() {
   fi
   printf '%s\n' "$watchdog_pid" > "$watchdog_state_dir/watchdog.pid"
   for _ in {1..40}; do
+    heartbeat_pid=""
+    [[ ! -f "$watchdog_heartbeat_file" ]] || read -r heartbeat_pid _ < "$watchdog_heartbeat_file" || true
     if [[ -f "$watchdog_ready_file" ]] \
-      && [[ "$(cat "$watchdog_ready_file" 2>/dev/null || true)" == "$watchdog_pid" ]]; then
+      && [[ "$(cat "$watchdog_ready_file" 2>/dev/null || true)" == "$watchdog_pid" ]] \
+      && [[ "$heartbeat_pid" == "$watchdog_pid" ]]; then
       return 0
     fi
     if ! watchdog_pid_is_alive "$watchdog_pid"; then
@@ -149,17 +227,164 @@ ensure_open_watchdog() {
   local watchdog_state_dir="$1"
   local watchdog_session="$2"
   local watchdog_enabled="$3"
+  ensure_watchdog_state "$watchdog_state_dir" "$watchdog_session" "$watchdog_enabled" true
+}
+
+ensure_watchdog_state() {
+  local watchdog_state_dir="$1"
+  local watchdog_session="$2"
+  local watchdog_enabled="$3"
+  local session_active="$4"
   local watchdog_pid=""
+  WATCHDOG_LAST_HEALTHY=0 WATCHDOG_LAST_REAPED=0 WATCHDOG_LAST_LAUNCHED=0
   [[ "$watchdog_enabled" == true ]] || return 0
-  if [[ -f "$watchdog_state_dir/watchdog.pid" ]]; then
-    watchdog_pid="$(cat "$watchdog_state_dir/watchdog.pid" 2>/dev/null || true)"
-  fi
-  if watchdog_pid_is_alive "$watchdog_pid"; then
+  [[ ! -f "$watchdog_state_dir/watchdog.pid" ]] || watchdog_pid="$(cat "$watchdog_state_dir/watchdog.pid" 2>/dev/null || true)"
+  if watchdog_is_healthy "$watchdog_state_dir" "$watchdog_pid"; then
+    [[ "$session_active" != true ]] || WATCHDOG_LAST_HEALTHY=1
     return 0
   fi
+  if watchdog_pid_is_alive "$watchdog_pid"; then
+    if ! watchdog_can_reap_frozen "$watchdog_state_dir" "$watchdog_pid"; then
+      printf 'Watchdog unhealthy but protected by reaping guard: %s pid=%s\n' "$watchdog_session" "$watchdog_pid" >&2
+      return 0
+    fi
+    if [[ "$(gsb_env_or_default GSB_WATCHDOG_REAP_FROZEN true)" != true ]]; then
+      printf 'Frozen watchdog reaping disabled: %s pid=%s\n' "$watchdog_session" "$watchdog_pid" >&2
+      return 0
+    fi
+    kill -9 "$watchdog_pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      watchdog_pid_is_alive "$watchdog_pid" || break
+      sleep 0.05
+    done
+    if watchdog_pid_is_alive "$watchdog_pid"; then
+      printf 'Frozen watchdog did not exit after SIGKILL: %s pid=%s\n' "$watchdog_session" "$watchdog_pid" >&2
+      return 1
+    fi
+    WATCHDOG_LAST_REAPED=1
+    printf 'Reaped frozen watchdog: %s pid=%s\n' "$watchdog_session" "$watchdog_pid"
+  fi
+  cleanup_watchdog_artifacts "$watchdog_state_dir" || return 1
+  [[ "$session_active" == true ]] || return 0
   printf 'Restarting missing or stale watchdog for active session: %s\n' "$watchdog_session"
-  cleanup_watchdog_artifacts "$watchdog_state_dir"
-  launch_watchdog_from_session "$watchdog_state_dir" "$watchdog_session"
+  launch_watchdog_from_session "$watchdog_state_dir" "$watchdog_session" || return 1
+  WATCHDOG_LAST_LAUNCHED=1
+}
+
+watchdog_session_enabled() {
+  local env_file="$1/session.env"
+  [[ -f "$env_file" ]] || { printf 'true\n'; return; }
+  (
+    unset GSB_WATCHDOG_ENABLED
+    source "$env_file"
+    printf '%s\n' "${GSB_WATCHDOG_ENABLED:-true}"
+  )
+}
+
+watchdog_session_is_active() {
+  local watchdog_state_dir="$1"
+  local watchdog_session="$2"
+  local socket_dir first_status=1 second_status=1
+  socket_dir="$(session_socket_dir_from_env "$watchdog_state_dir/session.env")"
+  if [[ -n "$socket_dir" ]]; then
+    watchdog_zellij_session_active_in "$socket_dir" "$watchdog_session"
+  else
+    watchdog_zellij_session_active_in "" "$watchdog_session" && return 0 || first_status=$?
+    watchdog_zellij_session_active_in "$(gsb_socket_dir)" "$watchdog_session" && return 0 || second_status=$?
+    (( first_status == 1 && second_status == 1 )) && return 1
+    return 2
+  fi
+}
+
+watchdog_ensure_all() {
+  local state_root="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local"
+  local state_dir session enabled active active_status failed=false
+  local checked=0 healthy=0 reaped=0 launched=0
+  [[ -d "$state_root" ]] || { printf 'Watchdog ensure-all: checked=0 healthy=0 reaped=0 launched=0\n'; return; }
+  for state_dir in "$state_root"/*; do
+    [[ -d "$state_dir" && -f "$state_dir/ROLES.md" ]] || continue
+    session="${state_dir##*/}"
+    [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    checked=$((checked + 1))
+    enabled="$(watchdog_session_enabled "$state_dir")"
+    active=false
+    active_status=0
+    watchdog_session_is_active "$state_dir" "$session" || active_status=$?
+    if (( active_status == 2 )); then
+      printf 'Watchdog session probe failed; no action: %s\n' "$session" >&2
+      continue
+    fi
+    (( active_status == 0 )) && active=true
+    if ! ensure_watchdog_state "$state_dir" "$session" "$enabled" "$active"; then failed=true; fi
+    healthy=$((healthy + WATCHDOG_LAST_HEALTHY))
+    reaped=$((reaped + WATCHDOG_LAST_REAPED))
+    launched=$((launched + WATCHDOG_LAST_LAUNCHED))
+  done
+  printf 'Watchdog ensure-all: checked=%s healthy=%s reaped=%s launched=%s\n' "$checked" "$healthy" "$reaped" "$launched"
+  [[ "$failed" == false ]]
+}
+
+watchdog_reaper_plist_path() {
+  printf '%s/Library/LaunchAgents/com.gsb.watchdog-reaper.plist\n' "$HOME"
+}
+
+watchdog_reaper_plist() {
+  local state_root="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local"
+  local stale_ms reap_frozen
+  stale_ms="$(watchdog_stale_ms)"
+  reap_frozen="$(gsb_env_or_default GSB_WATCHDOG_REAP_FROZEN true)"
+  node - "$ROOT_DIR/gsb" "$state_root/watchdog-reaper.log" "${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" "${XDG_STATE_HOME:-}" "$stale_ms" "$reap_frozen" <<'NODE'
+const [program, log, pathValue, stateHome, staleMs, reapFrozen] = process.argv.slice(2);
+const escapeXml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;");
+process.stdout.write(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gsb.watchdog-reaper</string>
+  <key>ProgramArguments</key><array><string>${escapeXml(program)}</string><string>watchdog</string><string>ensure-all</string></array>
+  <key>StartInterval</key><integer>90</integer>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${escapeXml(pathValue)}</string>
+    <key>GSB_WATCHDOG_HEARTBEAT_STALE_MS</key><string>${escapeXml(staleMs)}</string>
+    <key>GSB_WATCHDOG_REAP_FROZEN</key><string>${escapeXml(reapFrozen)}</string>
+    ${stateHome ? `<key>XDG_STATE_HOME</key><string>${escapeXml(stateHome)}</string>` : ""}
+  </dict>
+  <key>StandardOutPath</key><string>${escapeXml(log)}</string>
+  <key>StandardErrorPath</key><string>${escapeXml(log)}</string>
+</dict></plist>
+`);
+NODE
+}
+
+watchdog_reaper_install() {
+  local plist
+  plist="$(watchdog_reaper_plist_path)"
+  mkdir -p "$(dirname "$plist")" "${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local"
+  watchdog_reaper_plist > "$plist.tmp.$$"
+  chmod 600 "$plist.tmp.$$"
+  mv "$plist.tmp.$$" "$plist"
+  launchctl bootout "gui/$(id -u)/com.gsb.watchdog-reaper" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  printf 'Watchdog reaper installed: %s (next trigger within 90s)\n' "$plist"
+}
+
+watchdog_reaper_uninstall() {
+  local plist
+  plist="$(watchdog_reaper_plist_path)"
+  launchctl bootout "gui/$(id -u)/com.gsb.watchdog-reaper" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  printf 'Watchdog reaper uninstalled: %s\n' "$plist"
+}
+
+watchdog_reaper_status() {
+  local plist
+  plist="$(watchdog_reaper_plist_path)"
+  if launchctl print "gui/$(id -u)/com.gsb.watchdog-reaper" >/dev/null 2>&1; then
+    printf 'Watchdog reaper: installed and loaded; next trigger within 90s\n'
+  elif [[ -f "$plist" ]]; then
+    printf 'Watchdog reaper: installed but not loaded; no trigger scheduled\n'
+  else
+    printf 'Watchdog reaper: not installed; no trigger scheduled\n'
+  fi
 }
 
 # A Zellij server permanently inherits the environment of its creator. If GSB is
@@ -182,6 +407,19 @@ for tainted_var in \
 done
 if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
   export TERM=xterm-256color
+fi
+
+if [[ "${1:-}" == "watchdog" ]]; then
+  WATCHDOG_COMMAND="${2:-status}"
+  [[ -z "${3:-}" ]] || { printf 'Usage: gsb-local watchdog ensure-all|install|uninstall|status\n' >&2; exit 1; }
+  case "$WATCHDOG_COMMAND" in
+    ensure-all) watchdog_ensure_all ;;
+    install) watchdog_reaper_install ;;
+    uninstall) watchdog_reaper_uninstall ;;
+    status) watchdog_reaper_status ;;
+    *) printf 'Usage: gsb-local watchdog ensure-all|install|uninstall|status\n' >&2; exit 1 ;;
+  esac
+  exit 0
 fi
 
 if [[ "${1:-}" == "layout-status" ]]; then
@@ -358,6 +596,7 @@ while [[ "${1:-}" == --* ]]; do
         'Usage: gsb-local [--rebuild] [--background] [--full-access] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
         '       gsb-local open [--background] SESSION' \
         '       gsb-local layout-status [SESSION]' \
+        '       gsb-local watchdog ensure-all|install|uninstall|status' \
         '       gsb-local studio [--project PATH] [--port PORT] [--no-open]' \
         '       gsb-local --print-config [WORKSPACE] [SESSION]' \
         '       gsb-local --list-configs' \

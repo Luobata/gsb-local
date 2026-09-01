@@ -305,9 +305,22 @@ Agent CLI 遇到 API 错误时大多不会退出，而是在会话内显示错�
 
 可选**硬重启**（默认关闭）：`GSB_WATCHDOG_HARD_RESTART=true` 时，软恢复失败的 Spoke 会被 Ctrl-c 终止并由 supervise 重启。
 
-看门狗随会话启动自动在独立进程组后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。`gsb-local open <session>` 在 attach 前会检查 PID；若进程已死，会清理残留 pid/ready/lock 并从该会话的 `session.env` 自动复活。看门狗自身启动时也会在确认旧 PID 已死后接管陈旧锁。关闭：`GSB_WATCHDOG_ENABLED=false`。
+看门狗随会话启动自动在独立进程组后台运行（单实例锁保护，`--rebuild` 时自动替换旧实例），会话消失后自动退出。`gsb-local open <session>` 在 attach 前检查 PID、心跳和进程命令；若不健康，会在安全护栏允许时从该会话的 `session.env` 自动复活。关闭：`GSB_WATCHDOG_ENABLED=false`。
 
 看门狗的单次 Zellij 查询默认 10 秒超时（`GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS`）。超时只回收本轮新建的查询客户端，并沿用既有本轮失败容错；不会终止或重启 Zellij 会话、Agent 或看门狗本身。
+
+### Watchdog 生命周期保障
+
+每轮巡检先写 `watchdog.heartbeat`，再查询 Zellij；心跳默认超过 150 秒即视为冻结。自动回收同时要求：心跳中的 PID 与 `watchdog.pid` 一致、心跳已过期、`ps` 命令行含 `watchdog.mjs`。任一条件不满足都不会发信号。死会话只清理可确认的陈旧 watchdog，不会被体检器复活。对应故障分类见下方矩阵，Zellij 外部能力边界见「Zellij 外部操作安全矩阵」。
+
+保障链是 `agent ← supervise ← watchdog ← launchd`：前三层负责各自下游，单个 launchd `StartInterval` 任务每 90 秒运行一次短生命周期体检，递归在 macOS 的 OS 服务层终止，不再叠加 meta-watchdog。体检器不会自动安装：
+
+```bash
+gsb-local watchdog ensure-all  # 立即检查全部持久化会话
+gsb-local watchdog install     # 显式安装单个 launchd 体检器
+gsb-local watchdog status      # 查看安装状态及下次触发窗口
+gsb-local watchdog uninstall   # 卸载并恢复未安装状态
+```
 
 日志与自检：
 
@@ -332,6 +345,8 @@ node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区
 | `GSB_WATCHDOG_DRAFT_POLLS` | `2` | 草稿连续静止多少轮后补 Enter |
 | `GSB_WATCHDOG_DRAFT_MAX_ENTER` | `3` | 草稿补 Enter 多少次后升级 blocker |
 | `GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS` | `10000` | 单次 Zellij 查询的超时毫秒数 |
+| `GSB_WATCHDOG_HEARTBEAT_STALE_MS` | `150000` | 心跳超过多少毫秒视为冻结 |
+| `GSB_WATCHDOG_REAP_FROZEN` | `true` | 三重护栏命中时回收冻结 watchdog；设为 `false` 仅报告 |
 | `GSB_SUPERVISE_MAX_ATTEMPTS` | `10` | 进程退出后的最大重启次数 |
 | `GSB_SUPERVISE_SIGNAL_RESTART` | `true` | 转发 TERM/HUP 并让 supervise 在原 pane 内重启；`false` 恢复旧 exec 行为 |
 | `CLAUDE_CODE_MAX_RETRIES` | `10` | Claude 客户端自身的 API 重试次数（第一层防御，旧版本忽略） |
@@ -348,6 +363,8 @@ node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区
 | 进程反复退出 | 超过重启预算 | `bin/supervise` | 给 Hub 发 `blocker` 后停止 |
 | 整个 Zellij 会话死亡 | 会话 EXITED | `gsb-local` | 再次运行同一命令自动重建，保留任务板和契约 |
 | 看门狗死亡、会话仍活着 | pid/ready/lock 残留但 PID 不存活 | `gsb-local open` | 清理陈旧状态并从持久化会话环境复活 |
+| 看门狗冻结、会话仍活着 | PID 存活但心跳过期 | `open` / launchd 体检 | 三重护栏确认后回收并原策略拉起 |
+| 看门狗异常、会话已死亡 | 心跳过期或 PID 已退出 | launchd 体检 | 只清理，不拉起死会话 |
 
 看门狗只作用于 Spoke Pane。Hub Pane 不做自动恢复——你 attach 时直接看着它，错误需要人工判断。
 
@@ -366,6 +383,7 @@ node "$GSB_LOCAL_ROOT/bin/wake-detect.mjs" --selftest      # 输入区/历史区
 | `watchdog.log` | 看门狗运行日志（启动配置、每次恢复动作、升级记录） |
 | `watchdog.pid` | 当前看门狗进程 PID，`--rebuild` 时据此清理旧实例 |
 | `watchdog.ready` | 看门狗完成单实例加锁后的就绪握手；启动器确认 PID 一致后才报告启动成功 |
+| `watchdog.heartbeat` | 每轮查询前写入 `<pid> <unix_ts> <poll_seq>`，权限 0600 |
 | `watchdog.lock/` | 单实例锁目录，看门狗退出时自动清理 |
 | `agent-files/<role>.pid` | 各角色 Agent 进程 PID |
 | `agent-files/<role>.exit.log` | supervise 记录的每次退出与重启 |

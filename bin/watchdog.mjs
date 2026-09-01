@@ -19,7 +19,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -78,6 +78,27 @@ export function watchdogPidIsAlive(pid) {
   } catch (error) {
     return error?.code === "EPERM";
   }
+}
+
+export function parseWatchdogHeartbeat(value) {
+  const match = String(value || "").trim().match(/^(\d+) (\d+) (\d+)$/);
+  if (!match) return null;
+  const [pid, unixTs, pollSeq] = match.slice(1).map(Number);
+  if (![pid, unixTs, pollSeq].every(Number.isSafeInteger) || pid <= 0 || unixTs <= 0 || pollSeq < 1) return null;
+  return { pid, unixTs, pollSeq };
+}
+
+export function writeWatchdogHeartbeat(file, pid, unixTs, pollSeq) {
+  writeFileSync(file, `${pid} ${unixTs} ${pollSeq}\n`, { mode: 0o600 });
+  chmodSync(file, 0o600);
+}
+
+export function heartbeatThenQuery(file, pid, pollSeq, query, {
+  now = Date.now,
+  writeImpl = writeWatchdogHeartbeat,
+} = {}) {
+  writeImpl(file, pid, Math.floor(now() / 1000), pollSeq);
+  return query();
 }
 
 export function wakePrefixForRole(role) {
@@ -455,6 +476,7 @@ async function main() {
   const lockDir = path.join(STATE_DIR, "watchdog.lock");
   const readyFile = path.join(STATE_DIR, "watchdog.ready");
   const pidFile = path.join(STATE_DIR, "watchdog.pid");
+  const heartbeatFile = path.join(STATE_DIR, "watchdog.heartbeat");
   mkdirSync(STATE_DIR, { recursive: true });
   try {
     mkdirSync(lockDir);
@@ -471,7 +493,7 @@ async function main() {
         process.exit(0);
       }
       log(`reclaiming stale lock pid=${existingPid ?? "missing"}`);
-      for (const staleFile of [readyFile, pidFile]) {
+      for (const staleFile of [readyFile, pidFile, heartbeatFile]) {
         try {
           unlinkSync(staleFile);
         } catch {
@@ -486,9 +508,13 @@ async function main() {
   }
   writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 });
   const cleanup = () => {
-    for (const ownedFile of [readyFile, pidFile]) {
+    for (const [ownedFile, owner] of [
+      [readyFile, (value) => parseWatchdogPid(value)],
+      [pidFile, (value) => parseWatchdogPid(value)],
+      [heartbeatFile, (value) => parseWatchdogHeartbeat(value)?.pid],
+    ]) {
       try {
-        if (parseWatchdogPid(readFileSync(ownedFile, "utf8")) === process.pid) unlinkSync(ownedFile);
+        if (owner(readFileSync(ownedFile, "utf8")) === process.pid) unlinkSync(ownedFile);
       } catch {
         // best effort
       }
@@ -517,10 +543,11 @@ async function main() {
   writeFileSync(readyFile, `${process.pid}\n`, { mode: 0o600 });
 
   let sessionFailures = 0;
+  let pollSeq = 0;
   for (;;) {
     let panes;
     try {
-      panes = listPanes();
+      panes = heartbeatThenQuery(heartbeatFile, process.pid, ++pollSeq, listPanes);
       sessionFailures = 0;
     } catch (error) {
       sessionFailures += 1;
@@ -600,6 +627,23 @@ function runSelfTest() {
   test("parseWatchdogPid accepts a positive integer", parseWatchdogPid("123\n") === 123);
   test("parseWatchdogPid rejects malformed content", parseWatchdogPid("12x") === null);
   test("watchdogPidIsAlive sees the self-test process", watchdogPidIsAlive(process.pid));
+  const heartbeatFile = path.join(tmpdir(), `gsb-wd-heartbeat-${process.pid}`);
+  const heartbeatOrder = [];
+  const queried = heartbeatThenQuery(heartbeatFile, 123, 7, () => {
+    heartbeatOrder.push("query");
+    return "panes";
+  }, {
+    now: () => 1_700_000_000_999,
+    writeImpl(...args) {
+      heartbeatOrder.push("heartbeat");
+      writeWatchdogHeartbeat(...args);
+    },
+  });
+  test("heartbeat records pid, unix timestamp, and poll sequence", readFileSync(heartbeatFile, "utf8") === "123 1700000000 7\n");
+  test("heartbeat is mode 0600", (statSync(heartbeatFile).mode & 0o777) === 0o600);
+  test("heartbeat is written before the Zellij query", queried === "panes" && heartbeatOrder.join(",") === "heartbeat,query");
+  test("parseWatchdogHeartbeat rejects a PID mismatch shape", parseWatchdogHeartbeat("123 bad 7") === null);
+  unlinkSync(heartbeatFile);
   test("Zellij fallback allows read actions", zellijFallbackAllowed(["action", "list-panes"]) && zellijFallbackAllowed(["action", "dump-screen"]));
   test("Zellij fallback rejects write actions", !zellijFallbackAllowed(["action", "write-chars"]) && !zellijFallbackAllowed(["action", "send-keys"]));
   test("watchdog timeout config fails closed", positiveTimeoutMs("0", 10_000) === 10_000 && positiveTimeoutMs("bad", 10_000) === 10_000 && positiveTimeoutMs("250", 10_000) === 250);

@@ -26,6 +26,21 @@ export function parseLayout(text) {
   return { names, verticalSplits: (active.match(/\bsplit_direction="vertical"/g) || []).length };
 }
 
+export function analyzeWatchdogHeartbeat(pidText, heartbeatText, nowMs, staleMs = 150_000) {
+  const pidMatch = String(pidText || "").trim().match(/^\d+$/);
+  const pid = pidMatch ? Number(pidMatch[0]) : null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: "no-pid", pid: null, ageMs: null };
+  const heartbeat = String(heartbeatText || "").trim().match(/^(\d+) (\d+) (\d+)$/);
+  if (!heartbeat || Number(heartbeat[1]) !== pid) return { status: "stale", pid, ageMs: null };
+  const ageMs = Math.max(0, nowMs - Number(heartbeat[2]) * 1000);
+  return { status: ageMs < staleMs ? "healthy" : "stale", pid, ageMs };
+}
+
+export function formatWatchdogHeartbeat(health) {
+  const age = health.ageMs === null ? "missing" : `${Math.floor(health.ageMs / 1000)}s`;
+  return `watchdog: ${health.status} pid=${health.pid ?? "none"} heartbeat_age=${age}`;
+}
+
 function paneRole(pane, session, roles) {
   const titled = roles.find((role) => titleMatches(pane.title || "", baseTitle(session, role)));
   if (titled) return { role: titled, titleOk: true };
@@ -77,8 +92,9 @@ function ids(panes) {
   return panes.length ? `[${panes.map((pane) => pane.id).join(",")}]` : "[]";
 }
 
-function printReport(result, layout, session, roles) {
+function printReport(result, layout, session, roles, watchdogHealth) {
   console.log(`Layout status: session=${session} roles=${roles.join(",")}`);
+  console.log(formatWatchdogHeartbeat(watchdogHealth));
   for (const row of result.rows) console.log(`role ${row.role}: live=${row.live.length} ${ids(row.live)} exited=${row.exited.length} ${ids(row.exited)}`);
   const missing = result.rows.filter((row) => !row.live.length).map((row) => row.role);
   console.log(`missing live roles: ${missing.length ? missing.join(", ") : "none"}`);
@@ -124,7 +140,10 @@ function selftest() {
   assert.deepEqual(drift.rows.find((row) => row.role === "coder").exited.map((pane) => pane.id), [1]);
   assert.equal(drift.extras[0].pane.id, 12);
   assert.equal(drift.broken[0].role, "audit");
-  console.log("layout-status selftest: 8 passed");
+  assert.deepEqual(analyzeWatchdogHeartbeat("42\n", "42 1000 3\n", 1_010_000), { status: "healthy", pid: 42, ageMs: 10_000 });
+  assert.equal(analyzeWatchdogHeartbeat("42", "42 1000 3", 1_200_000).status, "stale");
+  assert.equal(formatWatchdogHeartbeat(analyzeWatchdogHeartbeat("", "", 1_000_000)), "watchdog: no-pid pid=none heartbeat_age=missing");
+  console.log("layout-status selftest: 11 passed");
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -136,8 +155,15 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const roles = parseRoster(readFileSync(process.env.GSB_ROLE_ROSTER || path.join(stateDir, "ROLES.md"), "utf8"));
     const env = { ...process.env, ZELLIJ_SESSION_NAME: session };
     const timeout = Number(process.env.GSB_LAYOUT_STATUS_TIMEOUT_MS || 10_000);
+    const readState = (name) => { try { return readFileSync(path.join(stateDir, name), "utf8"); } catch { return ""; } };
+    const watchdogHealth = analyzeWatchdogHeartbeat(
+      readState("watchdog.pid"),
+      readState("watchdog.heartbeat"),
+      Date.now(),
+      Number(process.env.GSB_WATCHDOG_HEARTBEAT_STALE_MS || 150_000),
+    );
     const layout = parseLayout(runZellijTimed(["action", "dump-layout"], timeout, { env }));
     const panes = JSON.parse(runZellijTimed(["action", "list-panes", "--json", "--all"], timeout, { env }));
-    printReport(analyzeLayout(panes, layout, session, roles), layout, session, roles);
+    printReport(analyzeLayout(panes, layout, session, roles), layout, session, roles, watchdogHealth);
   }
 }

@@ -866,6 +866,13 @@ function shellWord(value) {
   return /^[A-Za-z0-9_./:-]+$/.test(text) ? text : `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
+export function watchdogHeartbeatAgeMs(directory, now = Date.now()) {
+  const match = readText(path.join(directory, "watchdog.heartbeat")).trim().match(/^\d+ (\d+) \d+$/);
+  if (!match) return null;
+  const timestampMs = Number(match[1]) * 1000;
+  return Number.isSafeInteger(timestampMs) && timestampMs > 0 ? Math.max(0, now - timestampMs) : null;
+}
+
 export function sessionState(name, directory, liveLine = "", provenance = null, {
   env = process.env,
   home = os.homedir(),
@@ -900,6 +907,7 @@ export function sessionState(name, directory, liveLine = "", provenance = null, 
     state.attachHint = socketDir && (status === "running" || state.crossSocketExited)
       ? `ZELLIJ_SOCKET_DIR=${shellWord(socketDir)} zellij attach ${name}`
       : null;
+    state.watchdogHeartbeatMs = watchdogHeartbeatAgeMs(directory);
   }
   return state;
 }
