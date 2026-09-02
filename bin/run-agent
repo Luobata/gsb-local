@@ -109,9 +109,11 @@ WORKSPACE="${GSB_WORKSPACE:?GSB_WORKSPACE is required}"
 STATE_DIR="${GSB_STATE_DIR:?GSB_STATE_DIR is required}"
 SESSION="${GSB_SESSION:-seed-gsb}"
 ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
-PROJECT_PROMPT="$WORKSPACE/.gsb-local/prompts/$ROLE.md"
+PROJECT_DIR="${GSB_PROJECT_DIR:-$WORKSPACE/.gsb-local}"
+PROMPTS_DIR="${GSB_PROMPTS_DIR:-$PROJECT_DIR/prompts}"
+PROJECT_PROMPT="$PROMPTS_DIR/$ROLE.md"
 BUILTIN_PROMPT="$ROOT_DIR/prompts/$ROLE.md"
-HUB_EXTENSION_PROMPT="$WORKSPACE/.gsb-local/prompts/hub-extension.md"
+HUB_EXTENSION_PROMPT="$PROMPTS_DIR/hub-extension.md"
 PROTOCOL_FILE="${GSB_PROTOCOL_FILE:-$ROOT_DIR/protocol/dispatch.md}"
 
 if [[ ! "$ROLE" =~ ^[a-z][a-z0-9-]*$ ]]; then

@@ -27,11 +27,11 @@ gsb-local studio
 gsb-local studio --project /path/to/your/repository
 ```
 
-Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--project` 启动时，首屏按最近项目展示配置和运行会话；可直接载入项目、用上次配置启动，或从运行中项目点「在终端打开」。进入工作台后既可以选择 `config1-4`，也可以从最小 Hub 骨架创建独立个人模板；模板卡也支持校验后直接启动。新项目默认用合法的目录 basename 作为会话名，不合法时回退为 `seed-gsb`。
+Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--project` 启动时，首屏按最近项目展示配置和运行会话；可直接载入项目、用上次配置启动，或从运行中项目点「在终端打开」。进入工作台后既可以选择 `config1-4`，也可以从最小 Hub 骨架创建独立个人模板；模板卡也支持校验后直接启动。新建时先选择目录，再填写全局唯一项目名；会话名固定等于项目名，同一目录可以保存多个项目。
 
-非 Hub 角色默认使用“系统基座 + 一句话意图”两层编辑，保存时仍合成为完整的 `.gsb-local/prompts/<role>.md`；无标记的旧提示词继续按自定义全文编辑。新建角色只需角色 ID 和 Agent，内置基座覆盖 `coder`、`core-bug`、`ops-gov`、`plan-backup`、`frontend`、`backend`、`test`、`docs` 与通用兜底。模板显示名称支持中文、空格、符号与 Emoji，个人模板保存在 `~/.config/gsb-local/studio/templates/`，不绑定创建时的项目和会话。Profile 友好名来自各 `profiles/*.conf` 文件头的 `# label:`；`profiles/config1.conf` 同时是默认角色映射的单一事实源，`defaults/agents.conf` 以相对符号链接保留原 CLI 路径。最终启动仍调用同一套 `gsb-local` CLI，不存在第二套运行逻辑。Studio 启动工作台时会剥离调用方 Pane 的 `GSB_*`/`ZELLIJ_*` 会话环境；仅排障对照时可设置 `GSB_STUDIO_ENV_PASSTHROUGH=1` 恢复旧透传。`Ctrl-C` 只关闭 Studio 页面服务，不会关闭已经启动的 Zellij 会话。
+非 Hub 角色默认使用“系统基座 + 一句话意图”两层编辑，保存时仍合成为当前项目配置目录下完整的 `prompts/<role>.md`；无标记的旧提示词继续按自定义全文编辑。新建角色只需角色 ID 和 Agent，内置基座覆盖 `coder`、`core-bug`、`ops-gov`、`plan-backup`、`frontend`、`backend`、`test`、`docs` 与通用兜底。模板显示名称支持中文、空格、符号与 Emoji，个人模板保存在 `~/.config/gsb-local/studio/templates/`，不绑定创建时的项目和会话。Profile 友好名来自各 `profiles/*.conf` 文件头的 `# label:`；`profiles/config1.conf` 同时是默认角色映射的单一事实源，`defaults/agents.conf` 以相对符号链接保留原 CLI 路径。最终启动仍调用同一套 `gsb-local` CLI，不存在第二套运行逻辑。Studio 启动工作台时会剥离调用方 Pane 的 `GSB_*`/`ZELLIJ_*` 会话环境；仅排障对照时可设置 `GSB_STUDIO_ENV_PASSTHROUGH=1` 恢复旧透传。`Ctrl-C` 只关闭 Studio 页面服务，不会关闭已经启动的 Zellij 会话。
 
-项目配置的事实源是 `.gsb-local/agents.conf`、`.gsb-local/models.conf` 和 `.gsb-local/prompts/`；`.gsb-local/workbench.json` 仅作为 Studio 的 UI 草稿与展示元数据 sidecar，不覆盖手工修改的配置事实。
+命名项目的事实源位于 `.gsb-local/projects/<项目名>/` 下的 `agents.conf`、`models.conf` 和 `prompts/`；`workbench.json` 仅作为 Studio 的 UI 草稿与展示元数据 sidecar。旧平铺 `.gsb-local/` 项目继续零迁移读取，只有在同一目录创建第二个项目时才迁入 `projects/<原项目名>/`。CLI 会按会话/项目名选择目录，并把实际绝对路径写入该会话的 `session.env`。
 
 Studio 默认缓存 Agent 命令存在性检查：可用命令在当前进程内持续缓存，不可用结果 30 秒后自动重查；设置 `GSB_STUDIO_CMD_CACHE=off` 可关闭缓存。交互 shell 检查超时或失败时默认显示警告并允许继续启动；设置 `GSB_STUDIO_CHECK_STRICT=on` 可恢复为阻断错误。
 

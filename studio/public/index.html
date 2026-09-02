@@ -66,14 +66,18 @@
               <span>打开其他项目 <small>输入绝对路径</small></span>
               <input id="landing-project-path" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/project" required />
             </label>
-            <button id="landing-open-project" class="secondary-button" type="button">打开路径</button>
+            <label class="field">
+              <span>项目名 <small>新建时必填，全局唯一</small></span>
+              <input id="landing-project-name" autocomplete="off" spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="my-project" />
+            </label>
+            <button id="landing-open-project" class="secondary-button" type="button">打开 / 新建</button>
             <button id="landing-browse-project" class="secondary-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
               选择目录
             </button>
           </div>
-          <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
           <p id="landing-project-status" class="resource-note" aria-live="polite"><span aria-hidden="true">↳</span> 选择项目后进入完整工作台。</p>
+          <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
         </section>
 
         <section id="sec-templates" class="stage" data-stage="0" aria-labelledby="heading-templates">
@@ -258,7 +262,7 @@
               <div class="form-grid two-col session-grid">
                 <label class="field">
                   <span>会话名称</span>
-                  <input id="session-name" autocomplete="off" spellcheck="false" />
+                  <input id="session-name" autocomplete="off" spellcheck="false" readonly title="会话名与项目名保持一致" />
                 </label>
                 <label class="field">
                   <span>工作台名称</span>

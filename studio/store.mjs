@@ -12,8 +12,46 @@ import {
 import path from "node:path";
 
 const ROLE_PATTERN = /^[a-z][a-z0-9-]*$/;
+const PROJECT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
+const PROJECT_FILES = ["agents.conf", "models.conf", "prompts", "workbench.json"];
 export const PROMPT_INTENT_MARKER = "<!-- gsb:intent -->";
+
+function localRoot(workspace) {
+  return path.join(workspace, ".gsb-local");
+}
+
+export function projectDir(workspace, name) {
+  if (!PROJECT_PATTERN.test(name || "")) throw new Error("项目名只能包含字母、数字、点、下划线和连字符");
+  return path.join(localRoot(workspace), "projects", name);
+}
+
+function rawSidecar(directory) {
+  try {
+    const value = JSON.parse(readText(path.join(directory, "workbench.json")));
+    return value && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function legacyProjectName(workspace, sidecar = rawSidecar(localRoot(workspace))) {
+  const candidates = [sidecar?.projectName, sidecar?.name, sidecar?.session, path.basename(workspace)];
+  return candidates.find((name) => PROJECT_PATTERN.test(name || "")) || "seed-gsb";
+}
+
+export function listStoredProjects(workspace) {
+  const projectsRoot = path.join(localRoot(workspace), "projects");
+  const named = existsSync(projectsRoot) ? readdirSync(projectsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && PROJECT_PATTERN.test(entry.name) && !entry.name.startsWith(".staging-"))
+    .filter((entry) => PROJECT_FILES.some((name) => existsSync(path.join(projectsRoot, entry.name, name))))
+    .map((entry) => ({ path: workspace, name: entry.name, directory: path.join(projectsRoot, entry.name), legacy: false }))
+    .sort((left, right) => left.name.localeCompare(right.name)) : [];
+  if (named.length) return named;
+  const directory = localRoot(workspace);
+  if (!PROJECT_FILES.some((name) => existsSync(path.join(directory, name)))) return [];
+  return [{ path: workspace, name: legacyProjectName(workspace), directory, legacy: true }];
+}
 
 export function composeRolePrompt(role) {
   const custom = role?.promptMode === "custom";
@@ -58,6 +96,7 @@ export function serializeModels(workbench) {
 function sidecarValue(workbench) {
   return {
     version: workbench.version || 1,
+    ...(workbench.projectName ? { projectName: workbench.projectName } : {}),
     name: workbench.name,
     profile: workbench.profile,
     session: workbench.session,
@@ -113,18 +152,9 @@ function assertStagedRoundTrip(workbench, stagingDirectory) {
   }
 }
 
-function readRawSidecar(workspace) {
-  try {
-    const value = JSON.parse(readText(path.join(workspace, ".gsb-local", "workbench.json")));
-    return value && typeof value === "object" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function sidecarFields(workspace, value) {
+function sidecarFields(workspace, projectName, value) {
   if (!value) return null;
-  const saved = { workspace };
+  const saved = { workspace, projectName };
   for (const key of ["version", "name", "profile", "session", "permission", "watchdog", "rebuild"]) {
     if (value[key] !== undefined) saved[key] = value[key];
   }
@@ -136,16 +166,13 @@ function sidecarFields(workspace, value) {
   return saved;
 }
 
-function readModelMap(workspace) {
-  const file = path.join(workspace, ".gsb-local", "models.conf");
+function readModelMap(directory) {
+  const file = path.join(directory, "models.conf");
   if (!existsSync(file)) return new Map();
   return new Map(parseRoleMap(readText(file)).map(({ id, value }) => [id, value]));
 }
 
-export function saveProjectState(workbench) {
-  const localDirectory = path.join(workbench.workspace, ".gsb-local");
-  mkdirSync(localDirectory, { recursive: true });
-  const stagingDirectory = path.join(localDirectory, `.staging-${process.pid}-${randomBytes(4).toString("hex")}`);
+function stageProjectState(workbench, stagingDirectory) {
   const stagingPrompts = path.join(stagingDirectory, "prompts");
   mkdirSync(stagingPrompts, { recursive: true });
   writeFileSync(path.join(stagingDirectory, "agents.conf"), serializeAgents(workbench), { mode: 0o600 });
@@ -163,13 +190,17 @@ export function saveProjectState(workbench) {
     rmSync(stagingDirectory, { recursive: true, force: true });
     throw new Error(`配置预校验失败：${error.message}`);
   }
+}
 
-  const promptDirectory = path.join(localDirectory, "prompts");
+function commitStagedState(workbench, stagingDirectory, targetDirectory) {
+  const stagingPrompts = path.join(stagingDirectory, "prompts");
+  mkdirSync(targetDirectory, { recursive: true });
+  const promptDirectory = path.join(targetDirectory, "prompts");
   mkdirSync(promptDirectory, { recursive: true });
   try {
-    renameSync(path.join(stagingDirectory, "agents.conf"), path.join(localDirectory, "agents.conf"));
+    renameSync(path.join(stagingDirectory, "agents.conf"), path.join(targetDirectory, "agents.conf"));
     const stagedModels = path.join(stagingDirectory, "models.conf");
-    const modelsFile = path.join(localDirectory, "models.conf");
+    const modelsFile = path.join(targetDirectory, "models.conf");
     if (existsSync(stagedModels)) renameSync(stagedModels, modelsFile);
     else if (existsSync(modelsFile)) unlinkSync(modelsFile);
     for (const role of workbench.roles) {
@@ -184,7 +215,7 @@ export function saveProjectState(workbench) {
       }
     }
     // The UI sidecar is the commit marker and is intentionally renamed last.
-    renameSync(path.join(stagingDirectory, "workbench.json"), path.join(localDirectory, "workbench.json"));
+    renameSync(path.join(stagingDirectory, "workbench.json"), path.join(targetDirectory, "workbench.json"));
     rmSync(stagingDirectory, { recursive: true, force: true });
   } catch (error) {
     error.message = `配置提交失败；staging 副本保留在 ${stagingDirectory}：${error.message}`;
@@ -193,7 +224,59 @@ export function saveProjectState(workbench) {
   }
 }
 
-export function loadProjectState(workspace, options) {
+function migrateLegacyAndSave(workbench, legacy, { renameImpl = renameSync } = {}) {
+  const projectsRoot = path.join(localRoot(workbench.workspace), "projects");
+  const legacyTarget = projectDir(workbench.workspace, legacy.name);
+  const newTarget = projectDir(workbench.workspace, workbench.projectName);
+  if (existsSync(legacyTarget) || existsSync(newTarget)) throw new Error("项目目录已存在，无法执行惰性迁移");
+  mkdirSync(projectsRoot, { recursive: true });
+  const nonce = `${process.pid}-${randomBytes(4).toString("hex")}`;
+  const legacyStage = path.join(projectsRoot, `.staging-migrate-${nonce}`);
+  const newStage = path.join(projectsRoot, `.staging-new-${nonce}`);
+  stageProjectState(workbench, newStage);
+  mkdirSync(legacyStage);
+  let legacyLocation = legacyStage;
+  try {
+    for (const name of PROJECT_FILES) {
+      const source = path.join(legacy.directory, name);
+      if (existsSync(source)) renameImpl(source, path.join(legacyStage, name));
+    }
+    renameImpl(legacyStage, legacyTarget);
+    legacyLocation = legacyTarget;
+    renameImpl(newStage, newTarget);
+  } catch (error) {
+    for (const name of PROJECT_FILES) {
+      const source = path.join(legacyLocation, name);
+      if (existsSync(source)) renameSync(source, path.join(legacy.directory, name));
+    }
+    rmSync(legacyStage, { recursive: true, force: true });
+    rmSync(legacyTarget, { recursive: true, force: true });
+    rmSync(newStage, { recursive: true, force: true });
+    rmSync(newTarget, { recursive: true, force: true });
+    throw new Error(`项目迁移失败，旧配置已回滚：${error.message}`);
+  }
+}
+
+export function saveProjectState(workbench, options = {}) {
+  const root = localRoot(workbench.workspace);
+  const projectName = workbench.projectName || "";
+  if (projectName && !PROJECT_PATTERN.test(projectName)) throw new Error("项目名只能包含字母、数字、点、下划线和连字符");
+  const stored = listStoredProjects(workbench.workspace);
+  const legacy = stored.length === 1 && stored[0].legacy ? stored[0] : null;
+  if (projectName && legacy && legacy.name !== projectName) {
+    migrateLegacyAndSave(workbench, legacy, options);
+    return;
+  }
+  const targetDirectory = projectName
+    ? legacy?.name === projectName ? legacy.directory : projectDir(workbench.workspace, projectName)
+    : root;
+  mkdirSync(path.dirname(targetDirectory), { recursive: true });
+  const stagingDirectory = path.join(path.dirname(targetDirectory), `.staging-${process.pid}-${randomBytes(4).toString("hex")}`);
+  stageProjectState(workbench, stagingDirectory);
+  commitStagedState(workbench, stagingDirectory, targetDirectory);
+}
+
+export function loadProjectState(workspace, name, options) {
   const {
     profiles,
     prompts,
@@ -203,32 +286,39 @@ export function loadProjectState(workspace, options) {
     normalizeWorkbench,
     validateWorkbench,
   } = options;
-  let rawSidecar = readRawSidecar(workspace);
-  const agentsFile = path.join(workspace, ".gsb-local", "agents.conf");
-  if (!existsSync(agentsFile) && Array.isArray(rawSidecar?.roles) && rawSidecar.roles.length) {
-    const legacy = normalizeWorkbench({ ...rawSidecar, workspace });
+  const stored = listStoredProjects(workspace);
+  if (!name && stored.length > 1) throw new Error("该目录包含多个项目，请指定项目名");
+  const selected = stored.find((project) => project.name === name)
+    || (!name ? stored[0] : null)
+    || { name: name || legacyProjectName(workspace, null), directory: name ? projectDir(workspace, name) : localRoot(workspace), legacy: !name };
+  const projectName = selected.name;
+  const directory = selected.directory;
+  let raw = rawSidecar(directory);
+  const agentsFile = path.join(directory, "agents.conf");
+  if (!existsSync(agentsFile) && Array.isArray(raw?.roles) && raw.roles.length) {
+    const legacy = normalizeWorkbench({ ...raw, workspace, projectName });
     if (validateWorkbench(legacy).valid) {
       saveProjectState(legacy);
-      rawSidecar = readRawSidecar(workspace);
+      raw = rawSidecar(directory);
     }
   }
 
-  const saved = sidecarFields(workspace, rawSidecar);
+  const saved = sidecarFields(workspace, projectName, raw);
   const selectedProfile = profiles.find((profile) => profile.id === saved?.profile)
     || profiles.find((profile) => profile.id === "config1")
     || profiles[0];
-  const fallback = defaultWorkbench(workspace, selectedProfile, prompts);
+  const fallback = defaultWorkbench(workspace, projectName, directory, selectedProfile, prompts);
   if (!existsSync(agentsFile)) {
     const { roles: _savedRoles, ...savedFields } = saved || {};
-    return normalizeWorkbench({ ...fallback, ...savedFields, workspace });
+    return normalizeWorkbench({ ...fallback, ...savedFields, workspace, projectName });
   }
 
-  const models = readModelMap(workspace);
+  const models = readModelMap(directory);
   const savedRoles = new Map((saved?.roles || []).map((role) => [role.id, role]));
   const roles = parseRoleMap(readText(agentsFile)).map(({ id, value: agent }) => {
     const known = roleMeta[id];
     const metadata = savedRoles.get(id) || {};
-    const prompt = promptForRole(workspace, id, prompts);
+    const prompt = promptForRole(directory, id, prompts);
     return {
       id,
       name: known?.name || metadata.name || id,
@@ -244,5 +334,5 @@ export function loadProjectState(workspace, options) {
     };
   });
   const { roles: _savedRoles, ...savedFields } = saved || {};
-  return normalizeWorkbench({ ...fallback, ...savedFields, workspace, roles });
+  return normalizeWorkbench({ ...fallback, ...savedFields, workspace, projectName, roles });
 }

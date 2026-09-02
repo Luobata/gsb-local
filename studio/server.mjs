@@ -18,6 +18,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
   composeRolePrompt,
+  listStoredProjects,
   loadProjectState as loadStoredProjectState,
   parseRoleMap,
   PROMPT_INTENT_MARKER,
@@ -195,8 +196,8 @@ function loadProfiles() {
     });
 }
 
-function readModelMap(workspace) {
-  const file = path.join(workspace, ".gsb-local", "models.conf");
+function readModelMap(directory) {
+  const file = path.join(directory, "models.conf");
   if (!existsSync(file)) return new Map();
   return new Map(parseRoleMap(readText(file)).map(({ id, value }) => [id, value]));
 }
@@ -281,10 +282,10 @@ function prepareWorkbenchPrompts(workbench, promptTemplates = loadPromptTemplate
   };
 }
 
-function promptForRole(workspace, role, promptTemplates) {
-  const projectPrompt = path.join(workspace, ".gsb-local", "prompts", `${role}.md`);
+function promptForRole(directory, role, promptTemplates) {
+  const projectPrompt = path.join(directory, "prompts", `${role}.md`);
   if (role === "hub") {
-    const extension = path.join(workspace, ".gsb-local", "prompts", "hub-extension.md");
+    const extension = path.join(directory, "prompts", "hub-extension.md");
     const source = existsSync(extension) ? extension : projectPrompt;
     return {
       template: "",
@@ -298,28 +299,30 @@ function promptForRole(workspace, role, promptTemplates) {
   return promptLayers(roleBase(role, promptTemplates), { template: "", source: "generated" });
 }
 
-function defaultSession(workspace) {
+function defaultSession(workspace, name = "") {
+  if (SESSION_PATTERN.test(name)) return name;
   const basename = path.basename(workspace);
   return SESSION_PATTERN.test(basename) ? basename : "seed-gsb";
 }
 
-function defaultWorkbench(workspace, profile, promptTemplates) {
-  const projectAgents = path.join(workspace, ".gsb-local", "agents.conf");
+function defaultWorkbench(workspace, projectName, directory, profile, promptTemplates) {
+  const projectAgents = path.join(directory, "agents.conf");
   const mappings = existsSync(projectAgents)
     ? parseRoleMap(readText(projectAgents)).map(({ id: role, value: agent }) => ({ role, agent }))
     : profile.roles;
-  const models = readModelMap(workspace);
+  const models = readModelMap(directory);
   return normalizeWorkbench({
     version: 1,
-    name: `${path.basename(workspace)} workbench`,
+    projectName,
+    name: projectName || `${path.basename(workspace)} workbench`,
     profile: profile.id,
     workspace,
-    session: defaultSession(workspace),
+    session: defaultSession(workspace, projectName),
     permission: "balanced",
     watchdog: true,
     rebuild: false,
     roles: mappings.map(({ role, agent }) => {
-      const prompt = promptForRole(workspace, role, promptTemplates);
+      const prompt = promptForRole(directory, role, promptTemplates);
       return {
         id: role,
         name: metadataForRole(role).name || role,
@@ -350,7 +353,10 @@ export function validateWorkbench(input) {
       errors.push("无法检查项目路径");
     }
   }
+  const projectName = typeof workbench.projectName === "string" && workbench.projectName ? workbench.projectName : workbench.session;
+  if (typeof projectName !== "string" || !SESSION_PATTERN.test(projectName)) errors.push("项目名只能包含字母、数字、点、下划线和连字符");
   if (typeof workbench.session !== "string" || !SESSION_PATTERN.test(workbench.session)) errors.push("会话名只能包含字母、数字、点、下划线和连字符");
+  else if (SESSION_PATTERN.test(projectName || "") && workbench.session !== projectName) errors.push("会话名必须与项目名一致");
   if (!Array.isArray(workbench.roles) || !workbench.roles.length) errors.push("至少需要一个角色");
   const seen = new Set();
   for (const [index, role] of (workbench.roles || []).entries()) {
@@ -597,7 +603,13 @@ export function createRuntimeValidator({
 const runtimeValidator = createRuntimeValidator();
 
 async function validationWithRuntime(workbench) {
-  return runtimeValidator.validate(workbench);
+  const result = await runtimeValidator.validate(workbench);
+  const conflict = workbench?.projectName
+    ? projectNameConflict(workbench.workspace, workbench.projectName)
+    : "";
+  if (conflict) result.errors.push(conflict);
+  result.valid = result.errors.length === 0;
+  return result;
 }
 
 function configPreview(workbench) {
@@ -613,7 +625,7 @@ async function persistProjectState(workbench) {
   const validation = await validationWithRuntime(normalized);
   if (!validation.valid) return { validation };
   saveStoredProjectState(normalized);
-  rememberProject(normalized.workspace);
+  rememberProject(normalized.workspace, normalized.projectName || normalized.session);
   const templateUpdated = syncActiveUserTemplate(normalized);
   return { validation, files: configPreview(normalized), templateUpdated };
 }
@@ -622,18 +634,55 @@ function recentProjectsFile() {
   return path.join(configHome(), "recent-projects.json");
 }
 
+function normalizedProjectRef(value) {
+  const projectPath = typeof value === "string" ? value : value?.path;
+  if (typeof projectPath !== "string" || !path.isAbsolute(projectPath) || !existsSync(projectPath)) return null;
+  const requestedName = typeof value === "object" ? value?.name : path.basename(projectPath);
+  const name = SESSION_PATTERN.test(requestedName || "") ? requestedName : defaultSession(projectPath);
+  return { path: projectPath, name };
+}
+
+function projectKey(project) {
+  return `${project.path}\0${project.name}`;
+}
+
 function loadRecentProjects() {
   try {
     const rows = JSON.parse(readText(recentProjectsFile(), "[]"));
-    return Array.isArray(rows) ? rows.filter((item) => typeof item === "string" && existsSync(item)).slice(0, 12) : [];
+    if (!Array.isArray(rows)) return [];
+    const seen = new Set();
+    return rows.flatMap((item) => {
+      const project = normalizedProjectRef(item);
+      if (!project || seen.has(projectKey(project))) return [];
+      seen.add(projectKey(project));
+      return [project];
+    }).slice(0, 12);
   } catch {
     return [];
   }
 }
 
-function rememberProject(project) {
-  const next = [project, ...loadRecentProjects().filter((item) => item !== project)].slice(0, 12);
+function rememberProject(projectPath, name) {
+  const project = normalizedProjectRef({ path: projectPath, name });
+  if (!project) return;
+  const next = [project, ...loadRecentProjects().filter((item) => projectKey(item) !== projectKey(project))].slice(0, 12);
   atomicWrite(recentProjectsFile(), `${JSON.stringify(next, null, 2)}\n`);
+}
+
+function projectNameConflict(workspace, name, { creating = false } = {}) {
+  if (typeof workspace !== "string" || !path.isAbsolute(workspace) || !SESSION_PATTERN.test(name || "")) return "";
+  const sameProject = listStoredProjects(workspace).some((project) => project.name === name);
+  if (creating && sameProject) return `项目名 ${name} 已在该目录中使用`;
+  const known = [];
+  const paths = new Set([workspace, ...loadRecentProjects().map((project) => project.path)]);
+  for (const projectPath of paths) {
+    const stored = listStoredProjects(projectPath);
+    known.push(...(stored.length ? stored : loadRecentProjects().filter((project) => project.path === projectPath)));
+  }
+  const duplicate = known.find((project) => project.name === name && project.path !== workspace);
+  if (duplicate) return `项目名 ${name} 已被 ${duplicate.path} 使用；项目名必须全局唯一`;
+  if (!sameProject && existsSync(path.join(stateRoot(), name))) return `项目名 ${name} 与现存会话重名；请更换项目名`;
+  return "";
 }
 
 function normalizeTemplateName(name) {
@@ -943,33 +992,44 @@ async function listSessionOptions() {
 }
 
 function listProjectOptions(currentProject, sessions) {
-  const paths = [];
+  const projects = [];
+  const seen = new Set();
   const append = (project) => {
-    if (typeof project !== "string" || !path.isAbsolute(project) || paths.includes(project)) return;
+    const normalized = normalizedProjectRef(project);
+    if (!normalized || seen.has(projectKey(normalized))) return;
     try {
-      if (!statSync(project).isDirectory()) return;
+      if (!statSync(normalized.path).isDirectory()) return;
     } catch {
       return;
     }
-    paths.push(project);
+    seen.add(projectKey(normalized));
+    projects.push(normalized);
   };
-  append(currentProject);
-  loadRecentProjects().forEach(append);
-  sessions.forEach((session) => append(session.workspace));
-  return paths.map((project) => {
-    const related = sessions.filter((session) => session.workspace === project);
+  const appendWorkspace = (project) => {
+    const normalized = normalizedProjectRef(project);
+    if (!normalized) return;
+    const stored = listStoredProjects(normalized.path);
+    if (stored.length) stored.forEach(append);
+    else append(normalized);
+  };
+  if (currentProject) appendWorkspace(currentProject);
+  loadRecentProjects().forEach(appendWorkspace);
+  sessions.forEach((session) => session.workspace && appendWorkspace({ path: session.workspace, name: session.name }));
+  return projects.map((project) => {
+    const stored = listStoredProjects(project.path).find((candidate) => candidate.name === project.name);
+    const related = sessions.filter((session) => session.workspace === project.path && session.name === project.name);
     return {
-      path: project,
-      name: path.basename(project) || project,
-      configured: existsSync(path.join(project, ".gsb-local", "agents.conf")),
+      ...project,
+      configured: Boolean(stored && existsSync(path.join(stored.directory, "agents.conf"))),
       sessions: related.length,
       running: related.filter((session) => session.status === "running").length,
+      legacy: stored?.legacy === true,
     };
   });
 }
 
-export function loadProjectState(workspace, profiles = loadProfiles(), prompts = loadPromptTemplates()) {
-  return loadStoredProjectState(workspace, {
+export function loadProjectState(workspace, name = "", profiles = loadProfiles(), prompts = loadPromptTemplates()) {
+  return loadStoredProjectState(workspace, name, {
     profiles,
     prompts,
     roleMeta,
@@ -986,6 +1046,12 @@ async function bootstrap(project) {
   const prompts = loadPromptTemplates();
   const userTemplates = loadUserTemplates().map((template) => ({ ...template, ...normalizeWorkbench(template) }));
   const sessionOptions = await listSessionOptions();
+  const recent = loadRecentProjects();
+  const stored = project ? listStoredProjects(project) : [];
+  const selected = project ? (recent.find((item) => item.path === project && stored.some((candidate) => candidate.name === item.name))
+    || stored[0]
+    || normalizedProjectRef(project)) : null;
+  const recentProjects = selected ? [selected, ...recent.filter((item) => projectKey(item) !== projectKey(selected))] : recent;
   return {
     product: { name: "GSB Studio", version: 1, apiVersion: STUDIO_API_VERSION },
     platform: process.platform,
@@ -994,26 +1060,38 @@ async function bootstrap(project) {
     roleMeta,
     roleBaseAliases,
     modelSuggestions: MODEL_SUGGESTIONS,
-    recentProjects: project ? [project, ...loadRecentProjects().filter((item) => item !== project)] : loadRecentProjects(),
+    recentProjects,
     userTemplates,
     sessions: sessionOptions.filter((session) => session.raw).map((session) => session.raw),
     sessionOptions,
-    projectOptions: listProjectOptions(project, sessionOptions),
-    workbench: project ? loadProjectState(project, profiles, prompts) : null,
+    projectOptions: listProjectOptions(selected || project, sessionOptions),
+    workbench: selected ? loadProjectState(selected.path, selected.name, profiles, prompts) : null,
   };
 }
 
-async function projectWorkbench(workspace, { remember = true } = {}) {
-  if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw new Error("项目路径必须是绝对路径");
-  if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw new Error("项目路径不存在或不是目录");
+function requestError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+
+async function projectWorkbench(workspace, name = "", { remember = true, create = false } = {}) {
+  if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw requestError("项目路径必须是绝对路径");
+  if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw requestError("项目路径不存在或不是目录");
+  if (name && !SESSION_PATTERN.test(name)) throw requestError("项目名只能包含字母、数字、点、下划线和连字符");
+  if (create && !name) throw requestError("新建项目必须填写项目名");
+  const conflict = name ? projectNameConflict(workspace, name, { creating: create }) : "";
+  if (conflict) throw requestError(conflict);
   const profiles = loadProfiles();
   const prompts = loadPromptTemplates();
-  if (remember) rememberProject(workspace);
+  const workbench = loadProjectState(workspace, name, profiles, prompts);
+  if (remember) rememberProject(workspace, workbench.projectName || workbench.session);
   const sessionOptions = await listSessionOptions();
   return {
-    workbench: loadProjectState(workspace, profiles, prompts),
+    workbench,
     sessionOptions,
-    projectOptions: listProjectOptions(workspace, sessionOptions),
+    recentProjects: loadRecentProjects(),
+    projectOptions: listProjectOptions({ path: workspace, name: workbench.projectName || workbench.session }, sessionOptions),
   };
 }
 
@@ -1021,6 +1099,7 @@ async function runtimeResources(project) {
   const sessionOptions = await listSessionOptions();
   return {
     sessionOptions,
+    recentProjects: loadRecentProjects(),
     projectOptions: listProjectOptions(project, sessionOptions),
   };
 }
@@ -1171,13 +1250,17 @@ export function createStudioServer({ project, token, platform = process.platform
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/resources") {
-        const requestedProject = url.searchParams.get("project") || project;
+        const requestedPath = url.searchParams.get("project") || project;
+        const requestedProject = requestedPath ? { path: requestedPath, name: url.searchParams.get("name") || defaultSession(requestedPath) } : null;
         jsonResponse(response, 200, await runtimeResources(requestedProject));
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/project") {
         const body = await readJson(request);
-        jsonResponse(response, 200, await projectWorkbench(body.workspace, { remember: body.remember !== false }));
+        jsonResponse(response, 200, await projectWorkbench(body.workspace, body.name || "", {
+          remember: body.remember !== false,
+          create: body.create === true,
+        }));
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/validate") {

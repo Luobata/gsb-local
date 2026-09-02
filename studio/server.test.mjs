@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -31,7 +31,7 @@ import {
   validateWorkbench,
   zellijSocketPathInfo,
 } from "./server.mjs";
-import { PROMPT_INTENT_MARKER, saveProjectState } from "./store.mjs";
+import { listStoredProjects, projectDir, PROMPT_INTENT_MARKER, saveProjectState } from "./store.mjs";
 import { runZellijTimed } from "../bin/zellij-timed.mjs";
 
 const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -318,6 +318,7 @@ test("pane GSB decisions classify every direct environment fallback", () => {
   const source = readFileSync(path.join(ROOT_DIR, "gsb"), "utf8");
   const expectedStripped = new Set(`
     GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR
+    GSB_PROJECT_DIR GSB_PROMPTS_DIR GSB_PROFILES_DIR
     GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE
     GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE
     GSB_SESSION_METADATA_FILE GSB_ROLES GSB_WATCHDOG_ENABLED GSB_FULL_ACCESS
@@ -436,10 +437,15 @@ test("Studio frontend renders provenance only when structured fields are present
 
 test("Studio launch controls expose validation state and a direct project edit action", () => {
   const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");
   const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
   assert.match(app, /项校验错误阻止启动，请先修复/);
   assert.match(app, /validationPending = true/);
   assert.match(app, /project-quick-edit/);
+  assert.match(app, /function projectKey\(value\)/);
+  assert.match(app, /workspace: project\.path, name: project\.name, remember: false/);
+  assert.match(html, /id="landing-project-name"[^>]+pattern=/);
+  assert.match(html, /id="session-name"[^>]+readonly/);
   assert.match(styles, /\.primary-button:disabled \{ cursor: not-allowed; opacity: \.4/);
 });
 
@@ -486,6 +492,40 @@ test("the CLI still resolves an unconfigured project through defaults/agents.con
     assert.equal(paneOverridden.stderr, "warning: inherited GSB_PERMISSION_MODE was stripped in pane context; use a clean shell to override permissions.\n");
   } finally {
     rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("run-agent resolves named and legacy prompts from fake session environments", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gsb-run-agent-prompts-"));
+  const workspace = path.join(root, "workspace");
+  const state = path.join(root, "state");
+  const flatPrompts = path.join(workspace, ".gsb-local", "prompts");
+  const namedProject = path.join(workspace, ".gsb-local", "projects", "named");
+  try {
+    mkdirSync(flatPrompts, { recursive: true });
+    mkdirSync(path.join(namedProject, "prompts"), { recursive: true });
+    writeFileSync(path.join(flatPrompts, "coder.md"), "legacy prompt\n");
+    writeFileSync(path.join(namedProject, "prompts", "coder.md"), "named prompt\n");
+    const env = testEnv({
+      GSB_LOCAL_ROOT: ROOT_DIR,
+      GSB_WORKSPACE: workspace,
+      GSB_STATE_DIR: state,
+      GSB_SESSION: "prompt-test",
+      GSB_ROLES: "coder",
+      GSB_CODER_AGENT: 'shell:printf "%s" "$GSB_ROLE_PROMPT"',
+    });
+    for (const [layout, sessionEnv, expected] of [
+      ["legacy", "# old flat session.env\n", "legacy prompt"],
+      ["named", `export GSB_PROJECT_DIR=${JSON.stringify(namedProject)}\nexport GSB_PROMPTS_DIR=${JSON.stringify(path.join(namedProject, "prompts"))}\n`, "named prompt"],
+    ]) {
+      const envFile = path.join(root, `${layout}.session.env`);
+      writeFileSync(envFile, sessionEnv);
+      const result = spawnSync("/bin/bash", ["-c", 'source "$1"; exec "$2" coder', "gsb-test", envFile, path.join(ROOT_DIR, "bin", "run-agent")], { encoding: "utf8", env });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, new RegExp(`${expected}$`));
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -657,6 +697,9 @@ exit 99
     assert.equal(result.status, 0, `${result.stderr}${existsSync(watchdogLog) ? readFileSync(watchdogLog, "utf8") : ""}${existsSync(sessionEnvFile) ? readFileSync(sessionEnvFile, "utf8") : ""}`);
     const sessionEnv = readFileSync(path.join(createdState, "session.env"), "utf8");
     assert.match(sessionEnv, new RegExp(`^export ZELLIJ_SOCKET_DIR=${socketDir}$`, "m"));
+    assert.ok(sessionEnv.includes(`export GSB_PROJECT_DIR=${path.join(workspace, ".gsb-local")}\n`));
+    assert.ok(sessionEnv.includes(`export GSB_PROMPTS_DIR=${path.join(workspace, ".gsb-local", "prompts")}\n`));
+    assert.ok(sessionEnv.includes(`export GSB_PROFILES_DIR=${path.join(workspace, ".gsb-local", "profiles")}\n`));
     assert.match(sessionEnv, /^export GSB_AGENT=claude$/m);
     assert.match(sessionEnv, /^export GSB_WATCHDOG_ENABLED=true$/m);
     assert.match(sessionEnv, /^export GSB_MODEL=pane-global-model$/m);
@@ -1123,6 +1166,47 @@ test("a 50-role project state round-trips without truncation", () => {
   }
 });
 
+test("a second named project lazily migrates a flat project without cross-talk", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-projects-"));
+  try {
+    const legacy = fixture(workspace);
+    saveProjectState(legacy);
+    assert.equal(loadProjectState(workspace).projectName, "studio-test");
+    assert.equal(existsSync(path.join(workspace, ".gsb-local", "projects")), false);
+
+    const beta = { ...fixture(workspace), projectName: "beta", name: "Beta", session: "beta" };
+    beta.roles = beta.roles.map((role) => role.id === "coder" ? { ...role, agent: "shell:printf beta" } : role);
+    saveProjectState(beta);
+
+    assert.deepEqual(listStoredProjects(workspace).map(({ name }) => name), ["beta", "studio-test"]);
+    assert.equal(existsSync(path.join(workspace, ".gsb-local", "agents.conf")), false);
+    assert.equal(existsSync(path.join(projectDir(workspace, "studio-test"), "agents.conf")), true);
+    assert.equal(loadProjectState(workspace, "studio-test").roles[1].agent, "shell:printf coder");
+    assert.equal(loadProjectState(workspace, "beta").roles[1].agent, "shell:printf beta");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("lazy migration restores every flat file when the final rename fails", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-migrate-"));
+  try {
+    saveProjectState(fixture(workspace));
+    const files = ["agents.conf", "models.conf", "workbench.json", path.join("prompts", "coder.md")];
+    const before = new Map(files.map((name) => [name, readFileSync(path.join(workspace, ".gsb-local", name))]));
+    const beta = { ...fixture(workspace), projectName: "beta", session: "beta" };
+    let renames = 0;
+    assert.throws(() => saveProjectState(beta, { renameImpl(from, to) {
+      if (++renames === 6) throw new Error("injected final rename failure");
+      renameSync(from, to);
+    } }), /旧配置已回滚/);
+    for (const [name, bytes] of before) assert.deepEqual(readFileSync(path.join(workspace, ".gsb-local", name)), bytes);
+    assert.deepEqual(listStoredProjects(workspace).map(({ name, legacy }) => ({ name, legacy })), [{ name: "studio-test", legacy: true }]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("local API bootstraps, validates, and saves project-local files", async (t) => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-api-"));
   mkdirSync(path.join(workspace, ".git"));
@@ -1447,6 +1531,51 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
     assert.match(runtime.stdout, /immutable Hub core/);
     assert.match(runtime.stdout, /Additive Hub capability extension/);
     assert.match(runtime.stdout, /Coordinate only\./);
+
+    await t.test("named project APIs normalize old recents and reject global duplicates", async () => {
+      const first = path.join(workspace, "named-one");
+      const second = path.join(workspace, "named-two");
+      mkdirSync(first);
+      mkdirSync(second);
+      const recentFile = path.join(process.env.GSB_STUDIO_CONFIG_HOME, "recent-projects.json");
+      mkdirSync(path.dirname(recentFile), { recursive: true });
+      writeFileSync(recentFile, `${JSON.stringify([second])}\n`);
+      const resources = await request("/api/resources");
+      assert.ok((await resources.json()).recentProjects.some((item) => item.path === second && item.name === "named-two"));
+
+      const draftResponse = await request("/api/project", {
+        method: "POST",
+        body: JSON.stringify({ workspace: first, name: "shared-name", create: true, remember: false }),
+      });
+      const draftPayload = await draftResponse.json();
+      assert.equal(draftResponse.status, 200, JSON.stringify(draftPayload));
+      const draft = draftPayload.workbench;
+      assert.equal(draft.projectName, "shared-name");
+      assert.equal(draft.session, "shared-name");
+      const namedSave = await request("/api/save", { method: "POST", body: JSON.stringify({ workbench: draft }) });
+      assert.equal(namedSave.status, 200, await namedSave.text());
+      assert.equal(typeof JSON.parse(readFileSync(recentFile, "utf8"))[0], "object");
+      const namedCli = spawnSync(path.join(ROOT_DIR, "gsb"), ["--print-config", first, "shared-name"], { encoding: "utf8", env: testEnv() });
+      assert.equal(namedCli.status, 0, namedCli.stderr);
+      assert.ok(namedCli.stdout.includes(path.join(first, ".gsb-local", "projects", "shared-name", "agents.conf")));
+
+      const siblingResponse = await request("/api/project", {
+        method: "POST",
+        body: JSON.stringify({ workspace: first, name: "sibling", create: true, remember: false }),
+      });
+      const sibling = (await siblingResponse.json()).workbench;
+      assert.equal(siblingResponse.status, 200);
+      assert.equal((await request("/api/save", { method: "POST", body: JSON.stringify({ workbench: sibling }) })).status, 200);
+      const listed = await request(`/api/resources?project=${encodeURIComponent(first)}&name=shared-name`);
+      assert.deepEqual((await listed.json()).projectOptions.filter((item) => item.path === first).map((item) => item.name).sort(), ["shared-name", "sibling"]);
+
+      const duplicate = await request("/api/project", {
+        method: "POST",
+        body: JSON.stringify({ workspace: second, name: "shared-name", create: true, remember: false }),
+      });
+      assert.equal(duplicate.status, 400);
+      assert.match((await duplicate.json()).error, /全局唯一/);
+    });
 
     const minimalTemplate = fixture(workspace);
     minimalTemplate.name = "_Release / 前端（Kimi）🚀";

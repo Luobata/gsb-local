@@ -36,6 +36,7 @@ let currentRole = 0;
 let previewKind = "agents";
 let sessionFilter = "project";
 let loadedWorkspace = "";
+let loadedProjectKey = "";
 let validationResult = null;
 let previewFiles = { agents: "", models: "", manifest: "" };
 let viewportRevision = 0;
@@ -52,6 +53,21 @@ let detailReturnFocus = null;
 let currentStep = 0;
 let visitedSteps = new Set([0]);
 const projectLaunchCache = new Map();
+let landingNameTimer = null;
+
+function projectRef(value) {
+  if (typeof value === "string") return { path: value, name: value.split("/").filter(Boolean).at(-1) || value };
+  return { path: value?.path || "", name: value?.name || "" };
+}
+
+function projectKey(value) {
+  const project = projectRef(value);
+  return `${project.path}\0${project.name}`;
+}
+
+function workbenchProject(value = workbench) {
+  return { path: value?.workspace || "", name: value?.projectName || value?.session || "" };
+}
 
 function updateInPlace(update) {
   const left = window.scrollX;
@@ -188,7 +204,7 @@ function watchdogHeartbeat(value) {
 function sessionDetailView(session) {
   const target = clone(session);
   const hasProvenance = Object.hasOwn(target, "crossSocketExited");
-  let summary = "当前编辑中的工作台保持不变。只有点击下方显式动作，才会选用此会话名或切换关联项目。";
+  let summary = "当前编辑中的工作台保持不变。只有点击下方显式动作，才会切换到此会话关联的项目。";
   if (hasProvenance && target.crossSocketExited) {
     summary += " Zellij 在其他 Socket 目录可能把它显示为 EXITED；合并视图已确认它仍在下方归属目录运行。";
   } else if (hasProvenance && target.status === "exited") {
@@ -273,7 +289,7 @@ function projectDetailView(project, state, sessions, profileName, { landing = fa
   const validationPending = !targetValidation;
   return {
     kind: "project",
-    key: `project:${targetProject.path}`,
+    key: `project:${projectKey(targetProject)}`,
     eyebrow: "PROJECT / CONFIG SNAPSHOT",
     title: targetProject.name,
     summary: "项目配置通过只读路径载入；当前编辑草稿、最近项目顺序和 LIVE SPEC 状态均未改变。",
@@ -312,7 +328,7 @@ function projectDetailView(project, state, sessions, profileName, { landing = fa
 function projectLoadingDetailView(project, { landing = false } = {}) {
   return {
     kind: "project-loading",
-    key: `project:${project.path}`,
+    key: `project:${projectKey(project)}`,
     eyebrow: "PROJECT / READ-ONLY FETCH",
     title: project.name,
     summary: "正在通过只读配置路径读取角色、会话与校验结果…",
@@ -334,7 +350,7 @@ function detailActionButtons(view) {
   const actions = [];
   if (view.kind === "session") {
     if (view.target.status === "running") actions.push(terminalOpenButton(view.target.name));
-    const select = element("button", "primary-button", "选用此会话名");
+    const select = element("button", "primary-button", "打开关联项目");
     select.type = "button";
     select.addEventListener("click", async () => {
       if (await selectSession(view.target)) toggleDetail(false);
@@ -370,20 +386,20 @@ function detailActionButtons(view) {
     launch.addEventListener("click", async () => {
       const result = await executeQuickLaunch(view.target.workbench, launch);
       if (!result) return;
-      projectLaunchCache.delete(view.target.project.path);
+      projectLaunchCache.delete(projectKey(view.target.project));
       view.target.running = { name: view.target.workbench.session, status: "running" };
       renderDetail(view);
     });
     const edit = element("button", "primary-button", "编辑此项目");
     edit.type = "button";
     edit.addEventListener("click", async () => {
-      if (view.target.project.path === loadedWorkspace) {
+      if (projectKey(view.target.project) === loadedProjectKey) {
         toggleDetail(false);
         if (view.target.landing) enterEditor();
         else toast("当前项目已在编辑器中");
         return;
       }
-      if (!await loadProject(view.target.project.path)) return;
+      if (!await loadProject(view.target.project)) return;
       toggleDetail(false);
       if (view.target.landing) enterEditor();
     });
@@ -393,13 +409,13 @@ function detailActionButtons(view) {
     const edit = element("button", "primary-button", "仍然编辑此项目");
     edit.type = "button";
     edit.addEventListener("click", async () => {
-      if (view.target.project.path === loadedWorkspace) {
+      if (projectKey(view.target.project) === loadedProjectKey) {
         toggleDetail(false);
         if (view.target.landing) enterEditor();
         else toast("当前项目已在编辑器中");
         return;
       }
-      if (!await loadProject(view.target.project.path)) return;
+      if (!await loadProject(view.target.project)) return;
       toggleDetail(false);
       if (view.target.landing) enterEditor();
     });
@@ -513,6 +529,7 @@ async function discardChanges() {
   if (!await confirmDiscard("放弃所有未保存修改")) return false;
   workbench = clone(cleanWorkbenchSnapshot);
   loadedWorkspace = workbench.workspace || loadedWorkspace;
+  loadedProjectKey = projectKey(workbenchProject());
   currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
   resetValidationState();
   renderAll();
@@ -705,7 +722,7 @@ async function quickLaunchTemplate(template, button) {
     validationResult = result.validation;
     previewFiles = result.files;
     validatedWorkbenchFingerprint = workbenchFingerprint();
-    projectLaunchCache.delete(workbench.workspace);
+    projectLaunchCache.delete(projectKey(workbenchProject()));
     mergeTemplateUpdate(result.templateUpdated);
     renderAll();
     markWorkbenchClean();
@@ -870,9 +887,8 @@ function renderRuntime() {
 }
 
 function fallbackProjectOptions() {
-  return (bootstrap.recentProjects || []).map((project) => ({
-    path: project,
-    name: project.split("/").filter(Boolean).at(-1) || project,
+  return (bootstrap.recentProjects || []).map((value) => ({
+    ...projectRef(value),
     configured: false,
     sessions: 0,
     running: 0,
@@ -891,7 +907,9 @@ function fallbackSessionOptions() {
 }
 
 function sessionsForProject(project) {
-  return (bootstrap.sessionOptions || fallbackSessionOptions()).filter((session) => session.workspace === project.path);
+  return (bootstrap.sessionOptions || fallbackSessionOptions()).filter((session) => (
+    session.workspace === project.path && (!project.name || session.name === project.name)
+  ));
 }
 
 function profileName(profileId) {
@@ -932,8 +950,8 @@ async function openProjectDetail(project, trigger, options = {}) {
 }
 
 function projectResource(project, { landing = false, recentProject = "" } = {}) {
-  const selected = project.path === workbench?.workspace;
-  const isRecent = project.path === recentProject;
+  const selected = projectKey(project) === projectKey(workbenchProject());
+  const isRecent = projectKey(project) === projectKey(recentProject);
   const button = element("button", `resource-item project-resource${landing ? " landing-project-resource" : ""}${selected ? " is-selected" : ""}${isRecent ? " is-recent" : ""}`);
   button.type = "button";
   button.title = `只读预览项目配置：${project.path}`;
@@ -962,10 +980,11 @@ function projectResource(project, { landing = false, recentProject = "" } = {}) 
 }
 
 function projectLaunchState(project, { onProject } = {}) {
-  if (!projectLaunchCache.has(project.path)) {
+  const key = projectKey(project);
+  if (!projectLaunchCache.has(key)) {
     const projectRequest = api("/api/project", {
       method: "POST",
-      body: JSON.stringify({ workspace: project.path, remember: false }),
+      body: JSON.stringify({ workspace: project.path, name: project.name, remember: false }),
     });
     const pending = projectRequest.then(async (loaded) => {
       const checked = await api("/api/validate", {
@@ -974,12 +993,12 @@ function projectLaunchState(project, { onProject } = {}) {
       });
       return { workbench: loaded.workbench, validation: checked.validation };
     }).catch((error) => {
-      projectLaunchCache.delete(project.path);
+      projectLaunchCache.delete(key);
       throw error;
     });
-    projectLaunchCache.set(project.path, { projectRequest, pending });
+    projectLaunchCache.set(key, { projectRequest, pending });
   }
-  const cached = projectLaunchCache.get(project.path);
+  const cached = projectLaunchCache.get(key);
   if (onProject) cached.projectRequest.then((loaded) => onProject(loaded.workbench)).catch(() => {});
   return cached.pending;
 }
@@ -1059,8 +1078,8 @@ function projectLandingEntry(project, recentProject) {
   actions.append(editButton, launchButton, status);
   entry.append(main, actions);
   editButton.addEventListener("click", async () => {
-    if (project.path === loadedWorkspace) return enterEditor();
-    if (await loadProject(project.path)) enterEditor();
+    if (projectKey(project) === loadedProjectKey) return enterEditor();
+    if (await loadProject(project)) enterEditor();
   });
   launchButton.addEventListener("click", async () => {
     try {
@@ -1068,7 +1087,7 @@ function projectLandingEntry(project, recentProject) {
       if (!state.validation.valid) return;
       const result = await executeQuickLaunch(state.workbench, launchButton, status);
       if (result) {
-        projectLaunchCache.delete(project.path);
+        projectLaunchCache.delete(projectKey(project));
         if (!actions.querySelector(".terminal-open-button")) actions.prepend(terminalOpenButton(state.workbench.session));
       }
     } catch (error) {
@@ -1116,7 +1135,7 @@ function renderResourceBrowserContent() {
   const sessions = bootstrap.sessionOptions || fallbackSessionOptions();
   $$('[data-session-filter]').forEach((button) => button.classList.toggle("is-active", button.dataset.sessionFilter === sessionFilter));
   const visibleSessions = sessionFilter === "project"
-    ? sessions.filter((session) => session.workspace === workbench.workspace)
+    ? sessions.filter((session) => session.workspace === workbench.workspace && session.name === workbench.projectName)
     : sessions;
   const sessionList = $("#session-options");
   sessionList.replaceChildren(...(visibleSessions.length
@@ -1128,15 +1147,15 @@ function renderResourceBrowserContent() {
 }
 
 function renderProjectLanding() {
-  const recentProject = bootstrap.recentProjects?.[0] || "";
+  const recentProject = projectRef(bootstrap.recentProjects?.[0]);
   const projects = [...(bootstrap.projectOptions || fallbackProjectOptions())].sort((left, right) => (
-    Number(right.path === recentProject) - Number(left.path === recentProject)
+    Number(projectKey(right) === projectKey(recentProject)) - Number(projectKey(left) === projectKey(recentProject))
   ));
   $("#landing-project-count").textContent = String(projects.length).padStart(2, "0");
   $("#landing-project-options").replaceChildren(...(projects.length
     ? projects.map((project) => projectLandingEntry(project, recentProject))
     : [resourceEmpty("还没有最近项目", "输入绝对路径或选择目录，首次配置会自动加入这里")]));
-  if (!$("#landing-project-path").value) $("#landing-project-path").value = workbench?.workspace || recentProject;
+  if (!$("#landing-project-path").value) $("#landing-project-path").value = workbench?.workspace || recentProject.path;
   $("#landing-project-status").lastChild.textContent = persistentError
     ? ` ${persistentError}`
     : workbench?.workspace ? ` 当前项目：${workbench.workspace}` : " 选择项目后进入完整工作台。";
@@ -1144,11 +1163,11 @@ function renderProjectLanding() {
 
 function currentProjectOption() {
   const projects = bootstrap.projectOptions || fallbackProjectOptions();
-  const workspace = workbench?.workspace || "";
-  const sessions = sessionsForProject({ path: workspace });
-  return projects.find((project) => project.path === workspace) || {
-    path: workspace,
-    name: workspace.split("/").filter(Boolean).at(-1) || "当前项目",
+  const current = workbenchProject();
+  const sessions = sessionsForProject(current);
+  return projects.find((project) => projectKey(project) === projectKey(current)) || {
+    ...current,
+    name: current.name || current.path.split("/").filter(Boolean).at(-1) || "当前项目",
     configured: true,
     sessions: sessions.length,
     running: sessions.filter((session) => session.status === "running").length,
@@ -1174,6 +1193,7 @@ async function returnToProjectLanding() {
   if (dirty && cleanWorkbenchSnapshot) {
     workbench = clone(cleanWorkbenchSnapshot);
     loadedWorkspace = workbench.workspace || loadedWorkspace;
+    loadedProjectKey = projectKey(workbenchProject());
     currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
     resetValidationState();
     renderAll();
@@ -1205,12 +1225,14 @@ function resourceEmpty(title, copy) {
   return empty;
 }
 
-async function loadProject(workspace, options = {}) {
-  if (workspace === loadedWorkspace && !options.session) {
+async function loadProject(value, options = {}) {
+  const project = projectRef(value);
+  const workspace = project.path;
+  if (projectKey(project) === loadedProjectKey) {
     toast("当前项目已经选中");
     return false;
   }
-  if (workspace !== loadedWorkspace && !options.discardConfirmed && !await confirmDiscard(`载入项目 ${workspace}`)) {
+  if (projectKey(project) !== loadedProjectKey && !options.discardConfirmed && !await confirmDiscard(`载入项目 ${project.name || workspace}`)) {
     if (workbench) {
       workbench.workspace = loadedWorkspace;
       renderRuntime();
@@ -1223,22 +1245,22 @@ async function loadProject(workspace, options = {}) {
   try {
     const result = await api("/api/project", {
       method: "POST",
-      body: JSON.stringify({ workspace }),
+      body: JSON.stringify({ workspace, name: project.name, create: options.create === true }),
     });
     workbench = clone(result.workbench);
     loadedWorkspace = workspace;
+    loadedProjectKey = projectKey(workbenchProject());
     markWorkbenchClean();
-    if (options.session) workbench.session = options.session;
     bootstrap.projectOptions = result.projectOptions;
     bootstrap.sessionOptions = result.sessionOptions;
-    bootstrap.recentProjects = result.projectOptions.map((project) => project.path);
+    bootstrap.recentProjects = result.recentProjects;
     currentRole = 0;
     currentStep = 0;
     visitedSteps = new Set([0]);
     resetValidationState();
     setPersistentError();
     renderAll();
-    toast(`已载入项目 ${workspace.split("/").filter(Boolean).at(-1) || workspace}`);
+    toast(`已载入项目 ${workbench.projectName || workspace.split("/").filter(Boolean).at(-1) || workspace}`);
     return true;
   } catch (error) {
     toast(error.message, "error");
@@ -1250,17 +1272,14 @@ async function loadProject(workspace, options = {}) {
 }
 
 async function selectSession(session) {
-  if (session.workspace && session.workspace !== loadedWorkspace) {
+  const target = { path: session.workspace, name: session.name };
+  if (session.workspace && projectKey(target) !== loadedProjectKey) {
     if (!await confirmDiscard(`载入会话 ${session.name} 关联的项目`)) return false;
-    return loadProject(session.workspace, { session: session.name, discardConfirmed: true });
+    return loadProject(target, { discardConfirmed: true });
   }
-  workbench.session = session.name;
-  $("#session-name").value = session.name;
-  renderResourceBrowser();
-  renderSummary();
-  scheduleValidation();
-  toast(`已选择会话 ${session.name}`);
-  return true;
+  if (session.name === workbench.projectName) return true;
+  toast("会话名由项目名固定；请打开该会话关联的项目", "error");
+  return false;
 }
 
 async function refreshResources({ silent = false } = {}) {
@@ -1268,10 +1287,10 @@ async function refreshResources({ silent = false } = {}) {
   button.classList.add("is-loading");
   button.disabled = true;
   try {
-    const result = await api(`/api/resources?project=${encodeURIComponent(workbench.workspace || "")}`);
+    const result = await api(`/api/resources?project=${encodeURIComponent(workbench.workspace || "")}&name=${encodeURIComponent(workbench.projectName || "")}`);
     bootstrap.projectOptions = result.projectOptions;
     bootstrap.sessionOptions = result.sessionOptions;
-    bootstrap.recentProjects = result.projectOptions.map((project) => project.path);
+    bootstrap.recentProjects = result.recentProjects;
     renderResourceBrowser();
     renderProjectLanding();
     if (!silent) toast("项目与会话状态已刷新");
@@ -1609,7 +1628,12 @@ async function saveConfig() {
     previewFiles = result.files;
     validationResult = result.validation;
     validatedWorkbenchFingerprint = workbenchFingerprint();
-    projectLaunchCache.delete(workbench.workspace);
+    const savedProject = workbenchProject();
+    const savedOption = (bootstrap.projectOptions || []).find((project) => projectKey(project) === projectKey(savedProject));
+    projectLaunchCache.delete(projectKey(savedProject));
+    bootstrap.projectOptions = [{ sessions: 0, running: 0, ...savedOption, ...savedProject, configured: true },
+      ...(bootstrap.projectOptions || []).filter((project) => projectKey(project) !== projectKey(savedProject))];
+    bootstrap.recentProjects = [savedProject, ...(bootstrap.recentProjects || []).filter((project) => projectKey(project) !== projectKey(savedProject))];
     const templateSynced = mergeTemplateUpdate(result.templateUpdated);
     if (templateSynced) {
       updateInPlace(() => {
@@ -1691,17 +1715,57 @@ async function launch() {
 async function browseForProject({ focusTemplates = false } = {}) {
   try {
     const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
-    if (await loadProject(result.path) && focusTemplates) goToStep("sec-templates");
+    if (focusTemplates) {
+      $("#landing-project-path").value = result.path;
+      $("#landing-project-name").value = "";
+      $("#landing-project-status").lastChild.textContent = " 已选择目录；请填写全局唯一项目名。";
+      $("#landing-project-name").focus();
+    } else if (await loadProject({ path: result.path, name: "" })) goToStep("sec-templates");
   } catch (error) {
     if (!/取消/.test(error.message)) toast(error.message, "error");
   }
+}
+
+async function checkLandingProjectName({ report = false } = {}) {
+  const input = $("#landing-project-name");
+  const workspace = $("#landing-project-path").value.trim();
+  const name = input.value.trim();
+  const key = projectKey({ path: workspace, name });
+  input.setCustomValidity("");
+  input.removeAttribute("aria-invalid");
+  if (!name || !workspace || !input.checkValidity()) {
+    if (report) input.reportValidity();
+    return !name;
+  }
+  try {
+    await api("/api/project", { method: "POST", body: JSON.stringify({ workspace, name, create: true, remember: false }) });
+    if (key !== projectKey({ path: $("#landing-project-path").value.trim(), name: input.value.trim() })) return false;
+    $("#landing-project-status").lastChild.textContent = ` 项目名 ${name} 可用。`;
+    return true;
+  } catch (error) {
+    if (key !== projectKey({ path: $("#landing-project-path").value.trim(), name: input.value.trim() })) return false;
+    input.setCustomValidity(error.message);
+    input.setAttribute("aria-invalid", "true");
+    $("#landing-project-status").lastChild.textContent = ` ${error.message}`;
+    if (report) input.reportValidity();
+    return false;
+  }
+}
+
+function scheduleLandingProjectNameCheck() {
+  clearTimeout(landingNameTimer);
+  $("#landing-project-name").setCustomValidity("");
+  landingNameTimer = setTimeout(checkLandingProjectName, 300);
 }
 
 async function openLandingProjectPath() {
   const input = $("#landing-project-path");
   const workspace = input.value.trim();
   if (!workspace) return input.reportValidity();
-  if (await loadProject(workspace)) goToStep("sec-templates");
+  const name = $("#landing-project-name").value.trim();
+  clearTimeout(landingNameTimer);
+  if (name && !await checkLandingProjectName({ report: true })) return;
+  if (await loadProject({ path: workspace, name }, { create: Boolean(name) })) goToStep("sec-templates");
 }
 
 function bindEvents() {
@@ -1795,13 +1859,7 @@ function bindEvents() {
     scheduleValidation();
   });
   $("#workspace-path").addEventListener("change", (event) => {
-    if (event.target.value && event.target.value !== loadedWorkspace) loadProject(event.target.value);
-  });
-  $("#session-name").addEventListener("input", (event) => {
-    workbench.session = event.target.value;
-    renderResourceBrowser();
-    renderSummary();
-    scheduleValidation();
+    if (event.target.value && event.target.value !== loadedWorkspace) loadProject({ path: event.target.value, name: "" });
   });
   $("#workbench-name").addEventListener("input", (event) => { workbench.name = event.target.value; renderSummary(); scheduleValidation(); });
   $$('input[name="permission"]').forEach((input) => input.addEventListener("change", (event) => { workbench.permission = event.target.value; renderSummary(); scheduleValidation(); }));
@@ -1818,6 +1876,8 @@ function bindEvents() {
   $("#browse-project").addEventListener("click", () => browseForProject());
   $("#landing-browse-project").addEventListener("click", () => browseForProject({ focusTemplates: true }));
   $("#landing-open-project").addEventListener("click", openLandingProjectPath);
+  $("#landing-project-name").addEventListener("input", scheduleLandingProjectNameCheck);
+  $("#landing-project-path").addEventListener("input", scheduleLandingProjectNameCheck);
   $("#landing-project-path").addEventListener("keydown", (event) => {
     if (event.key === "Enter") openLandingProjectPath();
   });
@@ -1901,6 +1961,7 @@ async function start() {
   }
   workbench = bootstrap.workbench ? clone(bootstrap.workbench) : null;
   loadedWorkspace = workbench?.workspace || "";
+  loadedProjectKey = projectKey(workbenchProject());
   $("#browse-project").hidden = bootstrap.platform !== "darwin";
   $("#landing-browse-project").hidden = bootstrap.platform !== "darwin";
   bootstrap.modelSuggestions.forEach((model) => $("#model-options").append(new Option(model.label, model.value)));
