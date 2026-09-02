@@ -170,6 +170,8 @@ test("Studio launches with pane-scoped GSB and Zellij variables removed", async 
     for (const name of ["GSB_STATE_DIR", "GSB_SESSION", "GSB_SOCKET_DIR_OVERRIDE", "ZELLIJ_SESSION_NAME", "ZELLIJ_SOCKET_DIR"]) {
       assert.equal(name in spawned.options.env, false, name);
     }
+    assert.equal(existsSync(path.join(workspace, ".gsb-local", "agents.conf")), true);
+    assert.equal(existsSync(path.join(workspace, ".gsb-local", "workbench.json")), true);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
@@ -430,6 +432,15 @@ test("Studio frontend renders provenance only when structured fields are present
   assert.match(app, /else if \(hasProvenance && target\.status === "exited"\)/);
   assert.match(styles, /\.resource-badge\.socket/);
   assert.match(styles, /\.detail-code/);
+});
+
+test("Studio launch controls expose validation state and a direct project edit action", () => {
+  const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  assert.match(app, /项校验错误阻止启动，请先修复/);
+  assert.match(app, /validationPending = true/);
+  assert.match(app, /project-quick-edit/);
+  assert.match(styles, /\.primary-button:disabled \{ cursor: not-allowed; opacity: \.4/);
 });
 
 test("Studio confirmation rejects reentry before changing dialog content", () => {
@@ -1280,6 +1291,31 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
     assert.equal(existsSync(path.join(workspace, ".gsb-local", "prompts", "hub.md")), false);
     assert.equal(existsSync(path.join(workspace, ".gsb-local", "prompts", "stale-role.md")), false);
     assert.equal(readFileSync(path.join(workspace, ".gsb-local", "prompts", "coder.md"), "utf8"), "Implement only assigned paths.\n");
+
+    await t.test("validate previews a draft without mutating project files", async () => {
+      const files = [
+        path.join(workspace, ".gsb-local", "agents.conf"),
+        path.join(workspace, ".gsb-local", "models.conf"),
+        path.join(workspace, ".gsb-local", "workbench.json"),
+        ...readdirSync(promptDirectory).map((name) => path.join(promptDirectory, name)),
+      ];
+      const before = new Map(files.map((file) => [file, {
+        bytes: readFileSync(file),
+        mtimeNs: statSync(file, { bigint: true }).mtimeNs,
+      }]));
+      const draft = fixture(workspace);
+      draft.roles[1].agent = "shell:printf draft-agent";
+      draft.roles[1].model = "draft-model";
+      draft.roles[1].prompt = "Draft prompt must not persist.";
+      const response = await request("/api/validate", { method: "POST", body: JSON.stringify({ workbench: draft }) });
+      assert.equal(response.status, 200);
+      const payload = await response.json();
+      assert.match(payload.files.models, /coder=draft-model/);
+      for (const [file, snapshot] of before) {
+        assert.deepEqual(readFileSync(file), snapshot.bytes, file);
+        assert.equal(statSync(file, { bigint: true }).mtimeNs, snapshot.mtimeNs, file);
+      }
+    });
 
     await t.test("project load treats conf and prompts as authoritative", async () => {
       const authorityWorkspace = path.join(workspace, "authority-project");

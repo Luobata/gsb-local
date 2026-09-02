@@ -44,6 +44,8 @@ let cleanWorkbenchSnapshot = null;
 let validatedWorkbenchFingerprint = "";
 let validationTimer = null;
 let validationRevision = 0;
+let validationPending = false;
+let launchPending = false;
 let persistentError = "";
 let detailView = null;
 let detailReturnFocus = null;
@@ -470,6 +472,14 @@ function workbenchFingerprint() {
   return JSON.stringify(workbench);
 }
 
+function resetValidationState() {
+  clearTimeout(validationTimer);
+  validationRevision++;
+  validationResult = null;
+  validatedWorkbenchFingerprint = "";
+  validationPending = false;
+}
+
 function hasUnsavedChanges() {
   return Boolean(cleanWorkbenchFingerprint) && workbenchFingerprint() !== cleanWorkbenchFingerprint;
 }
@@ -504,8 +514,7 @@ async function discardChanges() {
   workbench = clone(cleanWorkbenchSnapshot);
   loadedWorkspace = workbench.workspace || loadedWorkspace;
   currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
-  validationResult = null;
-  validatedWorkbenchFingerprint = "";
+  resetValidationState();
   renderAll();
   markWorkbenchClean();
   toast("已恢复到上次保存或载入的状态");
@@ -619,8 +628,9 @@ async function createIndependentTemplate(name) {
   nextWorkbench.hubCore = result.template.hubCore;
   workbench = nextWorkbench;
   currentRole = 0;
-  validationResult = null;
+  resetValidationState();
   renderAll();
+  scheduleValidation();
   goToStep("sec-roster");
   toast(`独立模板「${savedName}」已创建，现在可以逐个配置角色`);
   return true;
@@ -655,6 +665,7 @@ async function applyTemplate(template) {
   workbench = workbenchForTemplate(template);
   currentRole = 0;
   renderAll();
+  scheduleValidation();
   toast(`已载入${template.source === "user" ? "模板 " : " "}${template.name}`);
   return true;
 }
@@ -1036,14 +1047,21 @@ function projectLandingEntry(project, recentProject) {
   const entry = element("div", "project-launch-row");
   const main = projectResource(project, { landing: true, recentProject });
   const actions = element("span", "project-quick-actions");
+  const editButton = element("button", "secondary-button project-quick-edit", "编辑");
+  editButton.type = "button";
+  editButton.title = `直接编辑项目：${project.path}`;
   const launchButton = element("button", "secondary-button project-quick-launch", "校验中…");
   launchButton.type = "button";
   launchButton.disabled = true;
   const status = element("small", "project-quick-status", "读取上次配置…");
   const running = sessionsForProject(project).find((session) => session.status === "running");
   if (running) actions.append(terminalOpenButton(running.name));
-  actions.append(launchButton, status);
+  actions.append(editButton, launchButton, status);
   entry.append(main, actions);
+  editButton.addEventListener("click", async () => {
+    if (project.path === loadedWorkspace) return enterEditor();
+    if (await loadProject(project.path)) enterEditor();
+  });
   launchButton.addEventListener("click", async () => {
     try {
       const state = await projectLaunchState(project);
@@ -1157,8 +1175,7 @@ async function returnToProjectLanding() {
     workbench = clone(cleanWorkbenchSnapshot);
     loadedWorkspace = workbench.workspace || loadedWorkspace;
     currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
-    validationResult = null;
-    validatedWorkbenchFingerprint = "";
+    resetValidationState();
     renderAll();
     markWorkbenchClean();
   }
@@ -1218,8 +1235,7 @@ async function loadProject(workspace, options = {}) {
     currentRole = 0;
     currentStep = 0;
     visitedSteps = new Set([0]);
-    validationResult = null;
-    validatedWorkbenchFingerprint = "";
+    resetValidationState();
     setPersistentError();
     renderAll();
     toast(`已载入项目 ${workspace.split("/").filter(Boolean).at(-1) || workspace}`);
@@ -1242,6 +1258,7 @@ async function selectSession(session) {
   $("#session-name").value = session.name;
   renderResourceBrowser();
   renderSummary();
+  scheduleValidation();
   toast(`已选择会话 ${session.name}`);
   return true;
 }
@@ -1303,6 +1320,7 @@ function renderAll() {
     renderSummary();
     renderWizardNavigation();
   });
+  syncLaunchButton();
 }
 
 function activateSection(sectionId) {
@@ -1375,7 +1393,25 @@ function toggleValidation(force) {
 }
 
 function syncLaunchButton() {
-  $("#launch-workbench").disabled = (validationResult?.errors || []).length > 0;
+  const button = $("#launch-workbench");
+  let hint = $("#launch-validation-hint");
+  if (!hint) {
+    hint = element("small", "launch-validation-hint");
+    hint.id = "launch-validation-hint";
+    hint.setAttribute("role", "status");
+    button.before(hint);
+  }
+  const current = validatedWorkbenchFingerprint === workbenchFingerprint();
+  const errors = current ? (validationResult?.errors || []) : [];
+  const errorMessage = errors.length ? `${errors.length} 项校验错误阻止启动，请先修复` : "";
+  const pending = validationPending && !current;
+  hint.textContent = errorMessage;
+  hint.hidden = !errorMessage;
+  button.disabled = launchPending || errors.length > 0;
+  if (errorMessage) button.setAttribute("aria-describedby", hint.id);
+  else button.removeAttribute("aria-describedby");
+  button.title = launchPending ? "正在启动工作台" : errorMessage || (pending ? "正在校验最新草稿" : "保存配置并在后台启动 GSB 工作台");
+  button.lastChild.textContent = launchPending ? " 正在启动…" : pending ? " 校验中…" : " 保存并后台启动";
 }
 
 function renderValidation() {
@@ -1445,13 +1481,17 @@ function applyFieldValidation() {
 function scheduleValidation() {
   clearTimeout(validationTimer);
   validationRevision++;
+  validatedWorkbenchFingerprint = "";
+  validationPending = true;
   clearFieldValidation();
-  validationTimer = setTimeout(() => requestValidation(), 600);
+  syncLaunchButton();
+  validationTimer = setTimeout(() => requestValidation({ renderFinal: sectionIds[currentStep] === "sec-validation" }), 600);
 }
 
 async function requestValidation({ renderFinal = false, reportField = null } = {}) {
   const fingerprint = workbenchFingerprint();
   if (validatedWorkbenchFingerprint === fingerprint && validationResult) {
+    validationPending = false;
     applyFieldValidation();
     syncLaunchButton();
     if (renderFinal) {
@@ -1463,6 +1503,8 @@ async function requestValidation({ renderFinal = false, reportField = null } = {
   }
   clearTimeout(validationTimer);
   const revision = ++validationRevision;
+  validationPending = true;
+  syncLaunchButton();
   if (renderFinal) {
     const box = $("#validation-box");
     box.className = "validation-box is-loading";
@@ -1477,6 +1519,7 @@ async function requestValidation({ renderFinal = false, reportField = null } = {
     if (revision !== validationRevision || fingerprint !== workbenchFingerprint()) return;
     validationResult = { valid: false, errors: [error.message], warnings: [] };
   }
+  validationPending = false;
   validatedWorkbenchFingerprint = fingerprint;
   applyFieldValidation();
   syncLaunchButton();
@@ -1508,7 +1551,7 @@ function updateRole(field, value) {
   renderRoleList();
   renderSummary();
   if (field === "name" || field === "type") renderRoleEditor();
-  if (field === "id" || field === "agent" || field === "model") scheduleValidation();
+  scheduleValidation();
 }
 
 function addRole() {
@@ -1594,9 +1637,8 @@ async function saveConfig() {
 async function launch() {
   if (!await confirmFullAccessLaunch(workbench)) return;
   toggleValidation(true);
-  const button = $("#launch-workbench");
-  button.disabled = true;
-  button.lastChild.textContent = " 正在启动…";
+  launchPending = true;
+  syncLaunchButton();
   try {
     const result = await api("/api/launch", { method: "POST", body: JSON.stringify({ workbench }) });
     const panel = $("#launch-result");
@@ -1641,8 +1683,8 @@ async function launch() {
     panel.replaceChildren(element("h3", "", "启动失败"), element("code", "", result.command || error.message), element("code", "", (result.stderr || "").trim()));
     toast(error.message, "error");
   } finally {
-    button.disabled = false;
-    button.lastChild.textContent = " 保存并后台启动";
+    launchPending = false;
+    syncLaunchButton();
   }
 }
 
@@ -1761,9 +1803,9 @@ function bindEvents() {
     renderSummary();
     scheduleValidation();
   });
-  $("#workbench-name").addEventListener("input", (event) => { workbench.name = event.target.value; renderSummary(); });
+  $("#workbench-name").addEventListener("input", (event) => { workbench.name = event.target.value; renderSummary(); scheduleValidation(); });
   $$('input[name="permission"]').forEach((input) => input.addEventListener("change", (event) => { workbench.permission = event.target.value; renderSummary(); scheduleValidation(); }));
-  $("#watchdog-enabled").addEventListener("change", (event) => { workbench.watchdog = event.target.checked; renderSummary(); });
+  $("#watchdog-enabled").addEventListener("change", (event) => { workbench.watchdog = event.target.checked; renderSummary(); scheduleValidation(); });
   $("#rebuild-session").addEventListener("change", (event) => { workbench.rebuild = event.target.checked; renderSaveState(); scheduleValidation(); });
   ["#workspace-path", "#session-name", "#role-id", "#role-agent", "#role-model"].forEach((selector) => {
     $(selector).addEventListener("blur", (event) => requestValidation({ reportField: event.currentTarget }));
@@ -1819,6 +1861,7 @@ function bindEvents() {
       $("#template-dialog").close();
       renderProfiles();
       renderSummary();
+      scheduleValidation();
       toast("个人模板已保存");
     } catch (error) {
       toast(error.message, "error");

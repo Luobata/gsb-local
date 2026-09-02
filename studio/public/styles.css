@@ -180,7 +180,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-launch-row + .project-launch-row { border-top-color: var(--line); }
 .project-launch-row > .resource-item { border: 0; }
 .project-quick-actions { padding: 9px; display: grid; align-content: center; gap: 5px; border-left: 1px solid var(--line); }
-.project-quick-launch { width: 100%; padding-inline: 8px; font-size: 11px; }
+.project-quick-launch, .project-quick-edit { width: 100%; padding-inline: 8px; font-size: 11px; }
 .project-quick-actions .terminal-open-button { width: 100%; }
 .project-quick-status { overflow: hidden; color: var(--faint); font-size: 10px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .shell.is-project-only { grid-template-columns: 1fr; }
@@ -342,7 +342,8 @@ input[readonly] { border-style: dashed; color: var(--signal-dim); cursor: not-al
 .secondary-button:disabled { opacity: .35; cursor: not-allowed; }
 .terminal-open-button { min-height: 34px; padding-inline: 10px; color: var(--cyan); font: 10px var(--mono); white-space: nowrap; }
 .primary-button { background: var(--signal); color: #0b0e0b; font-weight: 700; }
-.primary-button:hover { background: #d6ff6c; transform: translateY(-1px); }
+.primary-button:hover:not(:disabled) { background: #d6ff6c; transform: translateY(-1px); }
+.primary-button:disabled { cursor: not-allowed; opacity: .4; filter: grayscale(1); transform: none; }
 
 .runtime-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr); gap: 32px; }
 .path-control { display: flex; gap: 10px; align-items: end; }
@@ -511,6 +512,7 @@ body.has-detail-open { overflow: hidden; }
 .save-config-group small { color: var(--faint); font: 9px var(--mono); white-space: nowrap; }
 .launch-button { display: flex; align-items: center; gap: 8px; }
 .launch-button[hidden] { display: none; }
+.launch-validation-hint { max-width: 220px; color: var(--danger); font: 9px/1.35 var(--mono); text-align: right; }
 
 .studio-dialog { width: min(440px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink); }
 .studio-dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(4px); }
