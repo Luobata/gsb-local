@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -146,7 +146,12 @@ function selftest() {
   console.log("layout-status selftest: 11 passed");
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+function isMainModule(entry) {
+  const source = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(source); } catch { return entry === source; }
+}
+
+if (isMainModule(process.argv[1])) {
   if (process.argv[2] === "--selftest") selftest();
   else {
     const session = process.argv[2] || process.env.GSB_SESSION || process.env.ZELLIJ_SESSION_NAME || "seed-gsb";

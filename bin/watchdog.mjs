@@ -19,7 +19,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -834,7 +834,12 @@ function runSelfTest() {
   console.log("\nall self-tests passed");
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function isMainModule(entry) {
+  const source = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(source); } catch { return Boolean(entry) && path.resolve(entry) === source; }
+}
+
+const isMain = isMainModule(process.argv[1]);
 if (isMain && process.argv[2] === "--selftest") {
   runSelfTest();
 } else if (isMain) {

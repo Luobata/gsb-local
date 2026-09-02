@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -8,13 +9,18 @@ export function runZellijTimed(args, timeoutMs, { execImpl = execFileSync, env =
   return execImpl(bin, args, {
     env,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     timeout: Number(timeoutMs),
     killSignal: "SIGKILL",
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+function isMainModule(entry) {
+  const source = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(source); } catch { return entry === source; }
+}
+
+if (isMainModule(process.argv[1])) {
   const [timeoutArg, ...args] = process.argv.slice(2);
   const timeoutMs = Number(timeoutArg);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !args.length) {

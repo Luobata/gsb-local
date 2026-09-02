@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NUDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$NUDGE_DIR/.." && pwd)"
+NUDGE_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="$(cd -P "$NUDGE_DIR/.." && pwd -P)"
 TARGET_ROLE="${1:-}"
 MODE="${2:-}"
 SESSION="${GSB_SESSION:-${ZELLIJ_SESSION_NAME:-seed-gsb}}"
@@ -84,12 +84,16 @@ zellij_timed() {
 resolve_target_pane() {
   local pane_json
   pane_json="$(ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action list-panes --json --all 2>/dev/null)" || return 1
+  [ -n "$pane_json" ] || return 1
   printf '%s' "$pane_json" | node -e '
   let raw = "";
   process.stdin.on("data", chunk => raw += chunk);
   process.stdin.on("end", () => {
     const title = process.argv[1];
-    const hits = JSON.parse(raw).filter(p =>
+    let panes;
+    try { panes = JSON.parse(raw); } catch { process.exit(3); }
+    if (!Array.isArray(panes)) process.exit(3);
+    const hits = panes.filter(p =>
       !p.is_plugin && !p.exited && (p.title === title || p.title.startsWith(`${title} · `))
     );
     if (hits.length !== 1) process.exit(3);
