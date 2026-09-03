@@ -172,6 +172,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-total { min-width: 72px; display: grid; justify-items: end; color: var(--faint); font: 10px var(--mono); letter-spacing: .12em; }
 .project-total b { color: var(--signal); font: 30px var(--display); }
 .project-landing-path { margin-bottom: 15px; }
+.landing-template-head { margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--line); }
+.template-mode-bar { border-color: var(--signal-dim); }
+.template-mode-badge { cursor: default; }
+.template-mode-badge .project-switcher-glyph { border-color: var(--signal); color: var(--signal); }
+.template-resource-version { color: var(--signal-dim) !important; }
+.template-resource-readonly { color: var(--faint) !important; }
 .project-landing-list { max-height: none; padding: 8px; border: 1px solid var(--line); background: rgba(7,10,8,.7); }
 .project-landing-list .resource-item { min-height: 76px; }
 .project-landing-list .resource-item.is-recent:not(.is-selected) { border-color: var(--line-strong); background: linear-gradient(90deg, rgba(200,255,61,.045), rgba(17,22,18,.5)); }
@@ -348,6 +354,7 @@ input[readonly] { border-style: dashed; color: var(--signal-dim); cursor: not-al
 
 .runtime-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr); gap: 32px; }
 .path-control { display: flex; gap: 10px; align-items: end; }
+.path-control .field { margin-bottom: 0; }
 .path-control .grow { flex: 1; margin: 0; }
 .path-control .secondary-button { display: flex; align-items: center; gap: 8px; }
 .path-control svg, .launch-button svg { width: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; }

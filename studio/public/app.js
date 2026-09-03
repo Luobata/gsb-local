@@ -55,6 +55,7 @@ let visitedSteps = new Set([0]);
 const projectLaunchCache = new Map();
 let landingNameTimer = null;
 let pendingTemplateUpgrade = null;
+let templateEditMode = null;
 
 function projectRef(value) {
   if (typeof value === "string") return { path: value, name: value.split("/").filter(Boolean).at(-1) || value };
@@ -693,6 +694,108 @@ function workbenchForTemplate(template) {
   };
 }
 
+// Template edit mode: the workbench holds a template, not a project. Runtime
+// fields are placeholders that validate cleanly and are never written to disk.
+function workbenchForTemplateEdit(template) {
+  const roles = clone(template.roles || []);
+  return {
+    version: 1,
+    workspace: "",
+    projectName: "",
+    session: "template-edit",
+    name: template.name,
+    source: "user",
+    profile: `user:${template.id}`,
+    templateOrigin: { id: template.id, version: template.version },
+    hubCore: template.hubCore,
+    permission: template.permission || "balanced",
+    watchdog: template.watchdog !== false,
+    rebuild: false,
+    roles,
+  };
+}
+
+async function editTemplate(template) {
+  if (template.source !== "user") {
+    toast(`内置模板 ${template.name} 只读；请先「使用此模板」再另存为个人模板`, "error");
+    return false;
+  }
+  if (!await confirmDiscard(`编辑模板 ${template.name}`)) return false;
+  templateEditMode = { id: template.id, name: template.name };
+  workbench = workbenchForTemplateEdit(template);
+  currentRole = 0;
+  loadedProjectKey = "";
+  resetValidationState();
+  markWorkbenchClean();
+  setWorkspaceReady(true);
+  renderAll();
+  scheduleValidation();
+  goToStep("sec-roster");
+  toast(`正在编辑模板「${template.name}」v${template.version}`);
+  return true;
+}
+
+async function saveTemplateEdits() {
+  if (!templateEditMode) return false;
+  const button = $("#save-template-mode");
+  button.disabled = true;
+  try {
+    const result = await api("/api/templates", {
+      method: "POST",
+      body: JSON.stringify({ id: templateEditMode.id, name: templateEditMode.name, workbench }),
+    });
+    bootstrap.userTemplates = result.templates;
+    workbench.templateOrigin = { id: result.template.id, version: result.template.version };
+    templateEditMode = { id: result.template.id, name: result.template.name };
+    markWorkbenchClean();
+    renderAll();
+    toast(`模板「${result.template.name}」已保存为 v${result.template.version}`);
+    if (!openTemplateUpgrade(result.upgradePlan)) toast("没有项目使用该模板，无需同步");
+    return true;
+  } catch (error) {
+    toast(error.message, "error");
+    return false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function templateLandingEntry(template) {
+  const entry = element("div", "project-launch-row");
+  const main = element("button", "resource-item project-resource landing-project-resource");
+  main.type = "button";
+  main.title = `只读预览模板：${template.name}`;
+  main.append(element("span", "resource-glyph", "TP"));
+  const copy = element("span", "resource-copy");
+  copy.append(element("b", "", template.name), element("small", "", `我的 / ${template.id}`));
+  const consumers = templateConsumerCount(template.id);
+  copy.append(element("small", "template-resource-version", `v${template.version} · ${consumers} 个项目在用`));
+  const meta = element("span", "resource-meta");
+  meta.append(element("span", "resource-stat", `${String((template.roles || []).length).padStart(2, "0")} ROLES`));
+  main.append(copy, meta);
+  main.addEventListener("click", () => openDetail(templateDetailView(template, workbench?.profile || ""), main));
+  const actions = element("span", "project-quick-actions");
+  const editButton = element("button", "secondary-button project-quick-edit", "编辑");
+  editButton.type = "button";
+  editButton.title = `编辑模板 ${template.name}，保存后可同步关联项目`;
+  editButton.addEventListener("click", () => editTemplate(template));
+  actions.append(editButton);
+  entry.append(main, actions);
+  return entry;
+}
+
+function templateConsumerCount(templateId) {
+  return (bootstrap.projectOptions || []).filter((project) => project.templateId === templateId).length;
+}
+
+function renderTemplateLanding() {
+  const templates = (bootstrap.userTemplates || []).map((template) => toTemplate(template, "user"));
+  $("#landing-template-count").textContent = String(templates.length).padStart(2, "0");
+  $("#landing-template-options").replaceChildren(...(templates.length
+    ? templates.map(templateLandingEntry)
+    : [resourceEmpty("还没有个人模板", "在工作台里点「保存为模板」，或用空白模板从最小 Hub 开始")]));
+}
+
 async function applyTemplate(template) {
   if (workbench.profile === template.profileId && (template.source !== "user" || templateOrigin()?.version === template.version)) {
     toast(`正在编辑${template.source === "user" ? "模板 " : " "}${template.name}，已保留当前修改`);
@@ -1286,9 +1389,40 @@ function enterEditor(sectionId = "sec-templates") {
   goToStep(sectionId);
 }
 
+// Re-reads server state after leaving template mode, so the landing lists and
+// the restored project reflect anything the upgrade wrote to disk.
+async function reloadLandingState() {
+  try {
+    const fresh = await api("/api/bootstrap");
+    bootstrap = fresh;
+    workbench = fresh.workbench ? clone(fresh.workbench) : null;
+    loadedWorkspace = workbench?.workspace || "";
+    loadedProjectKey = projectKey(workbenchProject());
+    if (workbench) markWorkbenchClean();
+  } catch (error) {
+    toast(`刷新项目列表失败：${error.message}`, "error");
+  }
+}
+
 async function returnToProjectLanding() {
   const dirty = hasUnsavedChanges();
   if (!await confirmDiscard("返回项目列表")) return false;
+  if (templateEditMode) {
+    // Leaving template mode discards the scratch workbench and reloads the
+    // real project (or a projectless landing) from the server.
+    templateEditMode = null;
+    workbench = null;
+    loadedProjectKey = "";
+    cleanWorkbenchSnapshot = null;
+    cleanWorkbenchFingerprint = "";
+    resetValidationState();
+    await reloadLandingState();
+    setWorkspaceReady(false);
+    renderProjectLanding();
+    renderTemplateLanding();
+    $("#landing-project-path").focus();
+    return true;
+  }
   if (dirty && cleanWorkbenchSnapshot) {
     workbench = clone(cleanWorkbenchSnapshot);
     loadedWorkspace = workbench.workspace || loadedWorkspace;
@@ -1305,16 +1439,28 @@ async function returnToProjectLanding() {
 }
 
 function setWorkspaceReady(ready) {
+  const templateMode = Boolean(templateEditMode);
   $("#sec-projects").hidden = ready;
   sectionIds.forEach((id) => { document.getElementById(id).hidden = !ready; });
   $(".stepper").hidden = !ready;
   $$(".step[data-section]").forEach((button) => { button.hidden = button.dataset.section === "sec-projects"; });
   $("#nav-validation").hidden = !ready;
   $("#landing-head").hidden = ready;
-  $("#editor-project-bar").hidden = !ready;
+  $("#editor-project-bar").hidden = !ready || templateMode;
+  $("#template-mode-bar").hidden = !ready || !templateMode;
   $(".summary-panel").hidden = !ready;
   $(".actionbar").hidden = !ready;
   $(".shell").classList.toggle("is-project-only", !ready);
+  // A template has no project target or session, so runtime + launch are meaningless here.
+  $("#sec-runtime").hidden = !ready || templateMode;
+  $$(".step[data-section='sec-runtime']").forEach((button) => { button.hidden = templateMode; });
+  $("#launch-workbench").hidden = templateMode;
+  $("#save-config").parentElement.hidden = templateMode;
+  $("#save-template-mode").hidden = !templateMode;
+  if (templateMode) {
+    $("#template-mode-name").textContent = templateEditMode.name;
+    $("#template-mode-note").textContent = `模板 ID ${templateEditMode.id} · 改动只写模板，保存后可同步关联项目`;
+  }
   if (!ready) activateSection("sec-projects");
 }
 
@@ -1404,7 +1550,9 @@ async function refreshResources({ silent = false } = {}) {
 function renderSummary() {
   $("#summary-count").textContent = String(workbench.roles.length).padStart(2, "0");
   $("#summary-name").textContent = workbench.name || "Untitled Workbench";
-  $("#summary-path").textContent = persistentError ? `错误：${persistentError}` : (workbench.workspace || "尚未选择项目");
+  $("#summary-path").textContent = templateEditMode
+    ? `模板 ${templateEditMode.id} · 不绑定项目`
+    : persistentError ? `错误：${persistentError}` : (workbench.workspace || "尚未选择项目");
   $("#summary-path").title = persistentError ? (workbench.workspace || "") : "";
   $("#summary-profile").textContent = profileName(workbench.profile);
   $("#summary-session").textContent = workbench.session || "—";
@@ -1430,15 +1578,24 @@ function renderAll() {
   updateInPlace(() => {
     setWorkspaceReady(true);
     renderProjectLanding();
+    renderTemplateLanding();
     renderProfiles();
     renderRoleList();
     renderRoleEditor();
-    renderEditorProjectBar();
+    if (templateEditMode) renderTemplateModeBar();
+    else renderEditorProjectBar();
     renderRuntime();
     renderSummary();
     renderWizardNavigation();
   });
   syncLaunchButton();
+}
+
+function renderTemplateModeBar() {
+  $("#template-mode-name").textContent = templateEditMode.name;
+  const consumers = templateConsumerCount(templateEditMode.id);
+  const version = templateOrigin(workbench)?.version;
+  $("#template-mode-note").textContent = `${templateEditMode.id} · v${version === "unknown" ? "?" : version} · ${consumers} 个项目在用`;
 }
 
 function activateSection(sectionId) {
@@ -1629,7 +1786,7 @@ async function requestValidation({ renderFinal = false, reportField = null } = {
     box.replaceChildren(element("div", "validation-spinner"), element("p", "", "正在检查角色、命令、项目和会话配置…"));
   }
   try {
-    const result = await api("/api/validate", { method: "POST", body: JSON.stringify({ workbench }) });
+    const result = await api("/api/validate", { method: "POST", body: JSON.stringify({ workbench, scope: templateEditMode ? "template" : "project" }) });
     if (revision !== validationRevision || fingerprint !== workbenchFingerprint()) return;
     validationResult = result.validation;
     previewFiles = result.files;
@@ -1964,6 +2121,8 @@ function bindEvents() {
   });
   $("#project-switcher").addEventListener("click", (event) => openProjectDetail(currentProjectOption(), event.currentTarget));
   $("#return-projects").addEventListener("click", returnToProjectLanding);
+  $("#return-projects-from-template").addEventListener("click", returnToProjectLanding);
+  $("#save-template-mode").addEventListener("click", saveTemplateEdits);
   $("#detail-backdrop").addEventListener("click", () => toggleDetail(false));
 
   $$(".preview-tab").forEach((button) => button.addEventListener("click", () => { previewKind = button.dataset.preview; renderPreview(); }));
@@ -2059,6 +2218,7 @@ async function start() {
   } else {
     setWorkspaceReady(false);
     renderProjectLanding();
+    renderTemplateLanding();
   }
 }
 

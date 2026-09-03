@@ -27,6 +27,7 @@ import {
   serializeAgents,
   serializeModels,
   serializeWorkbenchSidecar,
+  storedTemplateId,
 } from "./store.mjs";
 
 export { parseRoleMap, serializeAgents, serializeModels } from "./store.mjs";
@@ -776,6 +777,15 @@ function saveTemplate(name, workbench, preferredId = "") {
   return { id: slug, ...template };
 }
 
+const TEMPLATE_SCOPE_IGNORED = ["项目路径", "项目名", "会话名"];
+
+// A template is not bound to a project, so project/session identity errors do
+// not apply. Mirrors the filter saveTemplate already uses when persisting one.
+export function templateScopeValidation(validation) {
+  const errors = (validation?.errors || []).filter((error) => !TEMPLATE_SCOPE_IGNORED.some((prefix) => error.startsWith(prefix)));
+  return { ...validation, valid: errors.length === 0, errors };
+}
+
 function rolePromptBase(role) {
   return String(role?.id === "hub" ? role.prompt || "" : role.promptBase || role.prompt || "").trim();
 }
@@ -1125,6 +1135,7 @@ function listProjectOptions(currentProject, sessions) {
       sessions: related.length,
       running: related.filter((session) => session.status === "running").length,
       legacy: stored?.legacy === true,
+      templateId: stored ? storedTemplateId(stored.directory) : "",
     };
   });
 }
@@ -1366,7 +1377,12 @@ export function createStudioServer({ project, token, platform = process.platform
       }
       if (request.method === "POST" && url.pathname === "/api/validate") {
         const body = await readJson(request);
-        jsonResponse(response, 200, { validation: await validator.validate(body.workbench), files: configPreview(body.workbench) });
+        const validation = await validator.validate(body.workbench);
+        // Template scope has no project target: drop project/session-only errors
+        // so role and agent problems stay visible without a workspace.
+        jsonResponse(response, 200, body.scope === "template" ? {
+          validation: templateScopeValidation(validation),
+        } : { validation, files: configPreview(body.workbench) });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/save") {

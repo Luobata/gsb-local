@@ -28,6 +28,7 @@ import {
   sessionSocketLabel,
   sessionState,
   studioLaunchEnv,
+  templateScopeValidation,
   validateWorkbench,
   zellijSocketPathInfo,
 } from "./server.mjs";
@@ -1205,6 +1206,20 @@ test("lazy migration restores every flat file when the final rename fails", () =
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test("template scope validation drops project identity errors but keeps role errors", () => {
+  const template = { workspace: "", session: "", roles: [{ id: "hub", agent: "" }] };
+  const project = validateWorkbench(template);
+  assert.equal(project.valid, false);
+  assert.ok(project.errors.some((error) => error.startsWith("项目路径")), "project scope must still demand a path");
+  const scoped = templateScopeValidation(project);
+  assert.equal(scoped.errors.some((error) => error.startsWith("项目路径") || error.startsWith("会话名") || error.startsWith("项目名")), false);
+  assert.ok(scoped.errors.some((error) => error.includes("Agent")), "role problems must survive the filter");
+  assert.equal(scoped.valid, false);
+  const clean = templateScopeValidation(validateWorkbench({ workspace: "", session: "", roles: [{ id: "hub", agent: "shell:true" }] }));
+  assert.deepEqual(clean.errors, []);
+  assert.equal(clean.valid, true, "a template needs no workspace to be valid");
 });
 
 test("named and legacy projects remain independently writable in a mixed layout", () => {

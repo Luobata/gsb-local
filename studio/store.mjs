@@ -40,6 +40,12 @@ function legacyProjectName(workspace, sidecar = rawSidecar(localRoot(workspace))
   return candidates.find((name) => PROJECT_PATTERN.test(name || "")) || "seed-gsb";
 }
 
+// Cheap sidecar-only read for listings: avoids a full loadProjectState per row.
+export function storedTemplateId(directory) {
+  const origin = normalizedTemplateOrigin(rawSidecar(directory));
+  return origin?.id || "";
+}
+
 export function listStoredProjects(workspace) {
   const projectsRoot = path.join(localRoot(workspace), "projects");
   const named = existsSync(projectsRoot) ? readdirSync(projectsRoot, { withFileTypes: true })

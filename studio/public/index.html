@@ -53,6 +53,18 @@
           <button id="return-projects" class="text-button" type="button">← 返回项目列表</button>
         </div>
 
+        <div id="template-mode-bar" class="editor-project-bar template-mode-bar" hidden>
+          <span class="project-switcher template-mode-badge">
+            <span class="project-switcher-glyph" aria-hidden="true">TP</span>
+            <span class="project-switcher-copy">
+              <small>EDITING TEMPLATE / NOT A PROJECT</small>
+              <b id="template-mode-name">Template</b>
+              <span id="template-mode-note">改动只写模板，保存后可同步关联项目</span>
+            </span>
+          </span>
+          <button id="return-projects-from-template" class="text-button" type="button">← 返回项目列表</button>
+        </div>
+
         <section id="sec-projects" class="stage is-active" data-stage="0">
           <div class="project-landing-head">
             <div>
@@ -79,6 +91,16 @@
           </div>
           <p id="landing-project-status" class="resource-note" aria-live="polite"><span aria-hidden="true">↳</span> 选择项目后进入完整工作台。</p>
           <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
+
+          <div class="project-landing-head landing-template-head">
+            <div>
+              <span class="eyebrow">TEMPLATES / REUSABLE SPEC</span>
+              <h2>编辑模板，同步关联项目</h2>
+              <p>模板改动只写模板本身；保存后可选择把哪些使用它的项目一起更新。</p>
+            </div>
+            <span class="project-total"><b id="landing-template-count">00</b><small>TEMPLATES</small></span>
+          </div>
+          <div id="landing-template-options" class="resource-list project-landing-list" aria-label="可编辑模板"></div>
         </section>
 
         <section id="sec-templates" class="stage" data-stage="0" aria-labelledby="heading-templates">
@@ -378,6 +400,7 @@
       </div>
       <div class="actionbar-right">
         <button id="toggle-validation" class="secondary-button" type="button">校验</button>
+        <button id="save-template-mode" class="primary-button" type="button" hidden>保存模板</button>
         <button id="launch-workbench" class="primary-button launch-button" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z" /></svg>
           保存并后台启动
