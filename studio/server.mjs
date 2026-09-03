@@ -881,7 +881,14 @@ export function applyTemplateUpgrade(templateId, selectedProjects) {
     }
     throw new Error(rollbackErrors.length ? `模板升级失败且回滚不完整：${rollbackErrors.join("；")}` : `模板升级失败，已回滚：${error.message}`);
   }
-  return { applied: selected, message: `已更新 ${selected.length} 个项目；变更将在项目下次重启/重建时生效` };
+  // Spell out the exact command: --rebuild is a flag on the default form, not a
+  // subcommand, and it needs both the workspace path and the session name.
+  const commands = selected.map((project) => `gsb-local --rebuild ${project.path} ${project.name}`);
+  return {
+    applied: selected,
+    commands,
+    message: `已更新 ${selected.length} 个项目；运行中的会话不变，需要重建后生效：\n${commands.join("\n")}`,
+  };
 }
 
 export function gsbSocketDir({ env = process.env, home = os.homedir() } = {}) {

@@ -125,7 +125,9 @@ function toast(message, kind = "info") {
 
 function confirmInStudio({ title, message, confirmLabel, cancelMessage }) {
   const dialog = $("#confirm-dialog");
-  if (dialog.open) return false;
+  // Another confirm is already up: resolve as "cancelled" rather than
+  // returning a bare false, so `await` callers still see a boolean.
+  if (dialog.open) return Promise.resolve(false);
   const cancel = $("#cancel-confirm");
   const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   $("#confirm-dialog-title").textContent = title;
@@ -527,6 +529,11 @@ function renderSaveState() {
 }
 
 function markWorkbenchClean() {
+  // renderRoleEditor() runs ensurePromptState(), which fills promptMode/prompt
+  // in place. Normalize every role first so the snapshot matches what render
+  // produces; otherwise a freshly loaded project reads as dirty and every
+  // "返回项目列表" hits a bogus 放弃修改 confirm.
+  (workbench?.roles || []).forEach(ensurePromptState);
   cleanWorkbenchSnapshot = workbench ? clone(workbench) : null;
   cleanWorkbenchFingerprint = workbenchFingerprint();
   renderSaveState();
@@ -1451,6 +1458,9 @@ function setWorkspaceReady(ready) {
   $(".summary-panel").hidden = !ready;
   $(".actionbar").hidden = !ready;
   $(".shell").classList.toggle("is-project-only", !ready);
+  const brand = $("#brand-home");
+  brand.setAttribute("aria-disabled", String(!ready));
+  brand.title = ready ? "返回首页（项目与模板总览）" : "已在首页";
   // A template has no project target or session, so runtime + launch are meaningless here.
   $("#sec-runtime").hidden = !ready || templateMode;
   $$(".step[data-section='sec-runtime']").forEach((button) => { button.hidden = templateMode; });
@@ -2122,6 +2132,13 @@ function bindEvents() {
   $("#project-switcher").addEventListener("click", (event) => openProjectDetail(currentProjectOption(), event.currentTarget));
   $("#return-projects").addEventListener("click", returnToProjectLanding);
   $("#return-projects-from-template").addEventListener("click", returnToProjectLanding);
+  // The brand is the always-available way home — the landing page is the
+  // dashboard, so it must be reachable from anywhere, not only via the
+  // contextual bar inside a stage.
+  $("#brand-home").addEventListener("click", () => {
+    if ($(".shell").classList.contains("is-project-only")) return;
+    returnToProjectLanding();
+  });
   $("#save-template-mode").addEventListener("click", saveTemplateEdits);
   $("#detail-backdrop").addEventListener("click", () => toggleDetail(false));
 

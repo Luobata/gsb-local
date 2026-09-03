@@ -450,9 +450,38 @@ test("Studio launch controls expose validation state and a direct project edit a
   assert.match(styles, /\.primary-button:disabled \{ cursor: not-allowed; opacity: \.4/);
 });
 
+test("a freshly loaded project is not dirty after prompt normalization", () => {
+  const source = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  // renderRoleEditor() calls ensurePromptState(), which fills promptMode/prompt
+  // in place. markWorkbenchClean() must normalize first or every project reads
+  // as dirty the moment it renders, and "返回项目列表" hits a bogus discard
+  // confirm — the user cannot get back to the landing dashboard.
+  const clean = source.slice(source.indexOf("function markWorkbenchClean()"));
+  const body = clean.slice(0, clean.indexOf("\n}"));
+  const normalizeIndex = body.indexOf("ensurePromptState");
+  const snapshotIndex = body.indexOf("cleanWorkbenchSnapshot =");
+  assert.ok(normalizeIndex > 0, "markWorkbenchClean must normalize prompts before snapshotting");
+  assert.ok(normalizeIndex < snapshotIndex, "normalization must run before the snapshot is taken");
+
+  // Mirror ensurePromptState's layered branch to prove the drift it repairs.
+  const role = { id: "coder", agent: "shell:true", promptBase: "base", intent: "" };
+  const workbench = { roles: [{ ...role }] };
+  const beforeRender = JSON.stringify(workbench);
+  const rendered = workbench.roles[0];
+  rendered.promptMode = "layered";
+  rendered.prompt = "base";
+  assert.notEqual(beforeRender, JSON.stringify(workbench), "rendering does mutate roles, so ordering matters");
+});
+
 test("Studio confirmation rejects reentry before changing dialog content", () => {
   const source = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
-  assert.match(source, /const dialog = \$\("#confirm-dialog"\);\n  if \(dialog\.open\) return false;\n  const cancel/);
+  // The reentry guard must resolve falsy without touching the open dialog's
+  // text, and must stay awaitable — `return false` would make `await` callers
+  // work by luck only, so a rejected reentry has to be a resolved Promise.
+  assert.match(source, /const dialog = \$\("#confirm-dialog"\);[\s\S]{0,240}?if \(dialog\.open\) return Promise\.resolve\(false\);/);
+  const guardIndex = source.indexOf('if (dialog.open) return Promise.resolve(false);');
+  const titleIndex = source.indexOf('$("#confirm-dialog-title").textContent');
+  assert.ok(guardIndex > 0 && titleIndex > guardIndex, "the guard must precede any dialog mutation");
 });
 
 test("the CLI still resolves an unconfigured project through defaults/agents.conf", () => {
@@ -1681,7 +1710,14 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
     }) });
     const applyPayload = await apply.json();
     assert.equal(apply.status, 200, JSON.stringify(applyPayload));
-    assert.match(applyPayload.message, /下次重启\/重建时生效/);
+    assert.match(applyPayload.message, /需要重建后生效/);
+    // The hint must name the runnable command, not just "rebuild it somehow":
+    // --rebuild is a flag on the default form and needs path AND session name.
+    assert.deepEqual(applyPayload.commands.slice().sort(), [
+      `gsb-local --rebuild ${otherWorkspace} consumer-project`,
+      `gsb-local --rebuild ${otherWorkspace} legacy-consumer`,
+      `gsb-local --rebuild ${workspace} studio-test`,
+    ].sort());
     for (const name of ["consumer-project", "legacy-consumer"]) {
       const upgraded = loadProjectState(otherWorkspace, name);
       const coder = upgraded.roles.find((role) => role.id === "coder");
