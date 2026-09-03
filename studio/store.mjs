@@ -47,10 +47,11 @@ export function listStoredProjects(workspace) {
     .filter((entry) => PROJECT_FILES.some((name) => existsSync(path.join(projectsRoot, entry.name, name))))
     .map((entry) => ({ path: workspace, name: entry.name, directory: path.join(projectsRoot, entry.name), legacy: false }))
     .sort((left, right) => left.name.localeCompare(right.name)) : [];
-  if (named.length) return named;
   const directory = localRoot(workspace);
-  if (!PROJECT_FILES.some((name) => existsSync(path.join(directory, name)))) return [];
-  return [{ path: workspace, name: legacyProjectName(workspace), directory, legacy: true }];
+  if (!PROJECT_FILES.some((name) => existsSync(path.join(directory, name)))) return named;
+  const legacy = { path: workspace, name: legacyProjectName(workspace), directory, legacy: true };
+  return named.some((project) => project.name === legacy.name) ? named : [...named, legacy]
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 export function composeRolePrompt(role) {
@@ -94,6 +95,7 @@ export function serializeModels(workbench) {
 }
 
 function sidecarValue(workbench) {
+  const templateOrigin = normalizedTemplateOrigin(workbench);
   return {
     version: workbench.version || 1,
     ...(workbench.projectName ? { projectName: workbench.projectName } : {}),
@@ -103,6 +105,7 @@ function sidecarValue(workbench) {
     permission: workbench.permission,
     watchdog: workbench.watchdog,
     rebuild: workbench.rebuild,
+    ...(templateOrigin ? { templateOrigin } : {}),
     roles: (workbench.roles || []).map((role) => ({
       id: role.id,
       name: role.name,
@@ -110,6 +113,15 @@ function sidecarValue(workbench) {
       description: role.description,
     })),
   };
+}
+
+function normalizedTemplateOrigin(workbench) {
+  const explicit = workbench?.templateOrigin;
+  if (explicit && PROJECT_PATTERN.test(explicit.id || "")) {
+    return { id: explicit.id, version: Number.isInteger(explicit.version) ? explicit.version : "unknown" };
+  }
+  const inferred = typeof workbench?.profile === "string" ? workbench.profile.match(/^user:([A-Za-z0-9][A-Za-z0-9._-]*)$/) : null;
+  return inferred ? { id: inferred[1], version: "unknown" } : null;
 }
 
 export function serializeWorkbenchSidecar(workbench) {
@@ -158,6 +170,8 @@ function sidecarFields(workspace, projectName, value) {
   for (const key of ["version", "name", "profile", "session", "permission", "watchdog", "rebuild"]) {
     if (value[key] !== undefined) saved[key] = value[key];
   }
+  const templateOrigin = normalizedTemplateOrigin(value);
+  if (templateOrigin) saved.templateOrigin = templateOrigin;
   saved.roles = Array.isArray(value.roles) ? value.roles.flatMap((role) => (
     role && typeof role === "object" && typeof role.id === "string"
       ? [{ id: role.id, name: role.name, type: role.type, description: role.description }]
@@ -267,8 +281,9 @@ export function saveProjectState(workbench, options = {}) {
     migrateLegacyAndSave(workbench, legacy, options);
     return;
   }
+  const existing = projectName ? stored.find((project) => project.name === projectName) : null;
   const targetDirectory = projectName
-    ? legacy?.name === projectName ? legacy.directory : projectDir(workbench.workspace, projectName)
+    ? existing?.directory || projectDir(workbench.workspace, projectName)
     : root;
   mkdirSync(path.dirname(targetDirectory), { recursive: true });
   const stagingDirectory = path.join(path.dirname(targetDirectory), `.staging-${process.pid}-${randomBytes(4).toString("hex")}`);

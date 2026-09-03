@@ -198,6 +198,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-switcher-copy small { color: var(--cyan); font: 8px var(--mono); letter-spacing: .15em; }
 .project-switcher-copy b { overflow: hidden; color: var(--ink); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .project-switcher-copy > span { overflow: hidden; color: var(--faint); font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.project-switcher-copy > .template-origin-status { color: var(--warning); }
 .project-switcher-action { color: var(--cyan); font: 9px var(--mono); white-space: nowrap; }
 
 .profile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 13px; }
@@ -521,6 +522,17 @@ body.has-detail-open { overflow: hidden; }
 .studio-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 11px; }
 .confirm-dialog { border-color: var(--warning); }
 .confirm-dialog .eyebrow { color: var(--warning); }
+.template-upgrade-dialog { width: min(860px, calc(100vw - 32px)); }
+.template-upgrade-body { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(300px, 1.2fr); gap: 18px; margin-bottom: 22px; }
+.template-upgrade-body h3 { margin: 0 0 8px; color: var(--faint); font: 9px var(--mono); letter-spacing: .12em; }
+.upgrade-projects, .upgrade-diff { max-height: 310px; margin: 0; padding: 0; overflow: auto; border: 1px solid var(--line); list-style: none; }
+.upgrade-project { padding: 10px; display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 9px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.upgrade-project span, .upgrade-diff li { min-width: 0; display: grid; gap: 3px; }
+.upgrade-project b, .upgrade-diff b { color: var(--ink); font: 10px var(--mono); }
+.upgrade-project small, .upgrade-diff small { overflow-wrap: anywhere; color: var(--faint); font: 9px/1.45 var(--mono); }
+.upgrade-diff li { padding: 10px; border-bottom: 1px solid var(--line); }
+.upgrade-diff li.is-preserved b { color: var(--cyan); }
+.upgrade-result { padding: 18px; border: 1px solid var(--signal-dim); color: var(--signal) !important; }
 .template-baseline { display: flex; align-items: center; gap: 12px; margin: 3px 0 21px; padding: 12px; border: 1px solid var(--line); background: #0c100d; }
 .baseline-node { width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--signal); color: var(--signal); font: 11px var(--mono); }
 .template-baseline > span:last-child { display: grid; gap: 3px; }
@@ -536,6 +548,7 @@ body.has-detail-open { overflow: hidden; }
   .shell { grid-template-columns: minmax(0, 1fr) 260px; }
   .workspace { padding-inline: 24px; }
   .runtime-grid, .review-grid { grid-template-columns: 1fr; }
+  .template-upgrade-body { grid-template-columns: 1fr; }
   .runtime-options { padding: 25px 0 0; border: 0; border-top: 1px solid var(--line); }
 }
 

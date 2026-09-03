@@ -221,10 +221,21 @@ function normalizeHubExtension(value) {
   return looksLikeLegacyCore ? "" : prompt;
 }
 
+function templateOriginFor(workbench) {
+  const explicit = workbench?.templateOrigin;
+  if (explicit && PROFILE_PATTERN.test(explicit.id || "")) {
+    return { id: explicit.id, version: Number.isInteger(explicit.version) ? explicit.version : "unknown" };
+  }
+  const inferred = typeof workbench?.profile === "string" ? workbench.profile.match(/^user:([A-Za-z0-9][A-Za-z0-9._-]*)$/) : null;
+  return inferred ? { id: inferred[1], version: "unknown" } : null;
+}
+
 function normalizeWorkbench(workbench) {
   if (!workbench || typeof workbench !== "object") return workbench;
+  const templateOrigin = templateOriginFor(workbench);
   return {
     ...workbench,
+    ...(templateOrigin ? { templateOrigin } : {}),
     hubCore: { source: "builtin", locked: true, version: 1 },
     roles: Array.isArray(workbench.roles) ? workbench.roles.map((role) => role?.id === "hub" ? {
       ...role,
@@ -626,8 +637,15 @@ async function persistProjectState(workbench) {
   if (!validation.valid) return { validation };
   saveStoredProjectState(normalized);
   rememberProject(normalized.workspace, normalized.projectName || normalized.session);
-  const templateUpdated = syncActiveUserTemplate(normalized);
-  return { validation, files: configPreview(normalized), templateUpdated };
+  const origin = templateOriginFor(normalized);
+  const template = origin && loadUserTemplates().find((item) => item.id === origin.id);
+  const templateOverwriteOffer = template ? {
+    id: template.id,
+    name: template.name,
+    currentVersion: template.version,
+    nextVersion: template.version + 1,
+  } : null;
+  return { validation, files: configPreview(normalized), templateOverwriteOffer };
 }
 
 function recentProjectsFile() {
@@ -718,7 +736,7 @@ function loadUserTemplates() {
     .flatMap((name) => {
       try {
         const template = JSON.parse(readText(path.join(directory, name)));
-        return [{ id: name.slice(0, -5), ...template }];
+        return [{ ...template, id: name.slice(0, -5), version: Number.isInteger(template.version) ? template.version : 0 }];
       } catch {
         return [];
       }
@@ -732,22 +750,21 @@ function saveTemplate(name, workbench, preferredId = "") {
   const validation = validateWorkbench(normalized);
   const relevantErrors = validation.errors.filter((error) => !error.startsWith("项目路径"));
   if (relevantErrors.length) throw new Error(relevantErrors.join("；"));
+  const file = path.join(configHome(), "templates", `${slug}.json`);
+  let existing = null;
+  if (existsSync(file)) {
+    try { existing = JSON.parse(readText(file)); } catch { /* handled as a collision below */ }
+  }
   const template = {
     name: normalizedName,
+    version: Number.isInteger(existing?.version) ? existing.version + 1 : 1,
     hubCore: normalized.hubCore,
     permission: normalized.permission,
     watchdog: normalized.watchdog,
     roles: normalized.roles,
     savedAt: new Date().toISOString(),
   };
-  const file = path.join(configHome(), "templates", `${slug}.json`);
   if (!preferredId && existsSync(file)) {
-    let existing = null;
-    try {
-      existing = JSON.parse(readText(file));
-    } catch {
-      // An unreadable target is still a collision and must not be overwritten.
-    }
     if (existing?.name !== normalizedName) {
       const error = new Error(`模板标识 ${slug} 已被「${existing?.name || "未知模板"}」使用，请换一个名称`);
       error.statusCode = 400;
@@ -758,19 +775,102 @@ function saveTemplate(name, workbench, preferredId = "") {
   return { id: slug, ...template };
 }
 
-function syncActiveUserTemplate(workbench) {
-  const match = typeof workbench.profile === "string" ? workbench.profile.match(/^user:([A-Za-z0-9][A-Za-z0-9._-]*)$/) : null;
-  if (!match) return null;
-  const id = match[1];
-  const file = path.join(configHome(), "templates", `${id}.json`);
-  if (!existsSync(file)) return null;
-  let existing;
-  try {
-    existing = JSON.parse(readText(file));
-  } catch {
-    return null;
+function rolePromptBase(role) {
+  return String(role?.id === "hub" ? role.prompt || "" : role.promptBase || role.prompt || "").trim();
+}
+
+function templateDiff(before, after) {
+  const changes = [];
+  const add = (label, left, right, preserve = false) => {
+    if (JSON.stringify(left) !== JSON.stringify(right)) changes.push({ label, before: String(left ?? "—"), after: String(right ?? "—"), preserve });
+  };
+  add("permission", before?.permission, after.permission);
+  add("watchdog", before?.watchdog, after.watchdog);
+  const oldRoles = new Map((before?.roles || []).map((role) => [role.id, role]));
+  const newRoles = new Map((after.roles || []).map((role) => [role.id, role]));
+  for (const id of oldRoles.keys()) if (!newRoles.has(id)) changes.push({ label: `移除角色 ${id}`, before: "存在", after: "移除" });
+  for (const [id, role] of newRoles) {
+    const old = oldRoles.get(id);
+    if (!old) { changes.push({ label: `新增角色 ${id}`, before: "—", after: role.agent || "已添加" }); continue; }
+    add(`${id} · agent`, old.agent, role.agent);
+    add(`${id} · model`, old.model, role.model);
+    add(`${id} · prompt base`, rolePromptBase(old), rolePromptBase(role));
+    add(`${id} · intent（保留项目自定义）`, old.intent, role.intent, true);
   }
-  return saveTemplate(existing.name || workbench.name || id, workbench, id);
+  return changes;
+}
+
+export function projectsUsingTemplate(templateId, extraWorkspaces = []) {
+  const projects = [];
+  const seen = new Set();
+  const workspaces = new Set([...extraWorkspaces, ...loadRecentProjects().map((project) => project.path)]);
+  for (const workspace of workspaces) {
+    if (!workspace || !existsSync(workspace)) continue;
+    for (const stored of listStoredProjects(workspace)) {
+      const key = projectKey(stored);
+      if (seen.has(key)) continue;
+      try {
+        const workbench = loadProjectState(stored.path, stored.name);
+        const origin = templateOriginFor(workbench);
+        if (origin?.id !== templateId) continue;
+        seen.add(key);
+        projects.push({ path: stored.path, name: stored.name, originVersion: origin.version, legacy: stored.legacy });
+      } catch { /* Ignore unreadable projects; they cannot be safely upgraded. */ }
+    }
+  }
+  return projects;
+}
+
+function workbenchWithTemplate(project, template) {
+  const currentRoles = new Map((project.roles || []).map((role) => [role.id, role]));
+  const roles = (template.roles || []).map((role) => {
+    if (role.id === "hub") return { ...role };
+    const layered = {
+      ...role,
+      promptMode: "layered",
+      promptBase: rolePromptBase(role),
+      intent: currentRoles.get(role.id)?.intent || "",
+    };
+    return { ...layered, prompt: composeRolePrompt(layered) };
+  });
+  return prepareWorkbenchPrompts(normalizeWorkbench({
+    ...project,
+    profile: `user:${template.id}`,
+    templateOrigin: { id: template.id, version: template.version },
+    permission: template.permission,
+    watchdog: template.watchdog,
+    roles,
+  }));
+}
+
+export function applyTemplateUpgrade(templateId, selectedProjects) {
+  const template = loadUserTemplates().find((item) => item.id === templateId);
+  if (!template) throw requestError("模板不存在");
+  const candidates = new Map(projectsUsingTemplate(templateId, (selectedProjects || []).map((project) => project?.path)).map((project) => [projectKey(project), project]));
+  const requested = [...new Map((selectedProjects || []).map((project) => [projectKey(project), project])).keys()];
+  const selected = requested.map((key) => candidates.get(key)).filter(Boolean);
+  if (selected.length !== requested.length) throw requestError("部分项目已不再使用该模板，请重新打开升级清单");
+  const changes = selected.map((project) => {
+    const before = loadProjectState(project.path, project.name);
+    const after = workbenchWithTemplate(before, template);
+    const validation = validateWorkbench(after);
+    if (!validation.valid) throw requestError(`${project.name} 无法升级：${validation.errors.join("；")}`);
+    return { project, before, after };
+  });
+  const touched = [];
+  try {
+    for (const change of changes) {
+      touched.push(change);
+      saveStoredProjectState(change.after);
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const change of touched.reverse()) {
+      try { saveStoredProjectState(change.before); } catch (rollback) { rollbackErrors.push(rollback.message); }
+    }
+    throw new Error(rollbackErrors.length ? `模板升级失败且回滚不完整：${rollbackErrors.join("；")}` : `模板升级失败，已回滚：${error.message}`);
+  }
+  return { applied: selected, message: `已更新 ${selected.length} 个项目；变更将在项目下次重启/重建时生效` };
 }
 
 export function gsbSocketDir({ env = process.env, home = os.homedir() } = {}) {
@@ -1287,7 +1387,25 @@ export function createStudioServer({ project, token, platform = process.platform
       }
       if (request.method === "POST" && url.pathname === "/api/templates") {
         const body = await readJson(request);
-        jsonResponse(response, 200, { template: saveTemplate(body.name, body.workbench), templates: loadUserTemplates() });
+        if (body.id && !PROFILE_PATTERN.test(body.id)) throw requestError("模板 ID 无效");
+        const id = body.id || templateSlug(body.name);
+        const before = loadUserTemplates().find((template) => template.id === id) || null;
+        const template = saveTemplate(body.name, body.workbench, body.id || "");
+        const projects = projectsUsingTemplate(template.id, [body.workbench?.workspace]);
+        jsonResponse(response, 200, {
+          template,
+          templates: loadUserTemplates(),
+          upgradePlan: projects.length ? {
+            template: { id: template.id, name: template.name, fromVersion: before?.version ?? 0, toVersion: template.version },
+            projects,
+            diff: templateDiff(before, template),
+          } : null,
+        });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/template-upgrade") {
+        const body = await readJson(request);
+        jsonResponse(response, 200, applyTemplateUpgrade(body.templateId, body.projects));
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/pick-directory") {

@@ -46,6 +46,7 @@
               <small>CURRENT PROJECT / INSPECT</small>
               <b id="editor-project-name">Project</b>
               <span id="editor-project-path">—</span>
+              <span id="editor-template-origin" class="template-origin-status" hidden></span>
             </span>
             <span class="project-switcher-action" aria-hidden="true">查看详情 ↗</span>
           </button>
@@ -426,6 +427,23 @@
         <div class="dialog-actions">
           <button value="cancel" class="secondary-button">取消</button>
           <button id="confirm-create-template" value="default" class="primary-button">创建并配置角色</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="template-upgrade-dialog" class="studio-dialog template-upgrade-dialog">
+      <form method="dialog">
+        <span class="eyebrow">TEMPLATE UPGRADE / DISK ONLY</span>
+        <h2 id="template-upgrade-title">升级关联项目</h2>
+        <p id="template-upgrade-copy"></p>
+        <div id="template-upgrade-body" class="template-upgrade-body">
+          <section><h3>关联项目（默认全选）</h3><div id="template-upgrade-projects" class="upgrade-projects"></div></section>
+          <section><h3>本次模板 DIFF</h3><ul id="template-upgrade-diff" class="upgrade-diff"></ul></section>
+        </div>
+        <p id="template-upgrade-result" class="upgrade-result" hidden></p>
+        <div class="dialog-actions">
+          <button id="close-template-upgrade" value="cancel" class="secondary-button">暂不升级</button>
+          <button id="confirm-template-upgrade" type="button" class="primary-button">确认升级所选项目</button>
         </div>
       </form>
     </dialog>

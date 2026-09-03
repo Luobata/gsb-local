@@ -54,6 +54,7 @@ let currentStep = 0;
 let visitedSteps = new Set([0]);
 const projectLaunchCache = new Map();
 let landingNameTimer = null;
+let pendingTemplateUpgrade = null;
 
 function projectRef(value) {
   if (typeof value === "string") return { path: value, name: value.split("/").filter(Boolean).at(-1) || value };
@@ -251,6 +252,23 @@ function rolePromptSummary(role) {
   return `自定义全文：${firstContentLine(role.prompt) || "（空）"}`;
 }
 
+function templateOrigin(value = workbench) {
+  if (value?.templateOrigin?.id) return value.templateOrigin;
+  const match = typeof value?.profile === "string" ? value.profile.match(/^user:(.+)$/) : null;
+  return match ? { id: match[1], version: "unknown" } : null;
+}
+
+function templateStatus(value) {
+  const origin = templateOrigin(value);
+  if (!origin) return "";
+  const template = bootstrap.userTemplates.find((item) => item.id === origin.id);
+  const name = template?.name || origin.id;
+  if (template && origin.version !== template.version) {
+    return `基于模板 ${name} · 模板已更新（v${origin.version === "unknown" ? "?" : origin.version}→v${template.version}）`;
+  }
+  return `基于模板 ${name}${template ? ` · v${template.version}` : ""}`;
+}
+
 function templateDetailView(template, currentProfile = "") {
   const target = clone(template);
   const source = target.source === "user" ? "我的模板" : "内置模板";
@@ -298,7 +316,7 @@ function projectDetailView(project, state, sessions, profileName, { landing = fa
       ["配置状态", targetProject.configured ? "已配置" : "尚未保存项目配置"],
       ["记忆会话", targetWorkbench.session || lastSession?.name || "—"],
       ["运行状态", running ? `运行中 · ${running.name}` : lastSession ? `${lastSession.status} · ${lastSession.name}` : "无会话记录"],
-      ["上次模板", profileName || targetWorkbench.profile || "CUSTOM"],
+      ["模板来源", templateStatus(targetWorkbench) || profileName || targetWorkbench.profile || "CUSTOM"],
       ["校验概览", validationPending ? "校验中…" : `${errors.length} errors · ${warnings.length} warnings`],
     ],
     groups: [
@@ -641,6 +659,7 @@ async function createIndependentTemplate(name) {
   const savedName = result.template.name;
   nextWorkbench.name = savedName;
   nextWorkbench.profile = `user:${result.template.id}`;
+  nextWorkbench.templateOrigin = { id: result.template.id, version: result.template.version };
   nextWorkbench.source = "user";
   nextWorkbench.hubCore = result.template.hubCore;
   workbench = nextWorkbench;
@@ -667,6 +686,7 @@ function workbenchForTemplate(template) {
     ...runtime,
     source: template.source,
     profile: template.profileId,
+    templateOrigin: template.source === "user" ? { id: template.id, version: template.version } : null,
     permission: template.source === "user" ? (template.permission || runtime.permission) : runtime.permission,
     watchdog: template.source === "user" ? template.watchdog !== false : runtime.watchdog,
     roles: clone(template.roles || []),
@@ -674,7 +694,7 @@ function workbenchForTemplate(template) {
 }
 
 async function applyTemplate(template) {
-  if (workbench.profile === template.profileId) {
+  if (workbench.profile === template.profileId && (template.source !== "user" || templateOrigin()?.version === template.version)) {
     toast(`正在编辑${template.source === "user" ? "模板 " : " "}${template.name}，已保留当前修改`);
     return false;
   }
@@ -723,7 +743,6 @@ async function quickLaunchTemplate(template, button) {
     previewFiles = result.files;
     validatedWorkbenchFingerprint = workbenchFingerprint();
     projectLaunchCache.delete(projectKey(workbenchProject()));
-    mergeTemplateUpdate(result.templateUpdated);
     renderAll();
     markWorkbenchClean();
     return true;
@@ -736,12 +755,89 @@ async function quickLaunchTemplate(template, button) {
   }
 }
 
-function mergeTemplateUpdate(template) {
-  if (!template?.id) return false;
-  const index = bootstrap.userTemplates.findIndex((item) => item.id === template.id);
-  if (index >= 0) bootstrap.userTemplates[index] = template;
-  else bootstrap.userTemplates.push(template);
+function openTemplateUpgrade(plan) {
+  if (!plan?.projects?.length) return false;
+  pendingTemplateUpgrade = plan;
+  $("#template-upgrade-title").textContent = `升级使用「${plan.template.name}」的项目`;
+  $("#template-upgrade-copy").textContent = `模板 v${plan.template.fromVersion} → v${plan.template.toVersion}；选择要写入磁盘的项目。运行中的会话不会改变。`;
+  $("#template-upgrade-projects").replaceChildren(...plan.projects.map((project, index) => {
+    const label = element("label", "upgrade-project");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = true;
+    input.value = String(index);
+    const copy = element("span");
+    copy.append(element("b", "", project.name), element("small", "", `${project.path} · 当前 v${project.originVersion === "unknown" ? "?" : project.originVersion}`));
+    label.append(input, copy);
+    return label;
+  }));
+  $("#template-upgrade-diff").replaceChildren(...(plan.diff.length ? plan.diff : [{ label: "模板内容无结构变化" }]).map((change) => {
+    const item = element("li", change.preserve ? "is-preserved" : "");
+    const compact = (value) => String(value || "—").replace(/\s+/g, " ").slice(0, 120);
+    item.append(element("b", "", change.label), element("small", "", `${compact(change.before)} → ${compact(change.after)}`));
+    return item;
+  }));
+  $("#template-upgrade-body").hidden = false;
+  $("#template-upgrade-result").hidden = true;
+  $("#confirm-template-upgrade").hidden = false;
+  $("#close-template-upgrade").textContent = "暂不升级";
+  const dialog = $("#template-upgrade-dialog");
+  if (!dialog.open) dialog.showModal();
   return true;
+}
+
+async function applyPendingTemplateUpgrade() {
+  if (!pendingTemplateUpgrade) return;
+  const button = $("#confirm-template-upgrade");
+  const projects = $$("#template-upgrade-projects input:checked").map((input) => pendingTemplateUpgrade.projects[Number(input.value)]);
+  button.disabled = true;
+  try {
+    const result = await api("/api/template-upgrade", {
+      method: "POST",
+      body: JSON.stringify({ templateId: pendingTemplateUpgrade.template.id, projects }),
+    });
+    if (result.applied.some((project) => projectKey(project) === projectKey(workbenchProject()))) {
+      const current = workbenchProject();
+      const state = await api("/api/project", { method: "POST", body: JSON.stringify({ workspace: current.path, name: current.name, remember: false }) });
+      workbench = clone(state.workbench);
+      bootstrap.projectOptions = state.projectOptions;
+      bootstrap.sessionOptions = state.sessionOptions;
+      bootstrap.recentProjects = state.recentProjects;
+      currentRole = Math.min(currentRole, Math.max(0, workbench.roles.length - 1));
+      resetValidationState();
+      markWorkbenchClean();
+    }
+    renderAll();
+    $("#template-upgrade-body").hidden = true;
+    $("#template-upgrade-result").hidden = false;
+    $("#template-upgrade-result").textContent = result.message;
+    button.hidden = true;
+    $("#close-template-upgrade").textContent = "完成";
+    scheduleValidation();
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function offerTemplateOverwrite(offer) {
+  if (!offer || !await confirmInStudio({
+    title: `是否覆盖模板「${offer.name}」？`,
+    message: `项目已保存。覆盖后模板将从 v${offer.currentVersion} 升到 v${offer.nextVersion}，随后可选择要升级的项目。`,
+    confirmLabel: "覆盖模板并继续",
+    cancelMessage: "项目已保存，模板未改变",
+  })) return;
+  try {
+    const result = await api("/api/templates", { method: "POST", body: JSON.stringify({ id: offer.id, name: offer.name, workbench }) });
+    bootstrap.userTemplates = result.templates;
+    renderProfiles();
+    renderEditorProjectBar();
+    renderSummary();
+    openTemplateUpgrade(result.upgradePlan);
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 function toTemplate(entry, source) {
@@ -1179,6 +1275,9 @@ function renderEditorProjectBar() {
   const project = currentProjectOption();
   $("#editor-project-name").textContent = project.name;
   $("#editor-project-path").textContent = project.path;
+  const origin = $("#editor-template-origin");
+  origin.textContent = templateStatus(workbench);
+  origin.hidden = !origin.textContent;
   $("#project-switcher").title = `只读预览当前项目：${project.path}`;
 }
 
@@ -1313,7 +1412,7 @@ function renderSummary() {
   $("#summary-watch").textContent = workbench.watchdog === false ? "OFF" : "ON";
   $("#save-config").textContent = "保存配置";
   $("#save-config-note").textContent = workbench.profile?.startsWith("user:")
-    ? "写入项目 · 同步当前模板"
+    ? "写入项目 · 可选择覆盖模板"
     : "写入项目 .gsb-local";
   $("#spoke-dots").replaceChildren(...workbench.roles.filter((role) => role.id !== "hub").map((role) => element("span", "spoke-dot", role.id.slice(0, 2).toUpperCase())));
   $("#summary-roster").replaceChildren(...workbench.roles.map((role) => {
@@ -1634,18 +1733,12 @@ async function saveConfig() {
     bootstrap.projectOptions = [{ sessions: 0, running: 0, ...savedOption, ...savedProject, configured: true },
       ...(bootstrap.projectOptions || []).filter((project) => projectKey(project) !== projectKey(savedProject))];
     bootstrap.recentProjects = [savedProject, ...(bootstrap.recentProjects || []).filter((project) => projectKey(project) !== projectKey(savedProject))];
-    const templateSynced = mergeTemplateUpdate(result.templateUpdated);
-    if (templateSynced) {
-      updateInPlace(() => {
-        renderProfiles();
-        renderSummary();
-      });
-    }
     markWorkbenchClean();
     setPersistentError();
-    toast(templateSynced ? "项目配置和当前个人模板已同步" : "配置已写入项目的 .gsb-local");
+    toast("配置已写入项目的 .gsb-local");
     renderValidation();
     renderPreview();
+    await offerTemplateOverwrite(result.templateOverwriteOffer);
   } catch (error) {
     toast(error.message, "error");
     setPersistentError(error.message);
@@ -1674,12 +1767,6 @@ async function launch() {
       terminalCommandRow(workbench.session, result.openCommand || `gsb-local open ${workbench.session}`),
       element("code", "", (result.stdout || "").trim()),
     );
-    if (mergeTemplateUpdate(result.templateUpdated)) {
-      updateInPlace(() => {
-        renderProfiles();
-        renderSummary();
-      });
-    }
     previewFiles = result.files;
     validationResult = result.validation;
     validatedWorkbenchFingerprint = workbenchFingerprint();
@@ -1689,12 +1776,6 @@ async function launch() {
     toast("GSB 工作台已启动");
   } catch (error) {
     const result = error.payload || {};
-    if (mergeTemplateUpdate(result.templateUpdated)) {
-      updateInPlace(() => {
-        renderProfiles();
-        renderSummary();
-      });
-    }
     if (result.files && result.validation?.valid) {
       previewFiles = result.files;
       validationResult = result.validation;
@@ -1915,18 +1996,24 @@ function bindEvents() {
     const name = $("#template-name").value.trim();
     if (!name) return $("#template-name").reportValidity();
     try {
-      const result = await api("/api/templates", { method: "POST", body: JSON.stringify({ name, workbench }) });
+      const origin = templateOrigin();
+      const result = await api("/api/templates", { method: "POST", body: JSON.stringify({ id: origin?.id, name, workbench }) });
       bootstrap.userTemplates = result.templates;
       workbench.profile = `user:${result.template.id}`;
+      const currentIncluded = result.upgradePlan?.projects.some((project) => projectKey(project) === projectKey(workbenchProject()));
+      if (!currentIncluded) workbench.templateOrigin = { id: result.template.id, version: result.template.version };
       $("#template-dialog").close();
       renderProfiles();
+      renderEditorProjectBar();
       renderSummary();
       scheduleValidation();
-      toast("个人模板已保存");
+      openTemplateUpgrade(result.upgradePlan);
+      toast(`个人模板已保存为 v${result.template.version}`);
     } catch (error) {
       toast(error.message, "error");
     }
   });
+  $("#confirm-template-upgrade").addEventListener("click", applyPendingTemplateUpgrade);
   $("#create-template-dialog form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (event.submitter?.value === "cancel") {

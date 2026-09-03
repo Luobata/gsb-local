@@ -1207,6 +1207,22 @@ test("lazy migration restores every flat file when the final rename fails", () =
   }
 });
 
+test("named and legacy projects remain independently writable in a mixed layout", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-mixed-projects-"));
+  try {
+    saveProjectState({ ...fixture(workspace), projectName: "named", session: "named" });
+    saveProjectState({ ...fixture(workspace), session: "legacy", name: "legacy" });
+    assert.deepEqual(listStoredProjects(workspace).map(({ name, legacy }) => [name, legacy]), [["legacy", true], ["named", false]]);
+    const legacy = loadProjectState(workspace, "legacy");
+    legacy.name = "Legacy updated";
+    saveProjectState(legacy);
+    assert.equal(loadProjectState(workspace, "legacy").name, "Legacy updated");
+    assert.equal(loadProjectState(workspace, "named").name, "Studio test");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("local API bootstraps, validates, and saves project-local files", async (t) => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-api-"));
   mkdirSync(path.join(workspace, ".git"));
@@ -1588,6 +1604,7 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
     assert.equal(createTemplate.status, 200);
     const templatePayload = await createTemplate.json();
     assert.equal(templatePayload.template.id, "template-_release-kimi");
+    assert.equal(templatePayload.template.version, 1);
     assert.equal(templatePayload.template.roles.length, 1);
     assert.deepEqual(templatePayload.template.hubCore, { source: "builtin", locked: true, version: 1 });
 
@@ -1603,18 +1620,75 @@ test("local API bootstraps, validates, and saves project-local files", async (t)
       assert.equal(original.name, minimalTemplate.name);
     });
 
+    const consumer = { ...fixture(otherWorkspace), projectName: "consumer-project", name: "Consumer identity", session: "consumer-project", rebuild: true,
+      profile: `user:${templatePayload.template.id}`, templateOrigin: { id: templatePayload.template.id, version: 1 } };
+    consumer.roles[1] = { ...consumer.roles[1], promptMode: "layered", promptBase: "consumer base", intent: "keep consumer intent" };
+    assert.equal((await request("/api/save", { method: "POST", body: JSON.stringify({ workbench: consumer }) })).status, 200);
+    const mixedLegacy = { ...fixture(otherWorkspace), name: "Legacy identity", session: "legacy-consumer", rebuild: true,
+      profile: `user:${templatePayload.template.id}`, templateOrigin: { id: templatePayload.template.id, version: 1 } };
+    mixedLegacy.roles = [...mixedLegacy.roles, { ...mixedLegacy.roles[1], id: "qa", name: "QA" }];
+    mixedLegacy.roles[1] = { ...mixedLegacy.roles[1], promptMode: "layered", promptBase: "legacy base", intent: "keep legacy intent" };
+    saveProjectState(mixedLegacy);
+    assert.deepEqual(listStoredProjects(otherWorkspace).map(({ name, legacy }) => [name, legacy]), [["consumer-project", false], ["legacy-consumer", true]]);
+
+    const legacySidecar = path.join(otherWorkspace, ".gsb-local", "workbench.json");
+    const oldSidecar = JSON.parse(readFileSync(legacySidecar, "utf8"));
+    delete oldSidecar.templateOrigin;
+    writeFileSync(legacySidecar, `${JSON.stringify(oldSidecar, null, 2)}\n`);
+    assert.deepEqual(loadProjectState(otherWorkspace, "legacy-consumer").templateOrigin, { id: templatePayload.template.id, version: "unknown" });
+
     const templateEdit = fixture(workspace);
     templateEdit.profile = `user:${templatePayload.template.id}`;
-    const syncedSave = await request("/api/save", {
+    templateEdit.permission = "full-access";
+    templateEdit.watchdog = false;
+    templateEdit.roles[1] = { ...templateEdit.roles[1], agent: "shell:printf upgraded", model: "upgrade-model",
+      promptMode: "layered", promptBase: "upgraded base", intent: "source project intent" };
+    const projectSave = await request("/api/save", {
       method: "POST",
       body: JSON.stringify({ workbench: templateEdit }),
     });
-    const syncedText = await syncedSave.text();
-    assert.equal(syncedSave.status, 200, syncedText);
-    const syncedPayload = JSON.parse(syncedText);
-    assert.equal(syncedPayload.templateUpdated.id, templatePayload.template.id);
-    assert.equal(syncedPayload.templateUpdated.name, minimalTemplate.name);
-    assert.deepEqual(syncedPayload.templateUpdated.roles.map((role) => role.id), ["hub", "coder"]);
+    const savedPayload = await projectSave.json();
+    assert.equal(projectSave.status, 200, JSON.stringify(savedPayload));
+    assert.equal(savedPayload.templateUpdated, undefined);
+    assert.deepEqual(savedPayload.templateOverwriteOffer, { id: templatePayload.template.id, name: minimalTemplate.name, currentVersion: 1, nextVersion: 2 });
+    const templateFile = path.join(process.env.GSB_STUDIO_CONFIG_HOME, "templates", `${templatePayload.template.id}.json`);
+    assert.deepEqual(JSON.parse(readFileSync(templateFile, "utf8")).roles.map((role) => role.id), ["hub"], "project save must not mutate its template");
+
+    const overwrite = await request("/api/templates", { method: "POST", body: JSON.stringify({
+      id: templatePayload.template.id, name: minimalTemplate.name, workbench: templateEdit,
+    }) });
+    const overwritePayload = await overwrite.json();
+    assert.equal(overwritePayload.template.version, 2);
+    assert.deepEqual(overwritePayload.upgradePlan.projects.map((project) => project.name).sort(), ["consumer-project", "legacy-consumer", "studio-test"]);
+    assert.ok(overwritePayload.upgradePlan.diff.some((change) => change.label === "新增角色 coder"));
+    const apply = await request("/api/template-upgrade", { method: "POST", body: JSON.stringify({
+      templateId: templatePayload.template.id, projects: overwritePayload.upgradePlan.projects,
+    }) });
+    const applyPayload = await apply.json();
+    assert.equal(apply.status, 200, JSON.stringify(applyPayload));
+    assert.match(applyPayload.message, /下次重启\/重建时生效/);
+    for (const name of ["consumer-project", "legacy-consumer"]) {
+      const upgraded = loadProjectState(otherWorkspace, name);
+      const coder = upgraded.roles.find((role) => role.id === "coder");
+      assert.deepEqual(upgraded.templateOrigin, { id: templatePayload.template.id, version: 2 });
+      assert.equal(upgraded.name, name === "consumer-project" ? "Consumer identity" : "Legacy identity");
+      assert.equal(upgraded.session, name);
+      assert.equal(upgraded.rebuild, true);
+      assert.equal(upgraded.permission, "full-access");
+      assert.equal(upgraded.watchdog, false);
+      assert.equal(coder.agent, "shell:printf upgraded");
+      assert.equal(coder.model, "upgrade-model");
+      assert.equal(coder.promptBase, "upgraded base");
+      assert.equal(coder.intent, name === "consumer-project" ? "keep consumer intent" : "keep legacy intent");
+      assert.deepEqual(upgraded.roles.map((role) => role.id), ["hub", "coder"]);
+    }
+    const regularSave = await request("/api/templates", { method: "POST", body: JSON.stringify({
+      id: templatePayload.template.id, name: minimalTemplate.name, workbench: loadProjectState(workspace, "studio-test"),
+    }) });
+    const regularPayload = await regularSave.json();
+    assert.equal(regularPayload.template.version, 3);
+    assert.equal(regularPayload.upgradePlan.projects.length, 3);
+    assert.deepEqual(regularPayload.upgradePlan.diff, []);
 
     const refreshed = await request("/api/bootstrap");
     const refreshedPayload = await refreshed.json();
