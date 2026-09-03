@@ -9,7 +9,7 @@ while [[ -L "$SOURCE_PATH" ]]; do
     SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
   fi
 done
-ROOT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd -P)"
 
 gsb_env_or_default() {
   local name="$1"

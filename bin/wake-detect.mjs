@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -115,7 +116,12 @@ async function readStdin() {
   return input;
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function isMainModule(entry) {
+  const source = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(source); } catch { return Boolean(entry) && path.resolve(entry) === source; }
+}
+
+const isMain = isMainModule(process.argv[1]);
 if (isMain && process.argv[2] === "--selftest") {
   runSelfTest();
 } else if (isMain) {

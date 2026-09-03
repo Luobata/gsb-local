@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   writeFileSync,
@@ -1451,7 +1452,12 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainModule(entry) {
+  const source = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(source); } catch { return Boolean(entry) && path.resolve(entry) === source; }
+}
+
+if (isMainModule(process.argv[1])) {
   main().catch((error) => {
     console.error(`gsb-studio: ${error.message}`);
     process.exit(1);
