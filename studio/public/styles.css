@@ -550,6 +550,18 @@ body.has-detail-open { overflow: hidden; }
 .upgrade-diff li { padding: 10px; border-bottom: 1px solid var(--line); }
 .upgrade-diff li.is-preserved b { color: var(--cyan); }
 .upgrade-result { padding: 18px; border: 1px solid var(--signal-dim); color: var(--signal) !important; white-space: pre-wrap; font: 10px/1.7 var(--mono); overflow-wrap: anywhere; }
+.upgrade-launch { margin-bottom: 22px; }
+.upgrade-launch h3 { margin: 0 0 6px; color: var(--faint); font: 9px var(--mono); letter-spacing: .12em; }
+.upgrade-launch-copy { margin: 0 0 12px !important; }
+.upgrade-launch-rows { display: grid; border: 1px solid var(--line); }
+.upgrade-launch-row { padding: 11px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; }
+.upgrade-launch-row + .upgrade-launch-row { border-top: 1px solid var(--line); }
+.upgrade-launch-row > span { min-width: 0; display: grid; gap: 3px; }
+.upgrade-launch-row b { color: var(--ink); font: 10px var(--mono); }
+.upgrade-launch-row small { overflow-wrap: anywhere; color: var(--faint); font: 9px/1.45 var(--mono); }
+.upgrade-launch-row .is-running { color: var(--warning); }
+.upgrade-launch-row .secondary-button { min-height: 32px; font-size: 11px; white-space: nowrap; }
+.copy-command-button { min-height: 32px; padding-inline: 10px; color: var(--cyan); font: 11px var(--mono); }
 .template-baseline { display: flex; align-items: center; gap: 12px; margin: 3px 0 21px; padding: 12px; border: 1px solid var(--line); background: #0c100d; }
 .baseline-node { width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--signal); color: var(--signal); font: 11px var(--mono); }
 .template-baseline > span:last-child { display: grid; gap: 3px; }

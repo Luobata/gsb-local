@@ -889,11 +889,77 @@ function openTemplateUpgrade(plan) {
   }));
   $("#template-upgrade-body").hidden = false;
   $("#template-upgrade-result").hidden = true;
+  $("#template-upgrade-launch").hidden = true;
   $("#confirm-template-upgrade").hidden = false;
   $("#close-template-upgrade").textContent = "暂不升级";
   const dialog = $("#template-upgrade-dialog");
   if (!dialog.open) dialog.showModal();
   return true;
+}
+
+// After an upgrade the new config is on disk but a running Zellij session was
+// started from the old one; only --rebuild re-creates its panes. These rows
+// launch each project with the right flag instead of leaving the user to
+// retype a command in a terminal.
+function upgradeLaunchRow(project) {
+  const row = element("div", "upgrade-launch-row");
+  const running = sessionsForProject(project).find((session) => session.status === "running");
+  const command = `gsb-local ${running ? "--rebuild " : ""}${project.path} ${project.name}`;
+  const copy = element("span");
+  copy.append(element("b", "", project.name));
+  copy.append(element("small", running ? "is-running" : "", running ? `运行中 · 需重建才会应用新配置` : "未运行 · 直接启动即可"));
+  copy.append(element("small", "", command));
+  const launchButton = element("button", "secondary-button", running ? "↻ 重建并启动" : "▶ 启动");
+  launchButton.type = "button";
+  launchButton.title = command;
+  launchButton.addEventListener("click", () => launchUpgradedProject(project, Boolean(running), launchButton));
+  const copyButton = element("button", "text-button copy-command-button", "复制命令");
+  copyButton.type = "button";
+  copyButton.title = command;
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      toast(`已复制：${command}`);
+    } catch {
+      toast("复制失败，请手动选择命令文本", "error");
+    }
+  });
+  row.append(copy, launchButton, copyButton);
+  return row;
+}
+
+async function launchUpgradedProject(project, running, button) {
+  if (running && !await confirmInStudio({
+    title: `确定要重建 ${project.name} 吗？`,
+    message: "重建会关闭该会话现有的 pane，正在运行的 agent 会被中断。TASK、合同和报告仍然保留。",
+    confirmLabel: "重建并启动",
+    cancelMessage: `已取消重建 ${project.name}；旧会话仍在运行`,
+  })) return false;
+  projectLaunchCache.delete(projectKey(project));
+  let state;
+  try {
+    state = await projectLaunchState(project);
+  } catch (error) {
+    toast(error.message, "error");
+    return false;
+  }
+  if (!state.validation.valid) {
+    toast(state.validation.errors[0] || `${project.name} 配置校验未通过`, "error");
+    return false;
+  }
+  // rebuild is a per-launch decision here, not a stored preference: only write
+  // it onto the payload we send, never back into the project's saved config.
+  const result = await executeQuickLaunch({ ...state.workbench, rebuild: running }, button);
+  if (result) await refreshResources({ silent: true });
+  return Boolean(result);
+}
+
+function renderUpgradeLaunch(applied) {
+  const section = $("#template-upgrade-launch");
+  const rows = $("#template-upgrade-launch-rows");
+  section.hidden = !applied?.length;
+  if (!applied?.length) return;
+  rows.replaceChildren(...applied.map(upgradeLaunchRow));
 }
 
 async function applyPendingTemplateUpgrade() {
@@ -920,7 +986,8 @@ async function applyPendingTemplateUpgrade() {
     renderAll();
     $("#template-upgrade-body").hidden = true;
     $("#template-upgrade-result").hidden = false;
-    $("#template-upgrade-result").textContent = result.message;
+    $("#template-upgrade-result").textContent = `已更新 ${result.applied.length} 个项目`;
+    renderUpgradeLaunch(result.applied);
     button.hidden = true;
     $("#close-template-upgrade").textContent = "完成";
     scheduleValidation();
