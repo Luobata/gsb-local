@@ -353,6 +353,34 @@ function defaultWorkbench(workspace, projectName, directory, profile, promptTemp
   });
 }
 
+// run-agent routes a bare command name (and claude:*) to the Claude adapter,
+// which passes the model straight to `claude --model`. A model belonging to
+// another agent family is therefore a launch that dies as soon as the pane
+// starts — warn, don't block: unlisted-but-valid model names are legitimate.
+function agentFamily(agent) {
+  const spec = String(agent || "").trim();
+  if (spec.startsWith("shell:")) return "shell";
+  for (const family of ["codex", "kimi", "claude"]) {
+    if (spec === family || spec.startsWith(`${family}:`)) return family;
+  }
+  return /^[A-Za-z_][A-Za-z0-9._-]*$/.test(spec) ? "claude" : "";
+}
+
+function modelFamilyWarning(role) {
+  const model = String(role?.model || "").trim();
+  if (!model) return "";
+  const family = agentFamily(role.agent);
+  if (!family || family === "shell") return "";
+  const suggestion = MODEL_SUGGESTIONS.find((entry) => entry.value === model);
+  if (!suggestion) {
+    return `角色 ${role.id} 的模型 ${model} 不在已知模型列表中；名称无效时 Pane 会在启动后立即退出`;
+  }
+  const owner = suggestion.family.toLowerCase();
+  return owner === family
+    ? ""
+    : `角色 ${role.id} 的模型 ${model} 属于 ${suggestion.family}，但 Agent ${role.agent} 走 ${family} 适配器；启动后 Pane 可能立即退出`;
+}
+
 export function validateWorkbench(input) {
   const errors = [];
   const warnings = [];
@@ -385,6 +413,10 @@ export function validateWorkbench(input) {
     else if (/^(claude|codex|kimi|shell):\s*$/.test(role.agent)) errors.push(`角色 ${role.id || index + 1} 的 Agent 冒号后必须提供命令`);
     if (role.model != null && typeof role.model !== "string") errors.push(`角色 ${role.id || index + 1} 的模型必须是文本`);
     else if (CONTROL_PATTERN.test(role.model || "")) errors.push(`角色 ${role.id || index + 1} 的模型不能包含换行或控制字符`);
+    else {
+      const modelWarning = modelFamilyWarning(role);
+      if (modelWarning) warnings.push(modelWarning);
+    }
   }
   const hubCount = (workbench.roles || []).filter((role) => role?.id === "hub").length;
   if (hubCount !== 1) errors.push("每个模板必须且只能包含一个 hub 角色");

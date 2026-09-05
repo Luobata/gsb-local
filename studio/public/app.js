@@ -903,11 +903,22 @@ function openTemplateUpgrade(plan) {
 // retype a command in a terminal.
 function upgradeLaunchRow(project) {
   const row = element("div", "upgrade-launch-row");
-  const running = sessionsForProject(project).find((session) => session.status === "running");
-  const command = `gsb-local ${running ? "--rebuild " : ""}${project.path} ${project.name}`;
+  const sessions = sessionsForProject(project);
+  const running = sessions.find((session) => session.status === "running");
+  const known = sessions.find((session) => session.name === project.name);
+  // `gsb-local open <session>` rebuilds workspace, config paths, full-access,
+  // watchdog and socket dir from durable metadata, so it is the right command
+  // for any session that already exists — including an EXITED one. The long
+  // `<path> <name>` form is only for a session that has never been created.
+  const command = running
+    ? `gsb-local --rebuild ${project.path} ${project.name}`
+    : known ? `gsb-local open ${project.name}` : `gsb-local ${project.path} ${project.name}`;
+  const state = running
+    ? "运行中 · 需重建才会应用新配置"
+    : known ? "会话已存在 · open 会用新配置重新拉起" : "尚未创建会话 · 首次启动";
   const copy = element("span");
   copy.append(element("b", "", project.name));
-  copy.append(element("small", running ? "is-running" : "", running ? `运行中 · 需重建才会应用新配置` : "未运行 · 直接启动即可"));
+  copy.append(element("small", running ? "is-running" : "", state));
   copy.append(element("small", "", command));
   const launchButton = element("button", "secondary-button", running ? "↻ 重建并启动" : "▶ 启动");
   launchButton.type = "button";
@@ -947,6 +958,15 @@ async function launchUpgradedProject(project, running, button) {
     toast(state.validation.errors[0] || `${project.name} 配置校验未通过`, "error");
     return false;
   }
+  // A model warning means the pane can die right after start, which otherwise
+  // looks exactly like "启动没反应". Say so before launching.
+  const modelWarning = (state.validation.warnings || []).find((warning) => warning.includes("模型"));
+  if (modelWarning && !await confirmInStudio({
+    title: `${project.name} 的模型配置可能导致启动后立即退出`,
+    message: `${modelWarning}\n\n仍要启动吗？会话会被创建，但 Pane 可能立刻退出为 EXITED。`,
+    confirmLabel: "仍然启动",
+    cancelMessage: `已取消启动 ${project.name}；请先修正模型配置`,
+  })) return false;
   // rebuild is a per-launch decision here, not a stored preference: only write
   // it onto the payload we send, never back into the project's saved config.
   const result = await executeQuickLaunch({ ...state.workbench, rebuild: running }, button);

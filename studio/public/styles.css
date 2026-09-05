@@ -537,6 +537,7 @@ body.has-detail-open { overflow: hidden; }
 .studio-dialog form { padding: 26px; }
 .studio-dialog h2 { margin: 7px 0 5px; font: 600 25px var(--display); }
 .studio-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 11px; }
+.confirm-dialog #confirm-dialog-message { white-space: pre-wrap; }
 .confirm-dialog { border-color: var(--warning); }
 .confirm-dialog .eyebrow { color: var(--warning); }
 .template-upgrade-dialog { width: min(860px, calc(100vw - 32px)); }

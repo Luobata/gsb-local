@@ -1237,6 +1237,23 @@ test("lazy migration restores every flat file when the final rename fails", () =
   }
 });
 
+test("model mismatches warn without blocking a launch", () => {
+  const wb = (role) => ({ workspace: os.tmpdir(), projectName: "p", session: "p", roles: [{ id: "hub", ...role }] });
+  const modelWarnings = (role) => validateWorkbench(wb(role)).warnings.filter((warning) => warning.includes("模型"));
+
+  // run-agent sends a bare command name to the Claude adapter, which passes the
+  // model to `claude --model`; a bad name kills the pane right after start, so
+  // the user sees "启动没反应" while Studio reported success.
+  const unknown = validateWorkbench(wb({ agent: "claude-glm-5.3", model: "garbage-model-xyz" }));
+  assert.equal(unknown.valid, true, "an unlisted model must never block a launch");
+  assert.match(unknown.warnings.join("\n"), /garbage-model-xyz 不在已知模型列表中/);
+
+  assert.match(modelWarnings({ agent: "claude-glm-5.3", model: "gpt-5.6-sol" }).join("\n"), /属于 Codex.*走 claude 适配器/);
+  assert.deepEqual(modelWarnings({ agent: "codex", model: "gpt-5.6-sol" }), [], "a family-matched model is silent");
+  assert.deepEqual(modelWarnings({ agent: "claude-glm-5.3", model: "" }), [], "no model means the agent default");
+  assert.deepEqual(modelWarnings({ agent: "shell:true", model: "anything" }), [], "shell agents ignore the model");
+});
+
 test("template scope validation drops project identity errors but keeps role errors", () => {
   const template = { workspace: "", session: "", roles: [{ id: "hub", agent: "" }] };
   const project = validateWorkbench(template);
