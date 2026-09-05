@@ -381,6 +381,24 @@ function modelFamilyWarning(role) {
     : `角色 ${role.id} 的模型 ${model} 属于 ${suggestion.family}，但 Agent ${role.agent} 走 ${family} 适配器；启动后 Pane 可能立即退出`;
 }
 
+// "Is there someone who writes code?" — not "is there a role literally named
+// coder". Split rosters (cep-coder/web-coder), aliases (fe/be) and renamed
+// implementers all satisfy this; only a roster with no implementer at all
+// should warn that work falls back to Hub.
+const IMPLEMENTER_BASES = new Set(["coder", "frontend", "backend", "ui"]);
+
+function isImplementerRole(role) {
+  const id = String(role?.id || "");
+  if (!id) return false;
+  const base = roleBaseAliases[id] || id;
+  if (IMPLEMENTER_BASES.has(base)) return true;
+  // A compound id such as cep-coder / web-coder / api-backend still names an
+  // implementer; match on hyphen-separated segments, never bare substrings.
+  const segments = id.split("-");
+  if (segments.some((segment) => IMPLEMENTER_BASES.has(roleBaseAliases[segment] || segment))) return true;
+  return String(role?.type || "") === "executor";
+}
+
 export function validateWorkbench(input) {
   const errors = [];
   const warnings = [];
@@ -420,7 +438,7 @@ export function validateWorkbench(input) {
   }
   const hubCount = (workbench.roles || []).filter((role) => role?.id === "hub").length;
   if (hubCount !== 1) errors.push("每个模板必须且只能包含一个 hub 角色");
-  if (!seen.has("coder")) warnings.push("没有 coder：生产实现可能重新落回 Hub");
+  if (!(workbench.roles || []).some(isImplementerRole)) warnings.push("没有实现角色（coder / frontend / backend 等）：生产实现可能重新落回 Hub");
   const hub = (workbench.roles || []).find((role) => role.id === "hub");
   if (hub && hub.agent !== "claude-glm-5.3") warnings.push("Hub 未使用当前推荐的 claude-glm-5.3");
   if (workbench.permission === "full-access") warnings.push("Full Access 会绕过内置 Agent 的常规审批与沙箱保护");
@@ -777,6 +795,73 @@ function loadUserTemplates() {
     });
 }
 
+function templateHistoryDir(slug) {
+  return path.join(configHome(), "templates", `${slug}.history`);
+}
+
+// Snapshot the version being replaced before overwriting it. Without this an
+// overwrite is unrecoverable: only the newest template is ever on disk, so a
+// mistaken save loses the previous roster for good.
+function snapshotTemplateVersion(slug, existing) {
+  if (!Number.isInteger(existing?.version)) return;
+  const file = path.join(templateHistoryDir(slug), `v${existing.version}.json`);
+  if (existsSync(file)) return;
+  try {
+    atomicWrite(file, `${JSON.stringify(existing, null, 2)}\n`);
+  } catch {
+    // History is best-effort; never block a save because a snapshot failed.
+  }
+}
+
+export function listTemplateHistory(slug) {
+  if (!PROFILE_PATTERN.test(slug || "")) return [];
+  const directory = templateHistoryDir(slug);
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => /^v\d+\.json$/.test(name))
+    .flatMap((name) => {
+      try {
+        const value = JSON.parse(readText(path.join(directory, name)));
+        return [{
+          version: Number(name.slice(1, -5)),
+          name: value.name || slug,
+          savedAt: value.savedAt || "",
+          permission: value.permission,
+          watchdog: value.watchdog,
+          roles: (value.roles || []).map((role) => ({ id: role.id, agent: role.agent, model: role.model })),
+        }];
+      } catch {
+        return [];
+      }
+    })
+    .sort((left, right) => right.version - left.version);
+}
+
+export function readTemplateVersion(slug, version) {
+  if (!PROFILE_PATTERN.test(slug || "") || !Number.isInteger(version)) throw requestError("模板版本无效");
+  const file = path.join(templateHistoryDir(slug), `v${version}.json`);
+  if (!existsSync(file)) throw requestError(`模板 ${slug} 没有 v${version} 的历史快照`);
+  try {
+    return JSON.parse(readText(file));
+  } catch {
+    throw requestError(`模板 ${slug} 的 v${version} 快照已损坏`);
+  }
+}
+
+// Restoring writes the old content forward as a NEW version rather than moving
+// the counter backwards: projects record templateOrigin.version, so a reused
+// number would make two different rosters share one version.
+export function restoreTemplateVersion(slug, version) {
+  const snapshot = readTemplateVersion(slug, version);
+  const saved = saveTemplate(snapshot.name, {
+    ...snapshot,
+    workspace: "",
+    session: "template-restore",
+    roles: snapshot.roles || [],
+  }, slug);
+  return { ...saved, restoredFrom: version };
+}
+
 function saveTemplate(name, workbench, preferredId = "") {
   const normalizedName = normalizeTemplateName(name);
   const slug = preferredId && PROFILE_PATTERN.test(preferredId) ? preferredId : templateSlug(normalizedName);
@@ -805,6 +890,7 @@ function saveTemplate(name, workbench, preferredId = "") {
       throw error;
     }
   }
+  snapshotTemplateVersion(slug, existing);
   atomicWrite(file, `${JSON.stringify(template, null, 2)}\n`);
   return { id: slug, ...template };
 }
@@ -1462,6 +1548,27 @@ export function createStudioServer({ project, token, platform = process.platform
       if (request.method === "POST" && url.pathname === "/api/template-upgrade") {
         const body = await readJson(request);
         jsonResponse(response, 200, applyTemplateUpgrade(body.templateId, body.projects));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/template-history") {
+        const slug = url.searchParams.get("id") || "";
+        if (!PROFILE_PATTERN.test(slug)) throw requestError("模板 ID 无效");
+        jsonResponse(response, 200, { id: slug, history: listTemplateHistory(slug) });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/template-restore") {
+        const body = await readJson(request);
+        const template = restoreTemplateVersion(body.id, body.version);
+        const projects = projectsUsingTemplate(template.id);
+        jsonResponse(response, 200, {
+          template,
+          templates: loadUserTemplates(),
+          upgradePlan: projects.length ? {
+            template: { id: template.id, name: template.name, fromVersion: template.version - 1, toVersion: template.version },
+            projects,
+            diff: templateDiff(readTemplateVersion(template.id, template.version - 1), template),
+          } : null,
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/pick-directory") {

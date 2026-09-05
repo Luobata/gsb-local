@@ -1237,6 +1237,69 @@ test("lazy migration restores every flat file when the final rename fails", () =
   }
 });
 
+test("the implementer warning accepts split and renamed coder roles", () => {
+  const wb = (ids) => ({ workspace: os.tmpdir(), projectName: "p", session: "p",
+    roles: ids.map((id) => (typeof id === "string" ? { id, agent: "shell:true" } : { agent: "shell:true", ...id })) });
+  const warns = (ids) => validateWorkbench(wb(ids)).warnings.some((warning) => warning.includes("实现角色"));
+
+  // A roster that clearly implements must not be told it has no implementer:
+  // demanding the literal id "coder" false-alarmed on every split roster.
+  assert.equal(warns(["hub", "coder"]), false);
+  assert.equal(warns(["hub", "cep-coder", "web-coder"]), false, "split coder roles still implement");
+  assert.equal(warns(["hub", "frontend", "backend"]), false);
+  assert.equal(warns(["hub", "fe", "be"]), false, "aliases resolve to their base role");
+  assert.equal(warns(["hub", { id: "builder", type: "executor" }]), false, "an executor is an implementer");
+
+  // Rosters with genuinely no implementer keep the warning.
+  assert.equal(warns(["hub"]), true);
+  assert.equal(warns(["hub", "audit", "plan"]), true);
+  assert.equal(warns(["hub", "docs", "test"]), true);
+});
+
+test("template overwrite snapshots the replaced version and restore moves forward", async (t) => {
+  const configHome = mkdtempSync(path.join(os.tmpdir(), "gsb-template-history-"));
+  const previous = process.env.GSB_STUDIO_CONFIG_HOME;
+  process.env.GSB_STUDIO_CONFIG_HOME = configHome;
+  t.after(() => {
+    if (previous === undefined) delete process.env.GSB_STUDIO_CONFIG_HOME;
+    else process.env.GSB_STUDIO_CONFIG_HOME = previous;
+    rmSync(configHome, { recursive: true, force: true });
+  });
+  const { createStudioServer } = await import("./server.mjs");
+  const token = "history-token";
+  const server = createStudioServer({ project: "", token, validator: { validate: async (wb) => validateWorkbench(wb), checkCommands: async () => ({}) } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const call = (route, body) => fetch(`${base}${route}`, {
+    method: body ? "POST" : "GET",
+    headers: { "x-gsb-token": token, "content-type": "application/json" },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const workbench = (roles) => ({ workspace: os.tmpdir(), projectName: "p", session: "p", permission: "balanced", watchdog: true,
+    roles: roles.map((id) => ({ id, name: id, type: id === "hub" ? "orchestrator" : "executor", agent: "shell:true", model: "" })) });
+
+  const first = await (await call("/api/templates", { name: "history-demo", workbench: workbench(["hub", "coder"]) })).json();
+  assert.equal(first.template.version, 1);
+  const id = first.template.id;
+  assert.deepEqual((await (await call(`/api/template-history?id=${id}`)).json()).history, [], "nothing is replaced yet");
+
+  const second = await (await call("/api/templates", { id, name: "history-demo", workbench: workbench(["hub", "web-coder"]) })).json();
+  assert.equal(second.template.version, 2);
+  const history = (await (await call(`/api/template-history?id=${id}`)).json()).history;
+  assert.deepEqual(history.map((entry) => entry.version), [1], "the replaced version is snapshotted");
+  assert.deepEqual(history[0].roles.map((role) => role.id), ["hub", "coder"]);
+
+  // Restoring v1 must not reuse version 1: projects pin templateOrigin.version,
+  // so one number must never describe two different rosters.
+  const restored = await (await call("/api/template-restore", { id, version: 1 })).json();
+  assert.equal(restored.template.version, 3);
+  assert.equal(restored.template.restoredFrom, 1);
+  assert.deepEqual(restored.template.roles.map((role) => role.id), ["hub", "coder"]);
+  assert.deepEqual((await (await call(`/api/template-history?id=${id}`)).json()).history.map((entry) => entry.version), [2, 1],
+    "the roster replaced by the restore is itself recoverable");
+});
+
 test("model mismatches warn without blocking a launch", () => {
   const wb = (role) => ({ workspace: os.tmpdir(), projectName: "p", session: "p", roles: [{ id: "hub", ...role }] });
   const modelWarnings = (role) => validateWorkbench(wb(role)).warnings.filter((warning) => warning.includes("模型"));

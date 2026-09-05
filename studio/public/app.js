@@ -767,6 +767,67 @@ async function saveTemplateEdits() {
   }
 }
 
+// Template history: every overwrite snapshots the replaced version, so a bad
+// save is recoverable. Restoring writes the old content forward as a new
+// version — never rewinds the counter, because projects pin templateOrigin.
+async function openTemplateHistory(template) {
+  const list = $("#template-history-list");
+  $("#template-history-title").textContent = `「${template.name}」历史版本`;
+  list.replaceChildren(element("p", "resource-note", "正在读取历史快照…"));
+  const dialog = $("#template-history-dialog");
+  if (!dialog.open) dialog.showModal();
+  let history;
+  try {
+    history = (await api(`/api/template-history?id=${encodeURIComponent(template.id)}`)).history;
+  } catch (error) {
+    list.replaceChildren(element("p", "resource-note", `读取失败：${error.message}`));
+    return;
+  }
+  if (!history.length) {
+    list.replaceChildren(element("p", "resource-note", "还没有历史快照；下次保存该模板时会自动记录当前版本。"));
+    return;
+  }
+  list.replaceChildren(...history.map((entry) => {
+    const row = element("label", "upgrade-project");
+    const copy = element("span");
+    copy.append(element("b", "", `v${entry.version} · ${entry.roles.map((role) => role.id).join(", ") || "无角色"}`));
+    copy.append(element("small", "", `${(entry.savedAt || "").slice(0, 19).replace("T", " ")} · ${entry.permission || "balanced"} · watchdog ${entry.watchdog === false ? "off" : "on"}`));
+    const restore = element("button", "secondary-button", `回退到 v${entry.version}`);
+    restore.type = "button";
+    restore.addEventListener("click", () => restoreTemplateVersion(template, entry, restore));
+    row.append(copy, restore);
+    return row;
+  }));
+}
+
+async function restoreTemplateVersion(template, entry, button) {
+  if (!await confirmInStudio({
+    title: `确定要回退「${template.name}」到 v${entry.version} 吗？`,
+    message: `当前 v${template.version} 会先存入历史，然后 v${entry.version} 的内容写为新版本 v${template.version + 1}。\n角色：${entry.roles.map((role) => role.id).join(", ") || "无"}`,
+    confirmLabel: `回退到 v${entry.version}`,
+    cancelMessage: "已取消回退",
+  })) return false;
+  button.disabled = true;
+  try {
+    const result = await api("/api/template-restore", {
+      method: "POST",
+      body: JSON.stringify({ id: template.id, version: entry.version }),
+    });
+    bootstrap.userTemplates = result.templates;
+    $("#template-history-dialog").close();
+    renderTemplateLanding();
+    renderProfiles();
+    toast(`已回退到 v${entry.version}，保存为 v${result.template.version}`);
+    if (!openTemplateUpgrade(result.upgradePlan)) toast("没有项目使用该模板，无需同步");
+    return true;
+  } catch (error) {
+    toast(error.message, "error");
+    return false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function templateLandingEntry(template) {
   const entry = element("div", "project-launch-row");
   const main = element("button", "resource-item project-resource landing-project-resource");
@@ -786,7 +847,11 @@ function templateLandingEntry(template) {
   editButton.type = "button";
   editButton.title = `编辑模板 ${template.name}，保存后可同步关联项目`;
   editButton.addEventListener("click", () => editTemplate(template));
-  actions.append(editButton);
+  const historyButton = element("button", "text-button copy-command-button", "历史版本");
+  historyButton.type = "button";
+  historyButton.title = `查看并回退 ${template.name} 的历史版本`;
+  historyButton.addEventListener("click", () => openTemplateHistory(template));
+  actions.append(editButton, historyButton);
   entry.append(main, actions);
   return entry;
 }
