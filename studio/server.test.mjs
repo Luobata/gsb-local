@@ -1237,6 +1237,48 @@ test("lazy migration restores every flat file when the final rename fails", () =
   }
 });
 
+test("a project can reclaim its own session name after its config is deleted", async (t) => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-ws-"));
+  const stateHome = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-state-"));
+  const configHome = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-config-"));
+  const previous = { state: process.env.GSB_STUDIO_STATE_HOME, config: process.env.GSB_STUDIO_CONFIG_HOME };
+  process.env.GSB_STUDIO_STATE_HOME = stateHome;
+  process.env.GSB_STUDIO_CONFIG_HOME = configHome;
+  t.after(() => {
+    if (previous.state === undefined) delete process.env.GSB_STUDIO_STATE_HOME;
+    else process.env.GSB_STUDIO_STATE_HOME = previous.state;
+    if (previous.config === undefined) delete process.env.GSB_STUDIO_CONFIG_HOME;
+    else process.env.GSB_STUDIO_CONFIG_HOME = previous.config;
+    [workspace, stateHome, configHome].forEach((dir) => rmSync(dir, { recursive: true, force: true }));
+  });
+
+  // .gsb-local/ is gitignored, so `git clean -xdf` wipes a project's config
+  // while its session state survives. The name is still this project's own.
+  const name = "reclaim-me";
+  mkdirSync(path.join(stateHome, name), { recursive: true });
+  writeFileSync(path.join(stateHome, name, "session.json"), JSON.stringify({ session: name, workspace }));
+
+  const token = "reclaim-token";
+  const server = createStudioServer({ project: "", token, validator: { validate: async (wb) => validateWorkbench(wb), checkCommands: async () => ({}) } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const open = (ws) => fetch(`http://127.0.0.1:${server.address().port}/api/project`, {
+    method: "POST",
+    headers: { "x-gsb-token": token, "content-type": "application/json" },
+    body: JSON.stringify({ workspace: ws, name }),
+  });
+
+  const own = await open(workspace);
+  assert.equal(own.status, 200, `a project must be able to reopen its own session name: ${JSON.stringify(await own.json())}`);
+
+  // A different workspace claiming the same session name is still a conflict.
+  const other = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-other-"));
+  t.after(() => rmSync(other, { recursive: true, force: true }));
+  const stolen = await open(other);
+  assert.equal(stolen.status, 400);
+  assert.match((await stolen.json()).error, /重名|已被/);
+});
+
 test("the implementer warning accepts split and renamed coder roles", () => {
   const wb = (ids) => ({ workspace: os.tmpdir(), projectName: "p", session: "p",
     roles: ids.map((id) => (typeof id === "string" ? { id, agent: "shell:true" } : { agent: "shell:true", ...id })) });

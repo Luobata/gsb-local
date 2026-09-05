@@ -739,6 +739,25 @@ function rememberProject(projectPath, name) {
   atomicWrite(recentProjectsFile(), `${JSON.stringify(next, null, 2)}\n`);
 }
 
+// A state directory alone does not prove the name belongs to someone else:
+// sessions record the workspace they were created for. Reading it lets a
+// project reclaim its own session name after its .gsb-local was deleted
+// (gitignored, so `git clean -xdf` removes it) — otherwise the project could
+// never be reconfigured under the name it already owns.
+function sessionWorkspace(name) {
+  const directory = path.join(stateRoot(), name);
+  if (!existsSync(directory)) return null;
+  try {
+    const metadata = JSON.parse(readText(path.join(directory, "session.json")));
+    if (typeof metadata?.workspace === "string" && metadata.workspace) return metadata.workspace;
+  } catch { /* fall through to the roster/task markers below */ }
+  for (const file of ["ROLES.md", "TASK.md"]) {
+    const marker = readText(path.join(directory, file)).match(/^Workspace:\s*(.+)$/m)?.[1]?.trim();
+    if (marker) return marker;
+  }
+  return "";
+}
+
 function projectNameConflict(workspace, name, { creating = false } = {}) {
   if (typeof workspace !== "string" || !path.isAbsolute(workspace) || !SESSION_PATTERN.test(name || "")) return "";
   const sameProject = listStoredProjects(workspace).some((project) => project.name === name);
@@ -751,7 +770,16 @@ function projectNameConflict(workspace, name, { creating = false } = {}) {
   }
   const duplicate = known.find((project) => project.name === name && project.path !== workspace);
   if (duplicate) return `项目名 ${name} 已被 ${duplicate.path} 使用；项目名必须全局唯一`;
-  if (!sameProject && existsSync(path.join(stateRoot(), name))) return `项目名 ${name} 与现存会话重名；请更换项目名`;
+  if (!sameProject) {
+    const owner = sessionWorkspace(name);
+    // An unreadable session ("") keeps the old conservative rejection; one that
+    // names this very workspace is this project's own session, not a clash.
+    if (owner !== null && owner !== workspace) {
+      return owner
+        ? `项目名 ${name} 与 ${owner} 的现存会话重名；请更换项目名`
+        : `项目名 ${name} 与现存会话重名；请更换项目名`;
+    }
+  }
   return "";
 }
 
