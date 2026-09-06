@@ -1237,6 +1237,53 @@ test("lazy migration restores every flat file when the final rename fails", () =
   }
 });
 
+test("a trailing slash never forks one project into two identities", async (t) => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "gsb-slash-"));
+  const workspace = path.join(parent, "tt");
+  mkdirSync(workspace);
+  const stateHome = mkdtempSync(path.join(os.tmpdir(), "gsb-slash-state-"));
+  const configHome = mkdtempSync(path.join(os.tmpdir(), "gsb-slash-config-"));
+  const previous = { state: process.env.GSB_STUDIO_STATE_HOME, config: process.env.GSB_STUDIO_CONFIG_HOME };
+  process.env.GSB_STUDIO_STATE_HOME = stateHome;
+  process.env.GSB_STUDIO_CONFIG_HOME = configHome;
+  t.after(() => {
+    if (previous.state === undefined) delete process.env.GSB_STUDIO_STATE_HOME;
+    else process.env.GSB_STUDIO_STATE_HOME = previous.state;
+    if (previous.config === undefined) delete process.env.GSB_STUDIO_CONFIG_HOME;
+    else process.env.GSB_STUDIO_CONFIG_HOME = previous.config;
+    [parent, stateHome, configHome].forEach((dir) => rmSync(dir, { recursive: true, force: true }));
+  });
+
+  // The session records the directory without a trailing slash; recent-projects
+  // may hold it with one. Both must resolve to the same project, or the editor
+  // silently swaps projects and then locks this one out of its own name.
+  const name = "tt-doc";
+  mkdirSync(path.join(stateHome, name), { recursive: true });
+  writeFileSync(path.join(stateHome, name, "session.json"), JSON.stringify({ session: name, workspace }));
+
+  const token = "slash-token";
+  const server = createStudioServer({ project: "", token, validator: { validate: async (wb) => validateWorkbench(wb), checkCommands: async () => ({}) } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const open = (ws) => fetch(`http://127.0.0.1:${server.address().port}/api/project`, {
+    method: "POST",
+    headers: { "x-gsb-token": token, "content-type": "application/json" },
+    body: JSON.stringify({ workspace: ws, name, remember: false }),
+  });
+
+  for (const requested of [workspace, `${workspace}/`, `${workspace}//`, path.join(workspace, ".", "")]) {
+    const response = await open(requested);
+    const payload = await response.json();
+    assert.equal(response.status, 200, `${JSON.stringify(requested)} must open: ${JSON.stringify(payload)}`);
+    assert.equal(payload.workbench.workspace, workspace, "the stored path is canonical regardless of how it was typed");
+  }
+
+  const other = path.join(parent, "other");
+  mkdirSync(other);
+  const stolen = await open(other);
+  assert.equal(stolen.status, 400, "a genuinely different directory still conflicts");
+});
+
 test("a project can reclaim its own session name after its config is deleted", async (t) => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-ws-"));
   const stateHome = mkdtempSync(path.join(os.tmpdir(), "gsb-reclaim-state-"));

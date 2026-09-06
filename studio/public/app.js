@@ -57,9 +57,22 @@ let landingNameTimer = null;
 let pendingTemplateUpgrade = null;
 let templateEditMode = null;
 
+// A project's identity is (path, name), so the path has to be compared in a
+// canonical form. "/a/tt" and "/a/tt/" are the same directory; treating them
+// as different keys makes the editor believe it is on another project and
+// silently swap which one you are configuring.
+function canonicalPath(value) {
+  const raw = String(value || "").trim();
+  if (raw.length > 1 && raw.endsWith("/")) return raw.replace(/\/+$/, "");
+  return raw;
+}
+
 function projectRef(value) {
-  if (typeof value === "string") return { path: value, name: value.split("/").filter(Boolean).at(-1) || value };
-  return { path: value?.path || "", name: value?.name || "" };
+  if (typeof value === "string") {
+    const projectPath = canonicalPath(value);
+    return { path: projectPath, name: projectPath.split("/").filter(Boolean).at(-1) || projectPath };
+  }
+  return { path: canonicalPath(value?.path), name: value?.name || "" };
 }
 
 function projectKey(value) {

@@ -650,7 +650,10 @@ export function createRuntimeValidator({
     }
     if (SESSION_PATTERN.test(workbench?.session || "")) {
       const existing = (await listSessionOptionsImpl()).find((session) => session.name === workbench.session);
-      if (existing?.workspace && existing.workspace !== workbench.workspace) {
+      // Compare canonical paths: the session records the directory it was
+      // created for, and a trailing slash on either side must not make a
+      // project look like a stranger to its own session.
+      if (existing?.workspace && canonicalWorkspace(existing.workspace) !== canonicalWorkspace(workbench.workspace)) {
         result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
       } else if (existing?.status === "running" && !workbench.rebuild) {
         result.warnings.push(`会话 ${workbench.session} 已在运行；当前配置不会覆盖它。请勾选「重建同名会话」或更换会话名称`);
@@ -704,9 +707,26 @@ function recentProjectsFile() {
   return path.join(configHome(), "recent-projects.json");
 }
 
+// Every workspace path must be canonical before it is compared or stored.
+// "/a/tt" and "/a/tt/" name the same directory but differ as strings, and the
+// path IS half of a project's identity (projectKey, session ownership checks,
+// recent-projects lookups), so an un-normalized slash makes one project look
+// like two — silently switching the edited project and locking it out of its
+// own session name.
+//
+// Deliberately path.resolve only, never realpathSync: resolving symlinks would
+// rewrite the path the user chose (on macOS /var -> /private/var, and this repo
+// is itself reached through a compat symlink), which would break existing
+// session metadata and recent-projects entries instead of matching them.
+function canonicalWorkspace(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  return path.resolve(value.trim());
+}
+
 function normalizedProjectRef(value) {
-  const projectPath = typeof value === "string" ? value : value?.path;
-  if (typeof projectPath !== "string" || !path.isAbsolute(projectPath) || !existsSync(projectPath)) return null;
+  const rawPath = typeof value === "string" ? value : value?.path;
+  const projectPath = canonicalWorkspace(rawPath);
+  if (!projectPath || !path.isAbsolute(projectPath) || !existsSync(projectPath)) return null;
   const requestedName = typeof value === "object" ? value?.name : path.basename(projectPath);
   const name = SESSION_PATTERN.test(requestedName || "") ? requestedName : defaultSession(projectPath);
   return { path: projectPath, name };
@@ -758,8 +778,9 @@ function sessionWorkspace(name) {
   return "";
 }
 
-function projectNameConflict(workspace, name, { creating = false } = {}) {
-  if (typeof workspace !== "string" || !path.isAbsolute(workspace) || !SESSION_PATTERN.test(name || "")) return "";
+function projectNameConflict(rawWorkspace, name, { creating = false } = {}) {
+  const workspace = canonicalWorkspace(rawWorkspace);
+  if (!workspace || !path.isAbsolute(workspace) || !SESSION_PATTERN.test(name || "")) return "";
   const sameProject = listStoredProjects(workspace).some((project) => project.name === name);
   if (creating && sameProject) return `项目名 ${name} 已在该目录中使用`;
   const known = [];
@@ -768,13 +789,13 @@ function projectNameConflict(workspace, name, { creating = false } = {}) {
     const stored = listStoredProjects(projectPath);
     known.push(...(stored.length ? stored : loadRecentProjects().filter((project) => project.path === projectPath)));
   }
-  const duplicate = known.find((project) => project.name === name && project.path !== workspace);
+  const duplicate = known.find((project) => project.name === name && canonicalWorkspace(project.path) !== workspace);
   if (duplicate) return `项目名 ${name} 已被 ${duplicate.path} 使用；项目名必须全局唯一`;
   if (!sameProject) {
     const owner = sessionWorkspace(name);
     // An unreadable session ("") keeps the old conservative rejection; one that
     // names this very workspace is this project's own session, not a clash.
-    if (owner !== null && owner !== workspace) {
+    if (owner !== null && canonicalWorkspace(owner) !== workspace) {
       return owner
         ? `项目名 ${name} 与 ${owner} 的现存会话重名；请更换项目名`
         : `项目名 ${name} 与现存会话重名；请更换项目名`;
@@ -1340,8 +1361,11 @@ function requestError(message) {
   return error;
 }
 
-async function projectWorkbench(workspace, name = "", { remember = true, create = false } = {}) {
-  if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw requestError("项目路径必须是绝对路径");
+async function projectWorkbench(rawWorkspace, name = "", { remember = true, create = false } = {}) {
+  if (typeof rawWorkspace !== "string" || !path.isAbsolute(rawWorkspace)) throw requestError("项目路径必须是绝对路径");
+  // Canonicalize before anything compares or stores this path, so a trailing
+  // slash cannot fork one project into two identities.
+  const workspace = canonicalWorkspace(rawWorkspace);
   if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw requestError("项目路径不存在或不是目录");
   if (name && !SESSION_PATTERN.test(name)) throw requestError("项目名只能包含字母、数字、点、下划线和连字符");
   if (create && !name) throw requestError("新建项目必须填写项目名");
