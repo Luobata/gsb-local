@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -1235,6 +1235,106 @@ test("lazy migration restores every flat file when the final rename fails", () =
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test("an orphaned session record cannot hold a project name hostage", async (t) => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "gsb-orphan-"));
+  const stateHome = path.join(parent, "state");
+  const configHome = path.join(parent, "config");
+  const mine = path.join(parent, "mine");
+  const realOther = path.join(parent, "real-other");
+  [stateHome, configHome, mine, realOther].forEach((dir) => mkdirSync(dir, { recursive: true }));
+  const previous = { state: process.env.GSB_STUDIO_STATE_HOME, config: process.env.GSB_STUDIO_CONFIG_HOME };
+  process.env.GSB_STUDIO_STATE_HOME = stateHome;
+  process.env.GSB_STUDIO_CONFIG_HOME = configHome;
+  t.after(() => {
+    if (previous.state === undefined) delete process.env.GSB_STUDIO_STATE_HOME;
+    else process.env.GSB_STUDIO_STATE_HOME = previous.state;
+    if (previous.config === undefined) delete process.env.GSB_STUDIO_CONFIG_HOME;
+    else process.env.GSB_STUDIO_CONFIG_HOME = previous.config;
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  // Session state outlives the project directory. If a record pointing at a
+  // deleted directory keeps blocking its name, nothing inside Studio can
+  // release it — the name is lost forever.
+  const writeSession = (name, workspace) => {
+    mkdirSync(path.join(stateHome, name), { recursive: true });
+    writeFileSync(path.join(stateHome, name, "session.json"), JSON.stringify({ session: name, workspace }));
+  };
+  writeSession("orphan", path.join(parent, "deleted-long-ago"));
+  writeSession("taken", realOther);
+
+  const token = "orphan-token";
+  const server = createStudioServer({ project: "", token, validator: { validate: async (wb) => validateWorkbench(wb), checkCommands: async () => ({}) } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const open = (name) => fetch(`http://127.0.0.1:${server.address().port}/api/project`, {
+    method: "POST",
+    headers: { "x-gsb-token": token, "content-type": "application/json" },
+    body: JSON.stringify({ workspace: mine, name, remember: false }),
+  });
+
+  const reclaimed = await open("orphan");
+  assert.equal(reclaimed.status, 200, `an orphaned name must be reclaimable: ${JSON.stringify(await reclaimed.json())}`);
+
+  const blocked = await open("taken");
+  assert.equal(blocked.status, 400, "a session whose workspace still exists keeps its name");
+  assert.match((await blocked.json()).error, /重名/);
+
+  // One directory reachable through a symlink is still ONE project. Sessions on
+  // disk may record either spelling (this repo is reachable as both
+  // ~/luobata/gsb-local and the older ~/Documents/gpt/gsb-local), so ownership
+  // must resolve links or the project is locked out of its own session.
+  const linked = path.join(parent, "linked");
+  symlinkSync(mine, linked);
+  writeSession("via-link", linked);
+  const throughLink = await open("via-link");
+  assert.equal(throughLink.status, 200,
+    `a session recorded through a symlink to this workspace is its own: ${JSON.stringify(await throughLink.json())}`);
+});
+
+test("unconfigured projects are never remembered as landing rows", async (t) => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "gsb-phantom-"));
+  const workspace = path.join(parent, "tt");
+  mkdirSync(workspace);
+  const configHome = mkdtempSync(path.join(os.tmpdir(), "gsb-phantom-config-"));
+  const stateHome = mkdtempSync(path.join(os.tmpdir(), "gsb-phantom-state-"));
+  const previous = { config: process.env.GSB_STUDIO_CONFIG_HOME, state: process.env.GSB_STUDIO_STATE_HOME };
+  process.env.GSB_STUDIO_CONFIG_HOME = configHome;
+  process.env.GSB_STUDIO_STATE_HOME = stateHome;
+  t.after(() => {
+    if (previous.config === undefined) delete process.env.GSB_STUDIO_CONFIG_HOME;
+    else process.env.GSB_STUDIO_CONFIG_HOME = previous.config;
+    if (previous.state === undefined) delete process.env.GSB_STUDIO_STATE_HOME;
+    else process.env.GSB_STUDIO_STATE_HOME = previous.state;
+    [parent, configHome, stateHome].forEach((dir) => rmSync(dir, { recursive: true, force: true }));
+  });
+
+  saveProjectState({ ...fixture(workspace), projectName: "tt-doc", session: "tt-doc" });
+
+  const token = "phantom-token";
+  const server = createStudioServer({ project: "", token, validator: { validate: async (wb) => validateWorkbench(wb), checkCommands: async () => ({}) } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { "x-gsb-token": token, "content-type": "application/json" };
+
+  // Opening a name nothing is stored for returns default roles. Remembering it
+  // would put a row on the landing page that silently loads defaults under a
+  // name no config exists for — indistinguishable from "the project switched".
+  const phantom = await fetch(`${base}/api/project`, { method: "POST", headers, body: JSON.stringify({ workspace, name: "tt" }) });
+  assert.equal(phantom.status, 200);
+  const recentAfterPhantom = (await (await fetch(`${base}/api/bootstrap`, { headers })).json()).recentProjects;
+  assert.deepEqual(recentAfterPhantom.filter((project) => project.name === "tt"), [], "an unconfigured name must not be remembered");
+
+  // A configured project is remembered, and bootstrap prunes entries whose
+  // configuration has since disappeared.
+  await fetch(`${base}/api/project`, { method: "POST", headers, body: JSON.stringify({ workspace, name: "tt-doc" }) });
+  assert.ok((await (await fetch(`${base}/api/bootstrap`, { headers })).json()).recentProjects.some((project) => project.name === "tt-doc"));
+  rmSync(path.join(workspace, ".gsb-local"), { recursive: true, force: true });
+  const pruned = (await (await fetch(`${base}/api/bootstrap`, { headers })).json()).recentProjects;
+  assert.deepEqual(pruned.filter((project) => project.name === "tt-doc"), [], "a project whose config vanished is pruned");
 });
 
 test("a trailing slash never forks one project into two identities", async (t) => {

@@ -652,8 +652,12 @@ export function createRuntimeValidator({
       const existing = (await listSessionOptionsImpl()).find((session) => session.name === workbench.session);
       // Compare canonical paths: the session records the directory it was
       // created for, and a trailing slash on either side must not make a
-      // project look like a stranger to its own session.
-      if (existing?.workspace && canonicalWorkspace(existing.workspace) !== canonicalWorkspace(workbench.workspace)) {
+      // project look like a stranger to its own session. A session whose
+      // workspace no longer exists is an orphan and must not block the name.
+      const foreign = existing?.workspace
+        && !sameDirectory(existing.workspace, workbench.workspace)
+        && existsSync(existing.workspace);
+      if (foreign) {
         result.errors.push(`会话 ${workbench.session} 属于另一项目 ${existing.workspace}；请更换会话名称，或用 gsb-local open ${workbench.session} 打开原会话`);
       } else if (existing?.status === "running" && !workbench.rebuild) {
         result.warnings.push(`会话 ${workbench.session} 已在运行；当前配置不会覆盖它。请勾选「重建同名会话」或更换会话名称`);
@@ -723,6 +727,24 @@ function canonicalWorkspace(value) {
   return path.resolve(value.trim());
 }
 
+// For COMPARISON only: two paths may reach one directory through a symlink
+// (this repo is reachable as both ~/luobata/gsb-local and the older
+// ~/Documents/gpt/gsb-local). Sessions on disk may record either spelling, so
+// ownership checks must resolve links or a project gets locked out of its own
+// session. Never use this to STORE a path — rewriting the user's chosen
+// spelling is what broke three tests when canonicalWorkspace resolved links.
+function sameDirectory(left, right) {
+  const a = canonicalWorkspace(left);
+  const b = canonicalWorkspace(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
 function normalizedProjectRef(value) {
   const rawPath = typeof value === "string" ? value : value?.path;
   const projectPath = canonicalWorkspace(rawPath);
@@ -755,8 +777,23 @@ function loadRecentProjects() {
 function rememberProject(projectPath, name) {
   const project = normalizedProjectRef({ path: projectPath, name });
   if (!project) return;
+  // Only remember a project that actually exists on disk. Remembering an
+  // unconfigured name creates a phantom row on the landing page: clicking it
+  // silently loads default roles under a name nothing is stored for, which
+  // looks exactly like "the project switched on me".
+  const configured = listStoredProjects(project.path).some((stored) => stored.name === project.name);
+  if (!configured) return;
   const next = [project, ...loadRecentProjects().filter((item) => projectKey(item) !== projectKey(project))].slice(0, 12);
   atomicWrite(recentProjectsFile(), `${JSON.stringify(next, null, 2)}\n`);
+}
+
+// Drop remembered projects whose configuration no longer exists, so a stale
+// entry cannot keep offering a project that cannot be loaded.
+function pruneRecentProjects() {
+  const recent = loadRecentProjects();
+  const live = recent.filter((project) => listStoredProjects(project.path).some((stored) => stored.name === project.name));
+  if (live.length !== recent.length) atomicWrite(recentProjectsFile(), `${JSON.stringify(live, null, 2)}\n`);
+  return live;
 }
 
 // A state directory alone does not prove the name belongs to someone else:
@@ -789,13 +826,15 @@ function projectNameConflict(rawWorkspace, name, { creating = false } = {}) {
     const stored = listStoredProjects(projectPath);
     known.push(...(stored.length ? stored : loadRecentProjects().filter((project) => project.path === projectPath)));
   }
-  const duplicate = known.find((project) => project.name === name && canonicalWorkspace(project.path) !== workspace);
+  const duplicate = known.find((project) => project.name === name && !sameDirectory(project.path, workspace));
   if (duplicate) return `项目名 ${name} 已被 ${duplicate.path} 使用；项目名必须全局唯一`;
   if (!sameProject) {
     const owner = sessionWorkspace(name);
     // An unreadable session ("") keeps the old conservative rejection; one that
     // names this very workspace is this project's own session, not a clash.
-    if (owner !== null && canonicalWorkspace(owner) !== workspace) {
+    // A session whose workspace no longer exists is an orphan record — holding
+    // the name hostage would be unfixable from Studio, so let it be reclaimed.
+    if (owner !== null && !sameDirectory(owner, workspace) && (!owner || existsSync(owner))) {
       return owner
         ? `项目名 ${name} 与 ${owner} 的现存会话重名；请更换项目名`
         : `项目名 ${name} 与现存会话重名；请更换项目名`;
@@ -1332,7 +1371,7 @@ async function bootstrap(project) {
   const prompts = loadPromptTemplates();
   const userTemplates = loadUserTemplates().map((template) => ({ ...template, ...normalizeWorkbench(template) }));
   const sessionOptions = await listSessionOptions();
-  const recent = loadRecentProjects();
+  const recent = pruneRecentProjects();
   const stored = project ? listStoredProjects(project) : [];
   const selected = project ? (recent.find((item) => item.path === project && stored.some((candidate) => candidate.name === item.name))
     || stored[0]
