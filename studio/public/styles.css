@@ -199,6 +199,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-quick-launch, .project-quick-edit { width: 100%; padding-inline: 8px; font-size: 11px; }
 .project-quick-actions .terminal-open-button { width: 100%; }
 .project-quick-status { overflow: hidden; color: var(--faint); font-size: 10px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.quick-open-command { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 6px 7px; border: 1px solid var(--signal-dim); background: rgba(120,155,37,.07); }
+.quick-open-command code { overflow-wrap: anywhere; color: var(--signal); font: 10px/1.45 var(--mono); user-select: all; }
+.quick-open-command .copy-command-button { min-height: 26px; padding-inline: 7px; font-size: 10px; }
 .shell.is-project-only { grid-template-columns: 1fr; }
 .shell.is-project-only .workspace { width: min(920px, 100%); margin: 0 auto; padding: clamp(28px, 5vh, 48px) clamp(18px, 4vw, 42px) 38px; border-right: 0; }
 .shell.is-project-only .landing-head { margin-bottom: 24px; }
@@ -557,6 +560,7 @@ body.has-detail-open { overflow: hidden; }
 .upgrade-launch-rows { display: grid; border: 1px solid var(--line); }
 .upgrade-launch-row { padding: 11px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; }
 .upgrade-launch-row + .upgrade-launch-row { border-top: 1px solid var(--line); }
+.upgrade-launch-row .quick-open-command { grid-column: 1 / -1; margin-top: 4px; }
 .upgrade-launch-row > span { min-width: 0; display: grid; gap: 3px; }
 .upgrade-launch-row b { color: var(--ink); font: 10px var(--mono); }
 .upgrade-launch-row small { overflow-wrap: anywhere; color: var(--faint); font: 9px/1.45 var(--mono); }

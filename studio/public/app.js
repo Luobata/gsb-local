@@ -1048,7 +1048,12 @@ async function launchUpgradedProject(project, running, button) {
   // rebuild is a per-launch decision here, not a stored preference: only write
   // it onto the payload we send, never back into the project's saved config.
   const result = await executeQuickLaunch({ ...state.workbench, rebuild: running }, button);
-  if (result) await refreshResources({ silent: true });
+  if (result) {
+    // Show how to attach to what was just started, in the row that started it.
+    renderOpenCommand(button.closest(".upgrade-launch-row") || button.parentElement,
+      state.workbench.session, result.openCommand);
+    await refreshResources({ silent: true });
+  }
   return Boolean(result);
 }
 
@@ -1384,6 +1389,33 @@ async function confirmFullAccessLaunch(target) {
   });
 }
 
+// After a quick launch the session exists but nothing is attached to it, so the
+// one thing the user needs next is the attach command. The status line is a
+// single ellipsised row, so render the command as its own selectable block with
+// a copy button instead of truncating it into "已启动 · gsb-local open …".
+function renderOpenCommand(container, session, command) {
+  const openCommand = command || `gsb-local open ${session}`;
+  let row = container.querySelector(".quick-open-command");
+  if (!row) {
+    row = element("div", "quick-open-command");
+    container.append(row);
+  }
+  const code = element("code", "", openCommand);
+  const copy = element("button", "text-button copy-command-button", "复制");
+  copy.type = "button";
+  copy.title = `复制 ${openCommand}`;
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(openCommand);
+      toast(`已复制：${openCommand}`);
+    } catch {
+      toast("复制失败，请手动选择命令文本", "error");
+    }
+  });
+  row.replaceChildren(code, copy);
+  return row;
+}
+
 async function executeQuickLaunch(target, button, statusNode = null) {
   if (!await confirmFullAccessLaunch(target)) return null;
   const label = button.textContent;
@@ -1392,8 +1424,12 @@ async function executeQuickLaunch(target, button, statusNode = null) {
   button.textContent = "正在启动…";
   try {
     const result = await api("/api/launch", { method: "POST", body: JSON.stringify({ workbench: target }) });
-    if (statusNode) statusNode.textContent = `已启动 · ${result.openCommand || `gsb-local open ${target.session}`}`;
-    button.title = result.openCommand || `gsb-local open ${target.session}`;
+    const openCommand = result.openCommand || `gsb-local open ${target.session}`;
+    if (statusNode) {
+      statusNode.textContent = "已启动 · 用下面的命令进入";
+      renderOpenCommand(statusNode.parentElement || statusNode, target.session, openCommand);
+    }
+    button.title = openCommand;
     toast(`已启动 ${target.session}`);
     return result;
   } catch (error) {
