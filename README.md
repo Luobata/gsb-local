@@ -35,6 +35,16 @@ Studio 只监听 `127.0.0.1`，启动时生成一次性访问 token。免 `--pro
 
 Studio 默认缓存 Agent 命令存在性检查：可用命令在当前进程内持续缓存，不可用结果 30 秒后自动重查；设置 `GSB_STUDIO_CMD_CACHE=off` 可关闭缓存。交互 shell 检查超时或失败时默认显示警告并允许继续启动；设置 `GSB_STUDIO_CHECK_STRICT=on` 可恢复为阻断错误。
 
+### 复用器后端：Zellij（默认）或 herdr
+
+工作台的复用器层已抽象为可插拔后端。默认仍是 Zellij；安装 [herdr](https://herdr.dev/) 后可用同一套角色/提示词/watchdog 体系在 herdr 上启动：
+
+```bash
+gsb-local --mux herdr /path/to/your/repository my-task
+```
+
+herdr 后端下，一个 GSB 会话对应本地 herdr server 里 label 为 `gsb-<会话名>` 的 workspace：Hub 是 workspace 根 pane，第一个 Spoke 从 Hub 向右分裂、其余 Spoke 在右列向下堆叠，pane label 仍使用 canonical 标题（`hub.<会话>.main` / `spk.<会话>.<角色>`），因此 nudge、relay、watchdog、`layout-status` 与 pane 寻址行为与 Zellij 后端一致。后端选择写入 `session.json` 与 `session.env`（`GSB_MUX`），`gsb-local open` 会按会话自己的后端 attach 或重建，无需再次传 `--mux`。herdr server 未运行时会自动后台启动（`GSB_HERDR_AUTOSTART=false` 关闭）；`GSB_HERDR_BIN` 可覆盖 herdr 可执行文件路径，`GSB_HERDR_START_DELAY` 控制每 pane 启动命令前的等待。herdr 后端的 `layout-status` 不校验列几何，只报告角色存活、标题与 herdr 自带的 agent 状态。
+
 只在后台创建、不立即占用当前终端：
 
 ```bash

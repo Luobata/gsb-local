@@ -39,6 +39,19 @@ fi
 if [[ "$SOCKET_FROM_SESSION_ENV" != true ]]; then
   unset ZELLIJ_SOCKET_DIR
 fi
+# Backend selection follows the session's own contract: caller env first
+# (panes inherit GSB_MUX from session.env), then the saved session.env, then
+# zellij for pre-mux sessions.
+if [[ -z "${GSB_MUX:-}" ]]; then
+  SAVED_MUX="$(
+    (
+      unset GSB_MUX
+      source "$SESSION_ENV" 2>/dev/null || exit 0
+      printf '%s' "${GSB_MUX:-}"
+    )
+  )"
+  export GSB_MUX="${SAVED_MUX:-zellij}"
+fi
 SOURCE_ROLE="${GSB_ROLE:-external}"
 ACTIVE_ROLES="${GSB_ROLES:-hub,core-bug,ops-gov,plan-backup,ui}"
 
@@ -77,13 +90,13 @@ if [[ "$MODE" != "--dry-run" ]]; then
   fi
 fi
 
-zellij_timed() {
-  node "$ROOT_DIR/bin/zellij-timed.mjs" "$NUDGE_RESOLVE_TIMEOUT_MS" "$@"
+mux_cli() {
+  GSB_MUX_TIMEOUT_MS="$NUDGE_RESOLVE_TIMEOUT_MS" node "$ROOT_DIR/bin/mux.mjs" "$@"
 }
 
 resolve_target_pane() {
   local pane_json
-  pane_json="$(ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action list-panes --json --all 2>/dev/null)" || return 1
+  pane_json="$(mux_cli list-panes "$SESSION" 2>/dev/null)" || return 1
   [ -n "$pane_json" ] || return 1
   printf '%s' "$pane_json" | node -e '
   let raw = "";
@@ -94,12 +107,12 @@ resolve_target_pane() {
     try { panes = JSON.parse(raw); } catch { process.exit(3); }
     if (!Array.isArray(panes)) process.exit(3);
     const hits = panes.filter(p =>
-      !p.is_plugin && !p.exited && (p.title === title || p.title.startsWith(`${title} · `))
+      !p.isPlugin && !p.exited && (p.title === title || p.title.startsWith(`${title} · `))
     );
     if (hits.length !== 1) process.exit(3);
     process.stdout.write(`${hits[0].id}\t${hits[0].title}`);
   });
-' "$TARGET_TITLE"
+  ' "$TARGET_TITLE"
 }
 
 PANE_MATCH=""
@@ -159,7 +172,7 @@ fi
 WAKE_SCREEN=""
 WAKE_DETECTION=""
 capture_wake_state() {
-  if ! WAKE_SCREEN="$(ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action dump-screen --pane-id "$PANE_ID" 2>/dev/null)"; then
+  if ! WAKE_SCREEN="$(mux_cli read "$SESSION" "$PANE_ID" 2>/dev/null)"; then
     return 2
   fi
   if ! WAKE_DETECTION="$(printf '%s' "$WAKE_SCREEN" | node "$ROOT_DIR/bin/wake-detect.mjs" "$MESSAGE_PREFIX")"; then
@@ -230,12 +243,12 @@ if [[ "$TARGET_IS_KIMI" == true && "${GSB_KIMI_NUDGE_COALESCE:-true}" != false ]
   fi
 fi
 
-ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action write-chars --pane-id "$PANE_ID" "$MESSAGE"
+mux_cli send-text "$SESSION" "$PANE_ID" "$MESSAGE"
 # Every supported TUI needs a short window to process the write burst before
 # Enter. Keep the original Kimi setting as a compatibility fallback.
 sleep "$SETTLE_SECONDS"
-# Let Zellij encode a real Enter key instead of writing a raw CR byte.
-ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
+# The backend adapter encodes a real Enter instead of a raw CR byte.
+mux_cli send-keys "$SESSION" "$PANE_ID" Enter
 
 if [[ "$VERIFY_DELIVERY" == false ]]; then
   printf 'nudged %s pane=%s session=%s\n' "$TARGET_ROLE" "$PANE_ID" "$SESSION"
@@ -254,7 +267,7 @@ retry_count=0
 if wake_is_draft; then
   for retry_delay in 0.3 0.6 1.2; do
     sleep "$retry_delay"
-    ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
+    mux_cli send-keys "$SESSION" "$PANE_ID" Enter
     retry_count=$((retry_count + 1))
     detection_status=0
     capture_wake_state || detection_status=$?
@@ -268,10 +281,10 @@ if wake_is_draft; then
 fi
 
 if wake_is_draft; then
-  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" "Ctrl u"
-  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action write-chars --pane-id "$PANE_ID" "$MESSAGE"
+  mux_cli send-keys "$SESSION" "$PANE_ID" "Ctrl u"
+  mux_cli send-text "$SESSION" "$PANE_ID" "$MESSAGE"
   sleep "$SETTLE_SECONDS"
-  ZELLIJ_SESSION_NAME="$SESSION" zellij_timed action send-keys --pane-id "$PANE_ID" Enter
+  mux_cli send-keys "$SESSION" "$PANE_ID" Enter
   detection_status=0
   capture_wake_state || detection_status=$?
   if [[ "$detection_status" -ne 0 ]]; then

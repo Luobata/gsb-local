@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { createMux, envWithSessionContract } from "./mux.mjs";
 import { runZellijTimed } from "./zellij-timed.mjs";
 
 const baseTitle = (session, role) => role === "hub" ? `hub.${session}.main` : `spk.${session}.${role}`;
@@ -146,6 +147,25 @@ function selftest() {
   console.log("layout-status selftest: 11 passed");
 }
 
+// herdr has no KDL layout file and no pane geometry contract yet; report
+// liveness, titles, and herdr's own agent status instead of column drift.
+function printHerdrReport(panes, session, roles, watchdogHealth) {
+  console.log(`Layout status: session=${session} backend=herdr roles=${roles.join(",")}`);
+  console.log(formatWatchdogHeartbeat(watchdogHealth));
+  const terminals = panes.filter((pane) => !pane.isPlugin);
+  const missing = [];
+  for (const role of roles) {
+    const live = terminals.filter((pane) => !pane.exited && titleMatches(pane.title || "", baseTitle(session, role)));
+    if (!live.length) missing.push(role);
+    const agents = live.map((pane) => `${pane.id}(agent=${pane.agentStatus})`).join(" ");
+    console.log(`role ${role}: live=${live.length} ${agents}`);
+  }
+  console.log(`missing live roles: ${missing.length ? missing.join(", ") : "none"}`);
+  const extras = terminals.filter((pane) => !roles.some((role) => titleMatches(pane.title || "", baseTitle(session, role))));
+  console.log(`extra panes / layout drift: ${extras.length ? extras.map((pane) => `${pane.id} ${JSON.stringify(pane.title)}`).join(", ") : "none (column geometry not tracked on herdr)"}`);
+  console.log(`result: ${missing.length || extras.length ? "DRIFT" : "CANONICAL"} (diagnostic only; no changes made)`);
+}
+
 function isMainModule(entry) {
   const source = fileURLToPath(import.meta.url);
   try { return realpathSync(entry) === realpathSync(source); } catch { return entry === source; }
@@ -153,12 +173,14 @@ function isMainModule(entry) {
 
 if (isMainModule(process.argv[1])) {
   if (process.argv[2] === "--selftest") selftest();
-  else {
+  else await (async () => {
     const session = process.argv[2] || process.env.GSB_SESSION || process.env.ZELLIJ_SESSION_NAME || "seed-gsb";
     if (!/^[A-Za-z0-9._-]+$/.test(session) || process.argv[3]) throw new Error("usage: layout-status.mjs [session]");
     const stateDir = process.env.GSB_STATE_DIR || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local/state"), "gsb-local", session);
     const roles = parseRoster(readFileSync(process.env.GSB_ROLE_ROSTER || path.join(stateDir, "ROLES.md"), "utf8"));
-    const env = { ...process.env, ZELLIJ_SESSION_NAME: session };
+    // Resolve the session's saved socket dir so bare invocations match the
+    // gsb-local layout-status wrapper.
+    const env = envWithSessionContract({ ...process.env, ZELLIJ_SESSION_NAME: session }, session);
     const timeout = Number(process.env.GSB_LAYOUT_STATUS_TIMEOUT_MS || 10_000);
     const readState = (name) => { try { return readFileSync(path.join(stateDir, name), "utf8"); } catch { return ""; } };
     const watchdogHealth = analyzeWatchdogHeartbeat(
@@ -167,8 +189,13 @@ if (isMainModule(process.argv[1])) {
       Date.now(),
       Number(process.env.GSB_WATCHDOG_HEARTBEAT_STALE_MS || 150_000),
     );
-    const layout = parseLayout(runZellijTimed(["action", "dump-layout"], timeout, { env }));
-    const panes = JSON.parse(runZellijTimed(["action", "list-panes", "--json", "--all"], timeout, { env }));
-    printReport(analyzeLayout(panes, layout, session, roles), layout, session, roles, watchdogHealth);
-  }
+    if ((env.GSB_MUX || "zellij") === "herdr") {
+      const panes = await createMux({ ...env, GSB_MUX_TIMEOUT_MS: timeout }).listPanes(session);
+      printHerdrReport(panes, session, roles, watchdogHealth);
+    } else {
+      const layout = parseLayout(runZellijTimed(["action", "dump-layout"], timeout, { env }));
+      const panes = JSON.parse(runZellijTimed(["action", "list-panes", "--json", "--all"], timeout, { env }));
+      printReport(analyzeLayout(panes, layout, session, roles), layout, session, roles, watchdogHealth);
+    }
+  })();
 }

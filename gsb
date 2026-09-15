@@ -68,6 +68,79 @@ use_zellij_socket_dir() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# herdr backend helpers. A GSB session maps to one herdr workspace labeled
+# "gsb-<session>" inside the default herdr session on the local herdr server.
+# ---------------------------------------------------------------------------
+
+herdr_bin() {
+  printf '%s\n' "${GSB_HERDR_BIN:-herdr}"
+}
+
+herdr_server_reachable() {
+  "$(herdr_bin)" status >/dev/null 2>&1
+}
+
+ensure_herdr_server() {
+  if herdr_server_reachable; then
+    return 0
+  fi
+  if [[ "${GSB_HERDR_AUTOSTART:-true}" != true ]]; then
+    printf 'herdr server is not running. Start it with: herdr server (or brew services start herdr).\n' >&2
+    return 1
+  fi
+  printf 'Starting herdr server in the background...\n' >&2
+  nohup "$(herdr_bin)" server >/dev/null 2>&1 &
+  local waiter
+  for waiter in 1 2 3 4 5 6 7 8 9 10; do
+    herdr_server_reachable && return 0
+    sleep 0.5
+  done
+  printf 'herdr server did not become reachable. Start it manually: herdr server\n' >&2
+  return 1
+}
+
+herdr_workspace_label() {
+  printf 'gsb-%s\n' "$1"
+}
+
+herdr_workspace_json() {
+  "$(herdr_bin)" workspace list 2>/dev/null || true
+}
+
+herdr_session_active() {
+  local session="$1" label list
+  label="$(herdr_workspace_label "$session")"
+  list="$(herdr_workspace_json)"
+  [[ -n "$list" ]] || return 1
+  printf '%s' "$list" | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => raw += chunk);
+    process.stdin.on("end", () => {
+      let workspaces;
+      try { workspaces = JSON.parse(raw).result.workspaces; } catch { process.exit(1); }
+      process.exit(workspaces.some((workspace) => workspace.label === process.argv[1]) ? 0 : 1);
+    });
+  ' "$label"
+}
+
+herdr_workspace_close_by_label() {
+  local session="$1" label workspace_id
+  label="$(herdr_workspace_label "$session")"
+  workspace_id="$(printf '%s' "$(herdr_workspace_json)" | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => raw += chunk);
+    process.stdin.on("end", () => {
+      try {
+        const hit = JSON.parse(raw).result.workspaces.find((workspace) => workspace.label === process.argv[1]);
+        if (hit) process.stdout.write(hit.workspace_id);
+      } catch { }
+    });
+  ' "$label")"
+  [[ -n "$workspace_id" ]] || return 0
+  "$(herdr_bin)" workspace close "$workspace_id" >/dev/null 2>&1 || true
+}
+
 session_socket_dir_from_env() {
   local env_file="$1"
   [[ -f "$env_file" ]] || return 0
@@ -460,7 +533,7 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
     printf 'Session name may only contain letters, numbers, dot, underscore, and hyphen.\n' >&2
     exit 1
   fi
-  for required_command in zellij node; do
+  for required_command in node; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
       printf 'Missing required command: %s\n' "$required_command" >&2
       exit 1
@@ -508,6 +581,27 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
 
   OPEN_PRIMARY_SOCKET_DIR="$(session_socket_dir_from_env "$OPEN_STATE_DIR/session.env")"
   [[ -n "$OPEN_PRIMARY_SOCKET_DIR" ]] || OPEN_PRIMARY_SOCKET_DIR="$(gsb_socket_dir)"
+  # Backend follows the session's own metadata; pre-mux sessions stay zellij.
+  OPEN_MUX="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$OPEN_METADATA" mux 2>/dev/null || printf zellij)"
+  if [[ "$OPEN_MUX" == herdr ]] && ! command -v "$(herdr_bin)" >/dev/null 2>&1; then
+    printf 'Session %s was created on the herdr backend, but herdr is not installed.\n' "$OPEN_SESSION" >&2
+    exit 1
+  fi
+  if [[ "$OPEN_MUX" != herdr ]] && ! command -v zellij >/dev/null 2>&1; then
+    printf 'Session %s was created on the zellij backend, but zellij is not installed.\n' "$OPEN_SESSION" >&2
+    exit 1
+  fi
+  if [[ "$OPEN_MUX" == herdr ]]; then
+    if herdr_session_active "$OPEN_SESSION"; then
+      ensure_open_watchdog "$OPEN_STATE_DIR" "$OPEN_SESSION" "$OPEN_WATCHDOG"
+      if [[ "$OPEN_BACKGROUND" == true ]]; then
+        printf 'herdr session is already active in the background: %s\n' "$OPEN_SESSION"
+        exit 0
+      fi
+      printf 'Attaching to herdr session: %s (workspace: %s)\n' "$OPEN_SESSION" "$(herdr_workspace_label "$OPEN_SESSION")"
+      exec "$(herdr_bin)" session attach default
+    fi
+  else
   OPEN_LEGACY_SOCKET_DIR="$(default_zellij_socket_dir)"
   OPEN_PRIMARY_ACTIVE=false
   OPEN_LEGACY_ACTIVE=false
@@ -535,6 +629,7 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
     printf 'Attaching to %s (workspace: %s)\n' "$OPEN_SESSION" "$OPEN_WORKSPACE"
     exec zellij attach "$OPEN_SESSION"
   fi
+  fi
 
   # Do not let a shell inside some other GSB session leak its runtime contract
   # into the session being reopened. Reconstruct only from durable metadata.
@@ -546,6 +641,7 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
   OPEN_ARGS=()
   [[ "$OPEN_BACKGROUND" == true ]] && OPEN_ARGS+=(--background)
   [[ "$OPEN_FULL_ACCESS" == true ]] && OPEN_ARGS+=(--full-access)
+  [[ "$OPEN_MUX" == herdr ]] && OPEN_ARGS+=(--mux herdr)
   if [[ "$OPEN_CONFIG_SOURCE" == profile && -n "$OPEN_CONFIG_PROFILE" ]]; then
     OPEN_ARGS+=(--config "$OPEN_CONFIG_PROFILE")
   elif [[ -n "$OPEN_CONFIG_PATH" && "$OPEN_CONFIG_SOURCE" == project && "$OPEN_CONFIG_PATH" != "$OPEN_WORKSPACE/.gsb-local/agents.conf" ]]; then
@@ -556,13 +652,14 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
   fi
   export GSB_SOCKET_DIR_OVERRIDE="$OPEN_PRIMARY_SOCKET_DIR"
   export GSB_WATCHDOG_ENABLED="$OPEN_WATCHDOG"
-  printf 'Reopening %s from durable workspace: %s\n' "$OPEN_SESSION" "$OPEN_WORKSPACE"
+  printf 'Reopening %s (backend %s) from durable workspace: %s\n' "$OPEN_SESSION" "$OPEN_MUX" "$OPEN_WORKSPACE"
   exec "$ROOT_DIR/gsb" "${OPEN_ARGS[@]}" "$OPEN_WORKSPACE" "$OPEN_SESSION"
 fi
 
 if [[ "${1:-}" == "--check" ]]; then
   printf 'GSB Local: %s\n' "$ROOT_DIR"
   printf 'Zellij:   %s\n' "$(zellij --version 2>/dev/null || printf 'missing')"
+  printf 'herdr:    %s\n' "$(herdr --version 2>/dev/null || printf 'missing')"
   printf 'Claude:   %s\n' "$(claude --version 2>/dev/null || printf 'missing')"
   printf 'Codex:    %s\n' "$(codex --version 2>/dev/null || printf 'missing')"
   printf 'Kimi:     %s\n' "$(kimi --version 2>/dev/null || printf 'missing')"
@@ -575,6 +672,7 @@ BACKGROUND=false
 FULL_ACCESS=false
 CONFIG_PROFILE=""
 LIST_CONFIGS=false
+MUX="${GSB_MUX:-zellij}"
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --rebuild) REBUILD=true ;;
@@ -582,6 +680,14 @@ while [[ "${1:-}" == --* ]]; do
     --background) BACKGROUND=true ;;
     --full-access) FULL_ACCESS=true ;;
     --list-configs) LIST_CONFIGS=true ;;
+    --mux)
+      if [[ -z "${2:-}" || "${2:-}" == --* ]]; then
+        printf 'Missing backend name after --mux.\n' >&2
+        exit 1
+      fi
+      MUX="$2"
+      shift
+      ;;
     --config[0-9]*) CONFIG_PROFILE="${1#--}" ;;
     --config)
       if [[ -z "${2:-}" || "${2:-}" == --* ]]; then
@@ -593,7 +699,7 @@ while [[ "${1:-}" == --* ]]; do
       ;;
     --help)
       printf '%s\n' \
-        'Usage: gsb-local [--rebuild] [--background] [--full-access] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
+        'Usage: gsb-local [--rebuild] [--background] [--full-access] [--mux zellij|herdr] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
         '       gsb-local open [--background] SESSION' \
         '       gsb-local layout-status [SESSION]' \
         '       gsb-local watchdog ensure-all|install|uninstall|status' \
@@ -610,6 +716,12 @@ while [[ "${1:-}" == --* ]]; do
   esac
   shift
 done
+
+if [[ "$MUX" != zellij && "$MUX" != herdr ]]; then
+  printf 'Unsupported multiplexer backend: %s (expected zellij or herdr).\n' "$MUX" >&2
+  exit 1
+fi
+export GSB_MUX="$MUX"
 
 if [[ "$LIST_CONFIGS" == true ]]; then
   for profile_path in "$ROOT_DIR"/profiles/*.conf; do
@@ -629,7 +741,7 @@ fi
 # A pane context carries the current session's runtime contract. Strip only
 # those runtime values so documented and role-scoped inputs remain available.
 PANE_RUNTIME_VARS=(
-  GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR
+  GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR GSB_MUX
   GSB_PROJECT_DIR GSB_PROMPTS_DIR GSB_PROFILES_DIR
   GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE
   GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE
@@ -1016,6 +1128,19 @@ fi
 # Attaching to an already-running session must be read-only. In particular,
 # do not rewrite its environment, roster, layout, or metadata from whichever
 # directory/config happened to invoke gsb-local a second time.
+if [[ "$MUX" == herdr ]]; then
+  ensure_herdr_server || exit 1
+  if herdr_session_active "$SESSION"; then
+    if [[ "$REBUILD" != true ]]; then
+      if [[ "$BACKGROUND" == true ]]; then
+        printf 'herdr session is already active in the background: %s\n' "$SESSION"
+        exit 0
+      fi
+      printf 'Attaching to active herdr session: %s\n' "$SESSION"
+      exec "$(herdr_bin)" session attach default
+    fi
+  fi
+else
 PRIMARY_SOCKET_DIR="$ZELLIJ_SOCKET_DIR"
 LEGACY_SOCKET_DIR="$(default_zellij_socket_dir)"
 PRIMARY_ACTIVE=false
@@ -1050,6 +1175,7 @@ fi
 use_zellij_socket_dir "$PRIMARY_SOCKET_DIR"
 SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
 validate_socket_path_length "$PRIMARY_SOCKET_DIR" "$SESSION"
+fi
 
 mkdir -p "$GSB_STATE_DIR/reports" "$GSB_STATE_DIR/contracts" "$GSB_STATE_DIR/layouts" "$GSB_STATE_DIR/agent-files"
 for role in "${ROLES[@]}"; do
@@ -1069,7 +1195,7 @@ write_session_export() {
 {
   printf '%s\n' '# Generated by gsb-local. Session-scoped; do not share across workspaces.'
   for runtime_var in \
-    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR \
+    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR GSB_MUX \
     GSB_PROJECT_DIR GSB_PROMPTS_DIR GSB_PROFILES_DIR \
     GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE \
     GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE \
@@ -1181,18 +1307,20 @@ done
 node "$ROOT_DIR/bin/render-layout.mjs" "$GSB_LAYOUT_FILE" "$SESSION" "${ROLES[@]}"
 
 if [[ "$PARENT_ENV_SANITIZED" == true ]]; then
-  printf 'Sanitized inherited Claude child-session markers before starting Zellij.\n'
+  printf 'Sanitized inherited Claude child-session markers before starting the multiplexer.\n'
 fi
 if [[ "$FULL_ACCESS" == true ]]; then
   printf 'WARNING: full-access enabled; built-in agents will run without normal approval or sandbox protections.\n' >&2
 fi
 
+if [[ "$MUX" == zellij ]]; then
 if [[ "$REBUILD" == true ]] && printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session { found = 1 } END { exit(found ? 0 : 1) }'; then
   printf 'Rebuilding Zellij session with current configuration: %s\n' "$SESSION"
   zellij delete-session --force "$SESSION" >/dev/null
 elif printf '%s\n' "$SESSION_LIST" | awk -v session="$SESSION" '$1 == session && /EXITED/ { found = 1 } END { exit(found ? 0 : 1) }'; then
   printf 'Rebuilding dead Zellij session: %s\n' "$SESSION"
   zellij delete-session "$SESSION" >/dev/null
+fi
 fi
 
 stop_watchdog() {
@@ -1211,11 +1339,91 @@ start_watchdog() {
   launch_watchdog_from_session "$GSB_STATE_DIR" "$SESSION"
 }
 
-# The watchdog must not query a session while Zellij is still constructing it.
-# Zellij 0.44.3 can also hang or panic its per-session server during rapid
-# kill/recreate cycles. Bound each create attempt, probe whether the server
-# actually became live, and retry once instead of hanging the caller forever.
+# The watchdog must not query a session while the multiplexer is still
+# constructing it. Zellij 0.44.3 can also hang or panic its per-session server
+# during rapid kill/recreate cycles. Bound each create attempt, probe whether
+# the server actually became live, and retry once instead of hanging forever.
 stop_watchdog
+
+# herdr creation: one workspace per GSB session, hub pane as the workspace
+# root, spokes split off to the right then stacked downward, canonical pane
+# labels as the routing contract, and the same `supervise` boot command the
+# Zellij layout uses. A pane registry is saved for diagnostics.
+create_herdr_session() {
+  local workspace_json hub_pane spoke_pane role_pane role title command_text registry split_target split_direction
+  herdr_workspace_close_by_label "$SESSION"
+  workspace_json="$("$(herdr_bin)" workspace create --cwd "$WORKSPACE" --label "$(herdr_workspace_label "$SESSION")" --no-focus 2>&1)" || return 1
+  hub_pane="$(printf '%s' "$workspace_json" | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => raw += chunk);
+    process.stdin.on("end", () => {
+      try { process.stdout.write(JSON.parse(raw).result.root_pane.pane_id); } catch { process.exit(1); }
+    });
+  ')"
+  [[ -n "$hub_pane" ]] || return 1
+  "$(herdr_bin)" pane rename "$hub_pane" "hub.$SESSION.main" >/dev/null || return 1
+  sleep "${GSB_HERDR_START_DELAY:-0.5}"
+  command_text="source $(printf '%q' "$GSB_SESSION_ENV_FILE") && exec $(printf '%q' "$ROOT_DIR/bin/supervise") hub"
+  "$(herdr_bin)" pane run "$hub_pane" "$command_text" >/dev/null || return 1
+
+  # Layout contract: hub owns the left column; the first spoke splits the hub
+  # to the right, further spokes stack downward inside that right column.
+  split_target="$hub_pane"
+  split_direction=right
+  registry="{\"backend\":\"herdr\",\"workspaceLabel\":\"$(herdr_workspace_label "$SESSION")\",\"panes\":{\"hub\":\"$hub_pane\""
+  for role in "${ROLES[@]}"; do
+    [[ "$role" == hub ]] && continue
+    role_pane="$("$(herdr_bin)" pane split "$split_target" --direction "$split_direction" --cwd "$WORKSPACE" --ratio 0.5 --no-focus 2>&1 | node -e '
+      let raw = "";
+      process.stdin.on("data", (chunk) => raw += chunk);
+      process.stdin.on("end", () => {
+        try { process.stdout.write(JSON.parse(raw).result.pane.pane_id); } catch { process.exit(1); }
+      });
+    ')"
+    [[ -n "$role_pane" ]] || return 1
+    split_target="$role_pane"
+    split_direction=down
+    "$(herdr_bin)" pane rename "$role_pane" "spk.$SESSION.$role" >/dev/null || return 1
+    sleep "${GSB_HERDR_START_DELAY:-0.5}"
+    command_text="source $(printf '%q' "$GSB_SESSION_ENV_FILE") && exec $(printf '%q' "$ROOT_DIR/bin/supervise") $(printf '%q' "$role")"
+    "$(herdr_bin)" pane run "$role_pane" "$command_text" >/dev/null || return 1
+    registry="$registry,\"$role\":\"$role_pane\""
+  done
+  registry="$registry}}"
+  printf '%s\n' "$registry" > "$GSB_STATE_DIR/panes.json"
+  chmod 600 "$GSB_STATE_DIR/panes.json"
+  herdr_session_active "$SESSION"
+}
+
+if [[ "$MUX" == herdr ]]; then
+  ensure_herdr_server || exit 1
+  session_created=false
+  for create_attempt in 1 2; do
+    create_status=0
+    create_herdr_session || create_status=$?
+    if herdr_session_active "$SESSION"; then
+      session_created=true
+      break
+    fi
+    if [[ "$create_attempt" -lt 2 ]]; then
+      printf 'herdr create attempt %s failed (status %s); retrying once.\n' "$create_attempt" "$create_status" >&2
+      sleep 1
+    fi
+  done
+  if [[ "$session_created" != true ]]; then
+    printf 'Failed to create herdr workspace for session %s. Check: herdr status\n' "$SESSION" >&2
+    exit 1
+  fi
+
+  start_watchdog
+
+  if [[ "$BACKGROUND" == true ]]; then
+    printf 'herdr session created in background: %s (workspace %s)\n' "$SESSION" "$(herdr_workspace_label "$SESSION")"
+    exit 0
+  fi
+
+  exec "$(herdr_bin)" session attach default
+fi
 
 create_zellij_session() {
   node "$ROOT_DIR/bin/run-with-timeout.mjs" 15000 \

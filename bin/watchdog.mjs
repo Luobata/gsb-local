@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { createMux, envWithSessionContract, resolveBackendName, runTimedExec } from "./mux.mjs";
 import { detectWake } from "./wake-detect.mjs";
 
 // ---------------------------------------------------------------------------
@@ -205,7 +206,6 @@ const CONFIG = {
   draftMaxEnter: Number(process.env.GSB_WATCHDOG_DRAFT_MAX_ENTER || 3),
   zellijTimeoutMs: positiveTimeoutMs(process.env.GSB_WATCHDOG_ZELLIJ_TIMEOUT_MS, 10_000),
 };
-const ZELLIJ_BIN = process.env.GSB_ZELLIJ_BIN || "zellij";
 const PATTERNS_FILE =
   process.env.GSB_WATCHDOG_PATTERNS ||
   (ROOT ? path.join(ROOT, "defaults", "watchdog-patterns.conf") : "");
@@ -214,37 +214,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 const log = (msg) => console.log(`${new Date().toISOString()} watchdog: ${msg}`);
 
-function zellijFallbackAllowed(args) {
-  return args[0] === "action" && (args[1] === "list-panes" || args[1] === "dump-screen");
-}
-
-function runZellijCommand(args, options, { execImpl = execFileSync, bin = ZELLIJ_BIN, logImpl = log } = {}) {
-  try {
-    return execImpl(bin, args, options);
-  } catch (error) {
-    if (error?.code === "ETIMEDOUT" || error?.signal === "SIGKILL") {
-      logImpl(`zellij timed out after ${options.timeout}ms (SIGKILL)`);
-    }
-    throw error;
-  }
-}
-
-function zellij(args) {
-  const options = {
-    env: { ...process.env, ZELLIJ_SESSION_NAME: SESSION },
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: CONFIG.zellijTimeoutMs,
-    killSignal: "SIGKILL",
-  };
-  try {
-    return runZellijCommand(args, options);
-  } catch (error) {
-    if (!process.env.ZELLIJ_SOCKET_DIR || !zellijFallbackAllowed(args)) throw error;
-    delete options.env.ZELLIJ_SOCKET_DIR;
-    return runZellijCommand(args, options);
-  }
-}
+// All pane I/O goes through the multiplexer facade (zellij or herdr, selected
+// by GSB_MUX from the sourced session.env). herdr panes additionally expose
+// agentStatus, but the polling heuristics below stay screen-based so both
+// backends behave identically.
+const MUX = createMux(envWithSessionContract({ ...process.env, GSB_MUX_TIMEOUT_MS: CONFIG.zellijTimeoutMs }, SESSION));
+const toLegacyPane = (pane) => ({ ...pane, is_plugin: pane.isPlugin, is_focused: pane.focused });
 
 function runHubNudge({ execImpl = execFileSync, nudgePath = path.join(ROOT, "bin", "nudge"), timeoutMs = 30_000, logImpl = log } = {}) {
   try {
@@ -259,19 +234,19 @@ function runHubNudge({ execImpl = execFileSync, nudgePath = path.join(ROOT, "bin
 }
 
 function listPanes() {
-  return JSON.parse(zellij(["action", "list-panes", "--json", "--all"]));
+  return MUX.listPanes(SESSION).then((panes) => panes.map(toLegacyPane));
 }
 
 function dumpScreen(paneId) {
-  return zellij(["action", "dump-screen", "--pane-id", String(paneId)]);
+  return MUX.dumpScreen(SESSION, paneId);
 }
 
 function writeChars(paneId, text) {
-  zellij(["action", "write-chars", "--pane-id", String(paneId), text]);
+  return MUX.sendText(SESSION, paneId, text);
 }
 
 function sendKeys(paneId, keys) {
-  zellij(["action", "send-keys", "--pane-id", String(paneId), ...keys]);
+  return MUX.sendKeys(SESSION, paneId, keys);
 }
 
 function sleepMs(milliseconds) {
@@ -333,7 +308,7 @@ function notifyHub(role, detail, issue = "error") {
   runHubNudge(); // The durable message remains in the inbox if waking Hub fails or times out.
 }
 
-function applyAction(role, pane, st, action, now) {
+async function applyAction(role, pane, st, action, now) {
   switch (action.action) {
     case "forget":
       states.delete(role);
@@ -367,9 +342,9 @@ function applyAction(role, pane, st, action, now) {
       st.prevFocused = false;
       break;
     case "soft":
-      writeChars(pane.id, action.retryText);
+      await writeChars(pane.id, action.retryText);
       if (isKimiTarget(role, pane)) sleepMs(CONFIG.kimiSettleMs);
-      sendKeys(pane.id, ["Enter"]);
+      await sendKeys(pane.id, ["Enter"]);
       st.softPending = true;
       st.softTimes.push(now);
       st.lastActionAt = now;
@@ -379,7 +354,7 @@ function applyAction(role, pane, st, action, now) {
       log(`role=${role} soft recovery: sent "${action.retryText}" + Enter (streak=${st.errorStreak})`);
       break;
     case "draft-enter":
-      sendKeys(pane.id, ["Enter"]);
+      await sendKeys(pane.id, ["Enter"]);
       st.draftAttempts += 1;
       st.draftStreak = 0;
       st.lastActionAt = now;
@@ -401,7 +376,7 @@ function applyAction(role, pane, st, action, now) {
     case "hard":
       mkdirSync(path.dirname(markerPath(role)), { recursive: true });
       writeFileSync(markerPath(role), "");
-      sendKeys(pane.id, ["Ctrl c", "Ctrl c"]);
+      await sendKeys(pane.id, ["Ctrl c", "Ctrl c"]);
       st.softPending = false;
       st.errorStreak = 0;
       st.lastActionAt = now;
@@ -424,7 +399,7 @@ function applyAction(role, pane, st, action, now) {
   }
 }
 
-function poll(panes, patterns, now) {
+async function poll(panes, patterns, now) {
   const resolved = resolveSpokePanes(panes, SESSION, SPOKES);
 
   for (const role of SPOKES) {
@@ -437,7 +412,7 @@ function poll(panes, patterns, now) {
     } else {
       let screen;
       try {
-        screen = dumpScreen(pane.id);
+        screen = await dumpScreen(pane.id);
       } catch {
         continue;
       }
@@ -547,12 +522,12 @@ async function main() {
   for (;;) {
     let panes;
     try {
-      panes = heartbeatThenQuery(heartbeatFile, process.pid, ++pollSeq, listPanes);
+      panes = await heartbeatThenQuery(heartbeatFile, process.pid, ++pollSeq, listPanes);
       sessionFailures = 0;
     } catch (error) {
       sessionFailures += 1;
       if (sessionFailures >= 3) {
-        log(`zellij session unavailable after ${sessionFailures} attempts; exiting (${error.message})`);
+        log(`${MUX.name} session unavailable after ${sessionFailures} attempts; exiting (${error.message})`);
         process.exit(0);
       }
       await sleep(CONFIG.interval * 1000);
@@ -561,7 +536,7 @@ async function main() {
 
     try {
       // Reload patterns every poll so the patterns file is hot-editable.
-      poll(panes, compilePatterns(PATTERNS_FILE), Date.now() / 1000);
+      await poll(panes, compilePatterns(PATTERNS_FILE), Date.now() / 1000);
     } catch (error) {
       log(`poll error: ${error.stack || error.message}`);
     }
@@ -644,36 +619,27 @@ function runSelfTest() {
   test("heartbeat is written before the Zellij query", queried === "panes" && heartbeatOrder.join(",") === "heartbeat,query");
   test("parseWatchdogHeartbeat rejects a PID mismatch shape", parseWatchdogHeartbeat("123 bad 7") === null);
   unlinkSync(heartbeatFile);
-  test("Zellij fallback allows read actions", zellijFallbackAllowed(["action", "list-panes"]) && zellijFallbackAllowed(["action", "dump-screen"]));
-  test("Zellij fallback rejects write actions", !zellijFallbackAllowed(["action", "write-chars"]) && !zellijFallbackAllowed(["action", "send-keys"]));
+  test("mux backend resolves from env", resolveBackendName({ GSB_MUX: "herdr" }) === "herdr" && resolveBackendName({}) === "zellij");
   test("watchdog timeout config fails closed", positiveTimeoutMs("0", 10_000) === 10_000 && positiveTimeoutMs("bad", 10_000) === 10_000 && positiveTimeoutMs("250", 10_000) === 250);
-  const hungZellij = path.join(tmpdir(), `gsb-wd-hung-zellij-${process.pid}`);
-  writeFileSync(hungZellij, "#!/usr/bin/env bash\nexec sleep 100\n");
-  chmodSync(hungZellij, 0o755);
+  const hungBackend = path.join(tmpdir(), `gsb-wd-hung-backend-${process.pid}`);
+  writeFileSync(hungBackend, "#!/usr/bin/env bash\nexec sleep 100\n");
+  chmodSync(hungBackend, 0o755);
   const timeoutState = freshState();
   timeoutState.errorStreak = 2;
   timeoutState.draftStreak = 1;
   const stateBeforeTimeout = JSON.stringify(timeoutState);
-  const timeoutLogs = [];
   const timeoutStarted = Date.now();
   let timeoutError;
   try {
-    runZellijCommand(["action", "list-panes"], {
-      env: process.env,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 200,
-      killSignal: "SIGKILL",
-    }, { bin: hungZellij, logImpl: (message) => timeoutLogs.push(message) });
+    runTimedExec(hungBackend, ["action", "list-panes"], process.env, 200);
   } catch (error) {
     timeoutError = error;
   } finally {
-    unlinkSync(hungZellij);
+    unlinkSync(hungBackend);
   }
   const timeoutElapsed = Date.now() - timeoutStarted;
-  test("hung Zellij query is killed within its timeout", timeoutElapsed < 700 && timeoutError?.signal === "SIGKILL");
-  test("Zellij timeout emits a specific diagnostic", timeoutLogs[0] === "zellij timed out after 200ms (SIGKILL)");
-  test("Zellij timeout leaves recovery streaks unchanged", JSON.stringify(timeoutState) === stateBeforeTimeout);
+  test("hung backend query is killed within its timeout", timeoutElapsed < 700 && timeoutError?.signal === "SIGKILL");
+  test("backend timeout leaves recovery streaks unchanged", JSON.stringify(timeoutState) === stateBeforeTimeout);
   let hubNudgeOptions;
   const hubNudgeLogs = [];
   const hubNudgeResult = runHubNudge({ nudgePath: "/fake/nudge", timeoutMs: 200, logImpl: (message) => hubNudgeLogs.push(message), execImpl(_command, _args, options) {

@@ -57,6 +57,7 @@ if (command === "write") {
     configProfile: process.env.GSB_CONFIG_PROFILE || "",
     modelsConfigPath: process.env.GSB_MODELS_CONFIG_PATH || "",
     roles: (process.env.GSB_ROLES || "").split(",").filter(Boolean),
+    mux: process.env.GSB_MUX === "herdr" ? "herdr" : "zellij",
     fullAccess: process.env.GSB_FULL_ACCESS === "true",
     permissionProfile: process.env.GSB_PERMISSION_PROFILE || "balanced",
     watchdogEnabled: process.env.GSB_WATCHDOG_ENABLED !== "false",
