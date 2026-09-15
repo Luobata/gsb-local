@@ -1158,23 +1158,54 @@ if [[ "$REBUILD" == true && "$LEGACY_ACTIVE" == true ]]; then
   printf 'Refusing to rebuild legacy session %s in the default socket directory; attach it or close it first.\n' "$SESSION" >&2
   exit 1
 fi
-if [[ "$REBUILD" != true && ( "$PRIMARY_ACTIVE" == true || "$LEGACY_ACTIVE" == true ) ]]; then
-  if [[ "$PRIMARY_ACTIVE" == true ]]; then
-    use_zellij_socket_dir "$PRIMARY_SOCKET_DIR"
-  else
-    use_zellij_socket_dir ""
+  if [[ "$REBUILD" != true && ( "$PRIMARY_ACTIVE" == true || "$LEGACY_ACTIVE" == true ) ]]; then
+    if [[ "$PRIMARY_ACTIVE" == true ]]; then
+      use_zellij_socket_dir "$PRIMARY_SOCKET_DIR"
+    else
+      use_zellij_socket_dir ""
+    fi
+    if [[ "$BACKGROUND" == true ]]; then
+      printf 'Zellij session is already active in the background: %s\n' "$SESSION"
+      exit 0
+    fi
+    printf 'Attaching to active Zellij session: %s\n' "$SESSION"
+    exec zellij attach "$SESSION"
   fi
-  if [[ "$BACKGROUND" == true ]]; then
-    printf 'Zellij session is already active in the background: %s\n' "$SESSION"
-    exit 0
-  fi
-  printf 'Attaching to active Zellij session: %s\n' "$SESSION"
-  exec zellij attach "$SESSION"
+
+  use_zellij_socket_dir "$PRIMARY_SOCKET_DIR"
+  SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
+  validate_socket_path_length "$PRIMARY_SOCKET_DIR" "$SESSION"
 fi
 
-use_zellij_socket_dir "$PRIMARY_SOCKET_DIR"
-SESSION_LIST="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
-validate_socket_path_length "$PRIMARY_SOCKET_DIR" "$SESSION"
+# Cross-backend duplicate guard: one session name may be live on at most one
+# backend. Both backends share the session's state dir (relay, watchdog,
+# session.env); two live copies would fight over it. --rebuild closes the
+# other backend's session first; without it we refuse.
+if [[ "$MUX" == herdr ]]; then
+  OTHER_DIR=""
+  for candidate_dir in "$(gsb_socket_dir)" "$(default_zellij_socket_dir)"; do
+    [[ -n "$OTHER_DIR" ]] && continue
+    zellij_session_active_in "$candidate_dir" "$SESSION" && OTHER_DIR="$candidate_dir"
+  done
+  if [[ -n "$OTHER_DIR" ]]; then
+    if [[ "$REBUILD" != true ]]; then
+      printf 'Session %s is currently live on the zellij backend.\n' "$SESSION" >&2
+      printf 'Close it first, or rebuild with: gsb-local --rebuild --mux herdr ...\n' >&2
+      exit 1
+    fi
+    printf 'Closing live Zellij session %s before rebuilding on herdr.\n' "$SESSION"
+    ZELLIJ_SOCKET_DIR="$OTHER_DIR" zellij delete-session --force "$SESSION" >/dev/null 2>&1 || true
+  fi
+else
+  if herdr_session_active "$SESSION"; then
+    if [[ "$REBUILD" != true ]]; then
+      printf 'Session %s is currently live on the herdr backend (workspace %s).\n' "$SESSION" "$(herdr_workspace_label "$SESSION")" >&2
+      printf 'Close it first, or rebuild with: gsb-local --rebuild --mux zellij ...\n' >&2
+      exit 1
+    fi
+    printf 'Closing live herdr workspace %s before rebuilding on zellij.\n' "$(herdr_workspace_label "$SESSION")"
+    herdr_workspace_close_by_label "$SESSION"
+  fi
 fi
 
 mkdir -p "$GSB_STATE_DIR/reports" "$GSB_STATE_DIR/contracts" "$GSB_STATE_DIR/layouts" "$GSB_STATE_DIR/agent-files"
