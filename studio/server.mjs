@@ -332,6 +332,7 @@ function defaultWorkbench(workspace, projectName, directory, profile, promptTemp
     workspace,
     session: defaultSession(workspace, projectName),
     permission: "balanced",
+    mux: "zellij",
     watchdog: true,
     rebuild: false,
     roles: mappings.map(({ role, agent }) => {
@@ -442,6 +443,7 @@ export function validateWorkbench(input) {
   const hub = (workbench.roles || []).find((role) => role.id === "hub");
   if (hub && hub.agent !== "claude-glm-5.3") warnings.push("Hub 未使用当前推荐的 claude-glm-5.3");
   if (workbench.permission === "full-access") warnings.push("Full Access 会绕过内置 Agent 的常规审批与沙箱保护");
+  if (workbench.mux != null && workbench.mux !== "zellij" && workbench.mux !== "herdr") errors.push("复用器后端只能是 zellij 或 herdr");
   return { valid: errors.length === 0, errors, warnings };
 }
 
@@ -1161,6 +1163,40 @@ export function mergeSessionLines(outputs, dirs) {
   return { lines: [...selected.values()].map(({ line }) => line), byName };
 }
 
+// A GSB session on the herdr backend maps to a workspace labeled gsb-<name>
+// inside the local herdr server. Turn those workspaces into listing lines so
+// Studio sees herdr sessions with the same shape as zellij ones; the line's
+// "herdr workspace" marker also identifies the backend downstream.
+export const HERDR_SESSION_MARKER = "herdr workspace";
+
+export function herdrWorkspaceLines(stdout) {
+  let workspaces;
+  try { workspaces = JSON.parse(String(stdout)).result.workspaces; } catch { return []; }
+  if (!Array.isArray(workspaces)) return [];
+  return workspaces.flatMap((workspace) => {
+    const label = typeof workspace?.label === "string" && workspace.label.startsWith("gsb-")
+      ? workspace.label.slice(4)
+      : "";
+    return SESSION_PATTERN.test(label) && label ? [`${label} ${HERDR_SESSION_MARKER} (running)`] : [];
+  });
+}
+
+export function mergeHerdrSessions(listing, herdrLines) {
+  for (const line of herdrLines) {
+    const name = line.split(/\s+/, 1)[0];
+    if (listing.byName.has(name)) continue; // a live zellij session of the same name wins
+    listing.byName.set(name, {
+      line,
+      socketDir: null,
+      crossSocketExited: false,
+      exitedEverywhere: false,
+      backend: "herdr",
+    });
+    listing.lines.push(line);
+  }
+  return listing;
+}
+
 function cloneSessionListing(listing) {
   return {
     lines: [...listing.lines],
@@ -1196,7 +1232,15 @@ export async function listSessionsDetailed({
       ? spawnSyncImpl("zellij", ["list-sessions", "--no-formatting"], { encoding: "utf8", env: childEnv, timeout: SPAWN_TIMEOUT_MS })
       : await spawnResult(spawnImpl, "zellij", ["list-sessions", "--no-formatting"], { env: childEnv }, SPAWN_TIMEOUT_MS);
     return String(result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-  })).then((outputs) => mergeSessionLines(outputs, dirs));
+  })).then(async (outputs) => {
+    const listing = mergeSessionLines(outputs, dirs);
+    // herdr is probed alongside zellij; a missing binary or server is simply
+    // an empty contribution, never a listing failure.
+    const probe = env.GSB_STUDIO_VALIDATE_SYNC === "1"
+      ? spawnSyncImpl("herdr", ["workspace", "list"], { encoding: "utf8", env, timeout: SPAWN_TIMEOUT_MS })
+      : await spawnResult(spawnImpl, "herdr", ["workspace", "list"], { env }, SPAWN_TIMEOUT_MS);
+    return probe.error?.code === "ENOENT" ? listing : mergeHerdrSessions(listing, herdrWorkspaceLines(probe.stdout));
+  });
   cache.set(cacheKey, { pending });
   try {
     const value = await pending;
@@ -1273,13 +1317,22 @@ export function sessionState(name, directory, liveLine = "", provenance = null, 
     raw: liveLine,
   };
   if (env.GSB_STUDIO_SESSION_PROVENANCE !== "false") {
-    const socketDir = provenance?.socketDir || null;
-    state.socketDir = socketDir;
-    state.socketLabel = sessionSocketLabel(socketDir, { env, home, uid });
-    state.crossSocketExited = Boolean(provenance?.crossSocketExited);
-    state.attachHint = socketDir && (status === "running" || state.crossSocketExited)
-      ? `ZELLIJ_SOCKET_DIR=${shellWord(socketDir)} zellij attach ${name}`
-      : null;
+    if (provenance?.backend === "herdr") {
+      // herdr sessions attach through gsb-local open, which follows the
+      // session's own backend metadata; a raw zellij socket hint is wrong here.
+      state.socketDir = null;
+      state.socketLabel = "herdr";
+      state.crossSocketExited = false;
+      state.attachHint = status === "running" ? `gsb-local open ${name}` : null;
+    } else {
+      const socketDir = provenance?.socketDir || null;
+      state.socketDir = socketDir;
+      state.socketLabel = sessionSocketLabel(socketDir, { env, home, uid });
+      state.crossSocketExited = Boolean(provenance?.crossSocketExited);
+      state.attachHint = socketDir && (status === "running" || state.crossSocketExited)
+        ? `ZELLIJ_SOCKET_DIR=${shellWord(socketDir)} zellij attach ${name}`
+        : null;
+    }
     state.watchdogHeartbeatMs = watchdogHeartbeatAgeMs(directory);
   }
   return state;
@@ -1514,23 +1567,41 @@ export async function launchWorkbench(workbench, {
 } = {}) {
   const saved = await persistProjectState(workbench);
   if (!saved.validation.valid) return { ...saved, launched: false };
+  const mux = workbench.mux === "herdr" ? "herdr" : "zellij";
   const args = ["--background"];
   if (workbench.rebuild) args.push("--rebuild");
   if (workbench.permission === "full-access") args.push("--full-access");
+  if (mux === "herdr") args.push("--mux", "herdr");
   args.push(workbench.workspace, workbench.session);
   const command = ["gsb-local", ...args].map((part) => (/^[A-Za-z0-9_./-]+$/.test(part) ? part : JSON.stringify(part))).join(" ");
   const openCommand = `gsb-local open ${workbench.session}`;
+  if (mux === "herdr") {
+    const probe = spawnSyncImpl("herdr", ["--version"], { encoding: "utf8", timeout: SPAWN_TIMEOUT_MS });
+    if (probe.error?.code === "ENOENT" || (!probe.status && probe.status !== 0 && probe.error)) {
+      return {
+        ...saved,
+        launched: false,
+        command,
+        openCommand,
+        stdout: "",
+        stderr: "未找到 herdr 命令：请先安装（brew install herdr）再选择 herdr 后端。\n",
+        status: 69,
+        error: "herdr 后端不可用：命令未安装",
+      };
+    }
+  }
   const existing = await activeSessionLineImpl(workbench.session);
   if (existing && !workbench.rebuild) {
+    const backend = /herdr/.test(existing) ? "herdr" : "zellij";
     return {
       ...saved,
       launched: false,
       command,
       openCommand,
       stdout: "",
-      stderr: `同名 Zellij 会话已在运行：${workbench.session}\n请勾选「重建同名会话」以应用当前配置，或换一个会话名称以保留旧会话。\n`,
+      stderr: `同名会话已在运行：${workbench.session}（${backend} 后端）\n请勾选「重建同名会话」以应用当前配置，或换一个会话名称以保留旧会话。\n`,
       status: 64,
-      error: "当前配置没有启动：同名旧会话仍在运行",
+      error: `当前配置没有启动：同名旧会话仍在运行（${backend}）`,
     };
   }
   const env = studioLaunchEnv(sourceEnv, workbench.watchdog !== false);

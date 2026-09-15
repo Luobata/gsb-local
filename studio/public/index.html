@@ -307,6 +307,17 @@
                   <span><b>Full Access</b><small>绕过内置审批与沙箱，仅限可信项目</small></span>
                 </label>
               </fieldset>
+              <fieldset class="permission-set">
+                <legend>复用器后端</legend>
+                <label class="choice-card">
+                  <input type="radio" name="mux" value="zellij" checked />
+                  <span><b>Zellij</b><small>默认分屏工作台</small></span>
+                </label>
+                <label class="choice-card">
+                  <input type="radio" name="mux" value="herdr" />
+                  <span><b>herdr</b><small>会话独立存活，可跨终端 / 远程接管</small></span>
+                </label>
+              </fieldset>
               <label class="switch-row">
                 <span><b>Watchdog</b><small>监控 API 错误和卡死 Pane</small></span>
                 <input id="watchdog-enabled" type="checkbox" checked /><i aria-hidden="true"></i>
@@ -358,6 +369,7 @@
           <div><dt>PROFILE</dt><dd id="summary-profile">—</dd></div>
           <div><dt>SESSION</dt><dd id="summary-session">seed-gsb</dd></div>
           <div><dt>POLICY</dt><dd id="summary-permission">BALANCED</dd></div>
+          <div><dt>BACKEND</dt><dd id="summary-mux">ZELLIJ</dd></div>
           <div><dt>WATCH</dt><dd id="summary-watch">ON</dd></div>
         </dl>
         <div class="summary-roster-label">ROLE / AGENT / MODEL</div>

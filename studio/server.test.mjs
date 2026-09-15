@@ -19,6 +19,8 @@ import {
   listSessions,
   loadProjectState,
   mergeSessionLines,
+  herdrWorkspaceLines,
+  mergeHerdrSessions,
   openTerminalSession,
   parseArgs,
   parseProfileHeader,
@@ -189,6 +191,57 @@ test("Studio launch passthrough rollback preserves inherited variables", () => {
   assert.equal(env.GSB_WATCHDOG_ENABLED, "false");
 });
 
+test("Studio launch maps the herdr backend to --mux after probing for the binary", async () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-launch-herdr-"));
+  const calls = [];
+  try {
+    const result = await launchWorkbench({ ...fixture(workspace), mux: "herdr" }, {
+      spawnSyncImpl(command, args) {
+        calls.push({ command, args });
+        if (command === "herdr") return { status: 0, stdout: "herdr 0.9.0\n", stderr: "" };
+        return { status: 0, stdout: "created\n", stderr: "" };
+      },
+      activeSessionLineImpl: () => null,
+      invalidateSessionCacheImpl: () => {},
+    });
+    assert.equal(result.launched, true);
+    assert.deepEqual(calls[0], { command: "herdr", args: ["--version"] });
+    assert.equal(calls[1].args.includes("--mux"), true);
+    assert.equal(calls[1].args[calls[1].args.indexOf("--mux") + 1], "herdr");
+    assert.match(result.command, /--mux herdr/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("Studio launch refuses herdr when the binary is missing and names the backend in duplicates", async () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-launch-herdr-missing-"));
+  const enoent = Object.assign(new Error("spawn herdr ENOENT"), { code: "ENOENT" });
+  try {
+    const missing = await launchWorkbench({ ...fixture(workspace), mux: "herdr" }, {
+      spawnSyncImpl(command) {
+        if (command === "herdr") return { status: null, stdout: "", stderr: "", error: enoent };
+        return { status: 0, stdout: "", stderr: "" };
+      },
+      activeSessionLineImpl: () => null,
+      invalidateSessionCacheImpl: () => {},
+    });
+    assert.equal(missing.launched, false);
+    assert.match(missing.error, /herdr 后端不可用/);
+
+    const duplicate = await launchWorkbench({ ...fixture(workspace), mux: "herdr" }, {
+      spawnSyncImpl() { return { status: 0, stdout: "", stderr: "" }; },
+      activeSessionLineImpl: () => "studio-test herdr workspace (running)",
+      invalidateSessionCacheImpl: () => {},
+    });
+    assert.equal(duplicate.launched, false);
+    assert.match(duplicate.error, /herdr/);
+    assert.match(duplicate.stderr, /重建同名会话/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("socket directory and 103-byte boundary calculations are stable", () => {
   assert.equal(gsbSocketDir({ env: {}, home: "/Users/test" }), "/Users/test/.cache/gsb-zsock");
   assert.equal(gsbSocketDir({ env: { XDG_CACHE_HOME: "/cache" }, home: "/ignored" }), "/cache/gsb-zsock");
@@ -219,6 +272,34 @@ test("session merging preserves the winning socket and cross-socket EXITED evide
     exitedEverywhere: false,
   });
   assert.equal(merged.byName.get("dead").exitedEverywhere, true);
+});
+
+test("herdr workspaces join the session listing behind zellij precedence", () => {
+  const lines = herdrWorkspaceLines(JSON.stringify({ result: { workspaces: [
+    { workspace_id: "w1", label: "gsb-demo" },
+    { workspace_id: "w2", label: "unrelated" },
+    { workspace_id: "w3", label: "gsb-has space" },
+  ] } }));
+  assert.deepEqual(lines, ["demo herdr workspace (running)"]);
+  assert.deepEqual(herdrWorkspaceLines("not json"), []);
+
+  const listing = mergeHerdrSessions(mergeSessionLines([["shared [Created now]"]], ["/cache/gsb-zsock"]), lines);
+  assert.equal(listing.byName.get("demo").backend, "herdr");
+  assert.equal(listing.byName.get("demo").socketDir, null);
+  assert.equal(listing.byName.get("shared").backend, undefined);
+  assert.equal(listing.byName.get("shared").socketDir, "/cache/gsb-zsock");
+  // A live zellij session of the same name keeps its own provenance.
+  const clash = mergeHerdrSessions(mergeSessionLines([["demo [Created now]"]], ["/cache/gsb-zsock"]), lines);
+  assert.equal(clash.byName.get("demo").backend, undefined);
+  assert.equal(clash.lines.filter((line) => line.startsWith("demo")).length, 1);
+});
+
+test("herdr session state attaches via gsb-local open instead of a zellij socket", () => {
+  const state = sessionState("demo", "/missing", "demo herdr workspace (running)", { backend: "herdr" }, { env: { TMPDIR: "/tmp" } });
+  assert.equal(state.status, "running");
+  assert.equal(state.socketLabel, "herdr");
+  assert.equal(state.socketDir, null);
+  assert.equal(state.attachHint, "gsb-local open demo");
 });
 
 test("session provenance labels attachable live sessions and hides behind its rollback switch", () => {
@@ -280,7 +361,8 @@ test("Studio merges unified and default Zellij session views", async () => {
         : { stdout: "shared [Created now]\nlegacy [Created now]\n" };
     },
   });
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map((call) => call.command), ["zellij", "zellij", "herdr"]);
   assert.ok(sessions.includes("shared [Created now]"));
   assert.ok(sessions.some((line) => line.startsWith("unified ")));
   assert.ok(sessions.some((line) => line.startsWith("legacy ")));
@@ -318,7 +400,7 @@ test("the default role map is sourced from config1 without changing its CLI path
 test("pane GSB decisions classify every direct environment fallback", () => {
   const source = readFileSync(path.join(ROOT_DIR, "gsb"), "utf8");
   const expectedStripped = new Set(`
-    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR
+    GSB_LOCAL_ROOT GSB_WORKSPACE GSB_SESSION GSB_AGENT GSB_STATE_DIR GSB_MUX
     GSB_PROJECT_DIR GSB_PROMPTS_DIR GSB_PROFILES_DIR
     GSB_CONFIG_PATH GSB_MODELS_CONFIG_PATH GSB_CONFIG_SOURCE GSB_CONFIG_PROFILE
     GSB_PROTOCOL_FILE GSB_ROLE_ROSTER GSB_LAYOUT_FILE GSB_SESSION_ENV_FILE
@@ -329,6 +411,7 @@ test("pane GSB decisions classify every direct environment fallback", () => {
   const preserved = new Set(`
     GSB_MODEL GSB_EFFORT GSB_KIMI_MODEL GSB_KIMI_HOST_CWD GSB_CONFIG
     GSB_MODELS_CONFIG GSB_SOCKET_DIR_OVERRIDE
+    GSB_HERDR_BIN GSB_HERDR_AUTOSTART GSB_HERDR_START_DELAY
   `.trim().split(/\s+/));
   const denylistBlock = source.match(/PANE_RUNTIME_VARS=\(\n([\s\S]*?)\n\)/);
   assert.ok(denylistBlock, "pane runtime denylist must remain explicit");
@@ -848,15 +931,16 @@ test("session listing caches for 30 seconds and supports explicit invalidation",
       return { stdout: spawnOptions.env.ZELLIJ_SOCKET_DIR === "/unified" ? "shared [Created now]\n" : "legacy [Created now]\n" };
     }),
   };
+  // Each fresh listing spawns two zellij probes plus one herdr probe.
   assert.equal((await listSessions(options)).length, 2);
   assert.equal((await listSessions(options)).length, 2);
-  assert.equal(calls, 2);
+  assert.equal(calls, 3);
   currentTime += 29_999; await listSessions(options);
-  assert.equal(calls, 2);
+  assert.equal(calls, 3);
   currentTime += 2; await listSessions(options);
-  assert.equal(calls, 4);
-  invalidateSessionCache(cache); await listSessions(options);
   assert.equal(calls, 6);
+  invalidateSessionCache(cache); await listSessions(options);
+  assert.equal(calls, 9);
 });
 
 test("runtime command validation caches a repeated available command", async () => {

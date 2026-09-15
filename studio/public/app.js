@@ -235,7 +235,7 @@ function sessionDetailView(session) {
   if (target.attachHint && (target.status === "running" || target.crossSocketExited)) {
     groups.push({
       title: "ATTACH / READ ONLY",
-      items: [{ title: "按 Socket 归属进入", code: target.attachHint }],
+      items: [{ title: target.socketLabel === "herdr" ? "用 gsb-local open 进入" : "按 Socket 归属进入", code: target.attachHint }],
       empty: "",
     });
   }
@@ -247,7 +247,7 @@ function sessionDetailView(session) {
     facts: [
       ["状态", (target.status || "unknown").toUpperCase()],
       ["关联项目", target.workspace || "未记录关联项目"],
-      ...(target.socketLabel ? [["Socket 归属", target.socketLabel]] : []),
+      ...(target.socketLabel ? [[target.socketLabel === "herdr" ? "复用器后端" : "Socket 归属", target.socketLabel]] : []),
       ...(Object.hasOwn(target, "watchdogHeartbeatMs") ? [["Watchdog 心跳", watchdogHeartbeat(target.watchdogHeartbeatMs)]] : []),
       ["更新时间", detailTime(target.updatedAt)],
       ["角色数量", String(target.roles?.length || 0)],
@@ -699,6 +699,7 @@ function workbenchForTemplate(template) {
     session: workbench.session,
     name: workbench.name,
     permission: workbench.permission,
+    mux: workbench.mux === "herdr" ? "herdr" : "zellij",
     watchdog: workbench.watchdog,
     rebuild: workbench.rebuild,
   };
@@ -729,6 +730,7 @@ function workbenchForTemplateEdit(template) {
     templateOrigin: { id: template.id, version: template.version },
     hubCore: template.hubCore,
     permission: template.permission || "balanced",
+    mux: "zellij",
     watchdog: template.watchdog !== false,
     rebuild: false,
     roles,
@@ -1257,6 +1259,8 @@ function renderRuntime() {
   $("#workbench-name").value = workbench.name || "";
   const permission = document.querySelector(`input[name="permission"][value="${CSS.escape(workbench.permission || "balanced")}"]`);
   if (permission) permission.checked = true;
+  const mux = document.querySelector(`input[name="mux"][value="${workbench.mux === "herdr" ? "herdr" : "zellij"}"]`);
+  if (mux) mux.checked = true;
   $("#watchdog-enabled").checked = workbench.watchdog !== false;
   $("#rebuild-session").checked = workbench.rebuild === true;
   renderResourceBrowser();
@@ -1768,6 +1772,7 @@ function renderSummary() {
   $("#summary-profile").textContent = profileName(workbench.profile);
   $("#summary-session").textContent = workbench.session || "—";
   $("#summary-permission").textContent = (workbench.permission || "balanced").toUpperCase();
+  $("#summary-mux").textContent = (workbench.mux === "herdr" ? "herdr" : "zellij").toUpperCase();
   $("#summary-watch").textContent = workbench.watchdog === false ? "OFF" : "ON";
   $("#save-config").textContent = "保存配置";
   $("#save-config-note").textContent = workbench.profile?.startsWith("user:")
@@ -2312,6 +2317,7 @@ function bindEvents() {
   });
   $("#workbench-name").addEventListener("input", (event) => { workbench.name = event.target.value; renderSummary(); scheduleValidation(); });
   $$('input[name="permission"]').forEach((input) => input.addEventListener("change", (event) => { workbench.permission = event.target.value; renderSummary(); scheduleValidation(); }));
+  $$('input[name="mux"]').forEach((input) => input.addEventListener("change", (event) => { workbench.mux = event.target.value; renderSummary(); scheduleValidation(); }));
   $("#watchdog-enabled").addEventListener("change", (event) => { workbench.watchdog = event.target.checked; renderSummary(); scheduleValidation(); });
   $("#rebuild-session").addEventListener("change", (event) => { workbench.rebuild = event.target.checked; renderSaveState(); scheduleValidation(); });
   ["#workspace-path", "#session-name", "#role-id", "#role-agent", "#role-model"].forEach((selector) => {

@@ -109,6 +109,7 @@ function sidecarValue(workbench) {
     profile: workbench.profile,
     session: workbench.session,
     permission: workbench.permission,
+    mux: workbench.mux === "herdr" ? "herdr" : "zellij",
     watchdog: workbench.watchdog,
     rebuild: workbench.rebuild,
     ...(templateOrigin ? { templateOrigin } : {}),
@@ -173,7 +174,7 @@ function assertStagedRoundTrip(workbench, stagingDirectory) {
 function sidecarFields(workspace, projectName, value) {
   if (!value) return null;
   const saved = { workspace, projectName };
-  for (const key of ["version", "name", "profile", "session", "permission", "watchdog", "rebuild"]) {
+  for (const key of ["version", "name", "profile", "session", "permission", "mux", "watchdog", "rebuild"]) {
     if (value[key] !== undefined) saved[key] = value[key];
   }
   const templateOrigin = normalizedTemplateOrigin(value);
