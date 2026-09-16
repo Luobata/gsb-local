@@ -268,6 +268,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .role-item b { display: block; font-size: 12px; font-weight: 600; }
 .role-item small { display: block; max-width: 130px; overflow: hidden; color: var(--faint); font: 10px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 
+.role-drag { display: grid; grid-template-columns: 14px 1fr auto; align-items: stretch; gap: 4px; }
+.role-handle { align-self: center; color: var(--faint); cursor: grab; font: 11px var(--mono); line-height: 1; padding: 0 2px; text-align: center; user-select: none; }
+.role-drag:active .role-handle { cursor: grabbing; }
+.role-drag.is-dragging { opacity: 0.45; }
+.role-nudge { display: flex; flex-direction: column; gap: 2px; justify-content: center; }
+.role-nudge-button { padding: 1px 3px; border: none; background: transparent; color: var(--faint); cursor: pointer; font: 8px var(--mono); line-height: 1; }
+.role-nudge-button:hover:not(:disabled) { color: var(--ink); }
+.role-nudge-button:disabled { opacity: 0.35; cursor: default; }
+
 .role-editor { padding: 24px clamp(20px, 3vw, 38px) 30px; }
 .role-editor-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 22px; }
 .role-editor-head h2 { margin: 5px 0 0; font: 600 30px var(--display); }
@@ -610,6 +619,7 @@ body.has-detail-open { overflow: hidden; }
   .roster-layout { grid-template-columns: 1fr; }
   .role-rail { border: 0; border-bottom: 1px solid var(--line); }
   .role-list { display: flex; overflow-x: auto; }
+  .role-drag { min-width: 175px; display: grid; }
   .role-item { min-width: 150px; }
   .hub-core-capabilities { grid-template-columns: 1fr; }
   .hub-core-capabilities > span { border-right: 0; border-bottom: 1px solid var(--line); }

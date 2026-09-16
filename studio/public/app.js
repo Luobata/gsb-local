@@ -1181,10 +1181,69 @@ function renderProfiles() {
   grid.replaceChildren(...templates.map(profileCard), blankTemplateCard());
 }
 
+let dragRoleIndex = null;
+
+// Role order is contractual: it fixes the spoke stacking order in the workbench
+// layout and the roster file, so reordering is a normal edit that marks the
+// workbench dirty and re-validates like any other field.
+function moveRole(from, to) {
+  const roles = workbench?.roles || [];
+  if (from === to || from < 0 || from >= roles.length || to < 0 || to >= roles.length) return;
+  const [moved] = roles.splice(from, 1);
+  roles.splice(to, 0, moved);
+  if (currentRole === from) currentRole = to;
+  else if (from < currentRole && to >= currentRole) currentRole -= 1;
+  else if (from > currentRole && to <= currentRole) currentRole += 1;
+  renderRoleList();
+  renderRoleEditor();
+  renderSummary();
+  renderSaveState();
+  scheduleValidation();
+}
+
+// Insertion point for a pointer event relative to one list row: the list is a
+// vertical stack on desktop and scrolls horizontally on narrow screens, so
+// pick the axis the row actually spans.
+function dropIsBefore(event, row) {
+  const rect = row.getBoundingClientRect();
+  return rect.width > rect.height
+    ? event.clientX < rect.left + rect.width / 2
+    : event.clientY < rect.top + rect.height / 2;
+}
+
 function renderRoleList() {
   const list = $("#role-list");
   list.replaceChildren(...workbench.roles.map((role, index) => {
-    const button = element("button", `role-item${index === currentRole ? " is-active" : ""}`);
+    const row = element("div", `role-drag${index === currentRole ? " is-active" : ""}`);
+    row.draggable = true;
+    row.addEventListener("dragstart", (event) => {
+      dragRoleIndex = index;
+      row.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", `role:${index}`);
+    });
+    row.addEventListener("dragend", () => {
+      dragRoleIndex = null;
+      for (const child of list.children) child.classList.remove("is-dragging");
+    });
+    // Live sorting: reorder on dragover, not on drop. Synthetic drags (and
+    // some embedding webviews) only deliver sparse dragover waypoints, and a
+    // drop is only dispatched when the previous dragover at that exact spot
+    // called preventDefault — deciding on drop alone silently no-ops there.
+    row.addEventListener("dragover", (event) => {
+      if (dragRoleIndex === null || dragRoleIndex === index) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      const insertAt = dropIsBefore(event, row) ? index : index + 1;
+      const target = insertAt > dragRoleIndex ? insertAt - 1 : insertAt;
+      if (target !== dragRoleIndex) moveRole(dragRoleIndex, target);
+    });
+    row.addEventListener("drop", (event) => event.preventDefault());
+
+    const handle = element("span", "role-handle", "⠿");
+    handle.title = "拖拽调整角色顺序";
+
+    const button = element("button", "role-item");
     button.type = "button";
     button.append(element("span", "role-number", String(index + 1).padStart(2, "0")));
     const body = element("span");
@@ -1195,7 +1254,26 @@ function renderRoleList() {
       renderRoleList();
       renderRoleEditor();
     });
-    return button;
+
+    const nudge = element("span", "role-nudge");
+    const up = element("button", "role-nudge-button");
+    up.type = "button";
+    up.title = "上移角色";
+    up.setAttribute("aria-label", `上移角色 ${role.id}`);
+    up.textContent = "▲";
+    up.disabled = index === 0;
+    up.addEventListener("click", () => moveRole(index, index - 1));
+    const down = element("button", "role-nudge-button");
+    down.type = "button";
+    down.title = "下移角色";
+    down.setAttribute("aria-label", `下移角色 ${role.id}`);
+    down.textContent = "▼";
+    down.disabled = index === workbench.roles.length - 1;
+    down.addEventListener("click", () => moveRole(index, index + 1));
+    nudge.append(up, down);
+
+    row.append(handle, button, nudge);
+    return row;
   }));
 }
 

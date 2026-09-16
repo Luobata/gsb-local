@@ -539,6 +539,25 @@ test("Studio frontend renders provenance only when structured fields are present
   assert.match(styles, /\.detail-code/);
 });
 
+test("Studio role rail supports drag-to-reorder with a button fallback", () => {
+  const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  // Reordering is a workbench edit: it must keep the edited selection, mark
+  // the draft dirty, and re-run validation like any other field.
+  assert.match(app, /function moveRole\(from, to\)/);
+  assert.match(app, /renderSaveState\(\);\s*\n\s*scheduleValidation\(\);[\s\S]*?\}\s*\n\s*\/\/ Insertion point/);
+  assert.match(app, /row\.draggable = true/);
+  assert.match(app, /addEventListener\("dragstart"/);
+  // Live sorting: the reorder happens on dragover so sparse synthetic drag
+  // waypoints (no final dragover => no drop event) still reorder.
+  assert.match(app, /Live sorting: reorder on dragover/);
+  assert.match(app, /addEventListener\("dragover"/);
+  assert.match(app, /setAttribute\("aria-label", `上移角色/);
+  assert.match(app, /setAttribute\("aria-label", `下移角色/);
+  assert.match(styles, /\.role-handle/);
+  assert.match(styles, /\.role-drag\.is-dragging/);
+});
+
 test("Studio launch controls expose validation state and a direct project edit action", () => {
   const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
   const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");
