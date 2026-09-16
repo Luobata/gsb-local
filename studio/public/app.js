@@ -1182,6 +1182,8 @@ function renderProfiles() {
 }
 
 let dragRoleIndex = null;
+let dragInsertAt = null;
+let dragDropped = false;
 
 // Role order is contractual: it fixes the spoke stacking order in the workbench
 // layout and the roster file, so reordering is a normal edit that marks the
@@ -1201,44 +1203,68 @@ function moveRole(from, to) {
   scheduleValidation();
 }
 
-// Insertion point for a pointer event relative to one list row: the list is a
-// vertical stack on desktop and scrolls horizontally on narrow screens, so
-// pick the axis the row actually spans.
+// Insertion point for a pointer event relative to one list row. The axis
+// follows the LIST's layout (the desktop rail stacks rows vertically while
+// the narrow-screen media query lays it out horizontally) — a row's own
+// width/height shape cannot decide this, because desktop rows are also wider
+// than they are tall.
 function dropIsBefore(event, row) {
+  const rail = row.parentElement;
+  const style = rail ? getComputedStyle(rail) : null;
+  // Non-flex containers still report flex-direction "row" (the property's
+  // initial value), so the display check must come first.
+  const horizontal = style?.display === "flex" && (style.flexDirection === "row" || style.flexDirection === "row-reverse");
   const rect = row.getBoundingClientRect();
-  return rect.width > rect.height
+  return horizontal
     ? event.clientX < rect.left + rect.width / 2
     : event.clientY < rect.top + rect.height / 2;
 }
 
 function renderRoleList() {
   const list = $("#role-list");
+  const applyDrag = (from, insertAt) => {
+    if (from === null || insertAt === null) return;
+    moveRole(from, insertAt > from ? insertAt - 1 : insertAt);
+  };
   list.replaceChildren(...workbench.roles.map((role, index) => {
     const row = element("div", `role-drag${index === currentRole ? " is-active" : ""}`);
     row.draggable = true;
     row.addEventListener("dragstart", (event) => {
       dragRoleIndex = index;
+      dragInsertAt = null;
+      dragDropped = false;
       row.classList.add("is-dragging");
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", `role:${index}`);
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", `role:${index}`);
+      }
     });
     row.addEventListener("dragend", () => {
+      row.classList.remove("is-dragging");
+      for (const child of list.children) child.classList.remove("is-drop-before", "is-drop-after");
+      // Destroying the dragged node mid-drag aborts HTML5 drag sessions in
+      // real browsers, so the DOM only changes after the drag settles — and
+      // a dragend that never saw a drop (sparse synthetic waypoints) still
+      // applies the last recorded insertion point.
+      if (!dragDropped) applyDrag(dragRoleIndex, dragInsertAt);
       dragRoleIndex = null;
-      for (const child of list.children) child.classList.remove("is-dragging");
+      dragInsertAt = null;
     });
-    // Live sorting: reorder on dragover, not on drop. Synthetic drags (and
-    // some embedding webviews) only deliver sparse dragover waypoints, and a
-    // drop is only dispatched when the previous dragover at that exact spot
-    // called preventDefault — deciding on drop alone silently no-ops there.
     row.addEventListener("dragover", (event) => {
       if (dragRoleIndex === null || dragRoleIndex === index) return;
       event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      const insertAt = dropIsBefore(event, row) ? index : index + 1;
-      const target = insertAt > dragRoleIndex ? insertAt - 1 : insertAt;
-      if (target !== dragRoleIndex) moveRole(dragRoleIndex, target);
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const before = dropIsBefore(event, row);
+      dragInsertAt = before ? index : index + 1;
+      for (const child of list.children) child.classList.remove("is-drop-before", "is-drop-after");
+      row.classList.add(before ? "is-drop-before" : "is-drop-after");
     });
-    row.addEventListener("drop", (event) => event.preventDefault());
+    row.addEventListener("drop", (event) => {
+      if (dragRoleIndex === null) return;
+      event.preventDefault();
+      dragDropped = true;
+      applyDrag(dragRoleIndex, dropIsBefore(event, row) ? index : index + 1);
+    });
 
     const handle = element("span", "role-handle", "⠿");
     handle.title = "拖拽调整角色顺序";
@@ -1275,6 +1301,21 @@ function renderRoleList() {
     row.append(handle, button, nudge);
     return row;
   }));
+  // Dropping into the list's trailing padding targets the end position. Row
+  // dragovers bubble up here too — ignore those so they keep the insertion
+  // point the row computed instead of overwriting it with "append to end".
+  list.ondragover = (event) => {
+    if (dragRoleIndex === null || event.target !== list) return;
+    event.preventDefault();
+    dragInsertAt = workbench.roles.length;
+    for (const child of list.children) child.classList.remove("is-drop-before", "is-drop-after");
+  };
+  list.ondrop = (event) => {
+    if (dragRoleIndex === null || event.target !== list) return;
+    event.preventDefault();
+    dragDropped = true;
+    applyDrag(dragRoleIndex, workbench.roles.length);
+  };
 }
 
 function renderRoleEditor() {

@@ -548,14 +548,18 @@ test("Studio role rail supports drag-to-reorder with a button fallback", () => {
   assert.match(app, /renderSaveState\(\);\s*\n\s*scheduleValidation\(\);[\s\S]*?\}\s*\n\s*\/\/ Insertion point/);
   assert.match(app, /row\.draggable = true/);
   assert.match(app, /addEventListener\("dragstart"/);
-  // Live sorting: the reorder happens on dragover so sparse synthetic drag
-  // waypoints (no final dragover => no drop event) still reorder.
-  assert.match(app, /Live sorting: reorder on dragover/);
+  // The DOM must not change during the drag: destroying the dragged node
+  // aborts HTML5 drag sessions in real browsers. Reorder applies on drop, or
+  // on dragend when sparse synthetic waypoints never delivered a drop.
+  assert.match(app, /Destroying the dragged node mid-drag aborts HTML5 drag/);
   assert.match(app, /addEventListener\("dragover"/);
+  assert.match(app, /addEventListener\("drop"/);
+  assert.match(app, /dragDropped/);
   assert.match(app, /setAttribute\("aria-label", `上移角色/);
   assert.match(app, /setAttribute\("aria-label", `下移角色/);
   assert.match(styles, /\.role-handle/);
   assert.match(styles, /\.role-drag\.is-dragging/);
+  assert.match(styles, /\.role-drag\.is-drop-before/);
 });
 
 test("Studio launch controls expose validation state and a direct project edit action", () => {
