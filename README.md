@@ -47,7 +47,7 @@ herdr 后端下，一个 GSB 会话对应本地 herdr server 里 label 为 `gsb-
 
 关闭整个会话：Zellij 后端在会话内按 `Ctrl+Q`，或任意后端在命令行执行 `gsb-local close SESSION`——它会按该会话自己的后端关闭全部 pane、停止 watchdog，并保留任务板、合同、报告与 `session.json`，之后 `gsb-local open SESSION` 可随时重建。herdr TUI 内也可以用 `ctrl+b` 前缀加 `shift+d`（close_workspace，默认带确认）关闭当前 workspace。
 
-项目配置本身与后端无关：同一份 `.gsb-local/projects/<项目名>/` 配置可以用不同会话名分别跑在两个后端上。Studio 启动面板的「复用器后端」（Zellij / herdr）是启动级选择，随 `workbench.json` 保存为该项目的默认；选择 herdr 时 Studio 会先确认 herdr 命令存在，会话列表也会同时收录两个后端的运行会话（herdr 会话显示 `herdr` 归属，进入方式为 `gsb-local open <会话名>`）。
+项目配置本身与后端无关：同一份 `.gsb-local/projects/<项目名>/` 配置可以用不同会话名分别跑在两个后端上。重复执行 `gsb-local <目录> <会话名>` 时，后端跟随该会话在 `session.json` 里记录的选择（无需再传 `--mux`）；只有显式传 `--mux` 加 `--rebuild` 才是切换后端。Studio 启动面板的「复用器后端」（Zellij / herdr）是启动级选择，随 `workbench.json` 保存为该项目的默认；选择 herdr 时 Studio 会先确认 herdr 命令存在，会话列表也会同时收录两个后端的运行会话（herdr 会话显示 `herdr` 归属，进入方式为 `gsb-local open <会话名>`）。
 
 只在后台创建、不立即占用当前终端：
 

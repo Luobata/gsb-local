@@ -734,7 +734,13 @@ BACKGROUND=false
 FULL_ACCESS=false
 CONFIG_PROFILE=""
 LIST_CONFIGS=false
-MUX="${GSB_MUX:-zellij}"
+MUX_EXPLICIT=false
+if [[ -n "${GSB_MUX:-}" ]]; then
+  MUX="$GSB_MUX"
+  MUX_EXPLICIT=true
+else
+  MUX=zellij
+fi
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --rebuild) REBUILD=true ;;
@@ -748,6 +754,7 @@ while [[ "${1:-}" == --* ]]; do
         exit 1
       fi
       MUX="$2"
+      MUX_EXPLICIT=true
       shift
       ;;
     --config[0-9]*) CONFIG_PROFILE="${1#--}" ;;
@@ -1187,6 +1194,19 @@ if [[ -n "$existing_workspace" && "$existing_workspace" != "$WORKSPACE" ]]; then
   printf 'Choose another session name, or reopen the saved session with: gsb-local open %s\n' "$SESSION" >&2
   exit 1
 fi
+
+# Backend follows the session's own durable metadata unless the caller chose
+# one explicitly: re-running `gsb-local <dir> <session>` on a herdr session
+# must attach on herdr, not trip the cross-backend guard with a confusing
+# "rebuild on zellij" hint. Switching backends still requires an explicit
+# --mux plus --rebuild.
+if [[ "$MUX_EXPLICIT" != true && -f "$GSB_SESSION_METADATA_FILE" ]]; then
+  SAVED_SESSION_MUX="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$GSB_SESSION_METADATA_FILE" mux 2>/dev/null || true)"
+  if [[ "$SAVED_SESSION_MUX" == herdr || "$SAVED_SESSION_MUX" == zellij ]]; then
+    MUX="$SAVED_SESSION_MUX"
+  fi
+fi
+export GSB_MUX="$MUX"
 
 # Attaching to an already-running session must be read-only. In particular,
 # do not rewrite its environment, roster, layout, or metadata from whichever
