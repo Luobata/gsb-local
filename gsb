@@ -656,6 +656,68 @@ if [[ "${1:-}" == "open" || "${1:-}" == "attach" ]]; then
   exec "$ROOT_DIR/gsb" "${OPEN_ARGS[@]}" "$OPEN_WORKSPACE" "$OPEN_SESSION"
 fi
 
+# Close a whole GSB session on whichever backend it runs on. Pane processes
+# die, the watchdog stops, but state files (task board, contracts, reports,
+# session.json) are preserved so `gsb-local open SESSION` can rebuild later —
+# the same lifecycle as pressing Ctrl+Q inside Zellij.
+if [[ "${1:-}" == "close" ]]; then
+  shift
+  CLOSE_SESSION="${1:-}"
+  if [[ -z "$CLOSE_SESSION" || -n "${2:-}" ]]; then
+    printf 'Usage: gsb-local close SESSION\n' >&2
+    exit 1
+  fi
+  if [[ ! "$CLOSE_SESSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'Session name may only contain letters, numbers, dot, underscore, and hyphen.\n' >&2
+    exit 1
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    printf 'Missing required command: node\n' >&2
+    exit 1
+  fi
+  CLOSE_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gsb-local/$CLOSE_SESSION"
+  CLOSE_METADATA="$CLOSE_STATE_DIR/session.json"
+  CLOSE_MUX=zellij
+  if [[ -f "$CLOSE_METADATA" ]]; then
+    CLOSE_MUX="$(node "$ROOT_DIR/bin/session-meta.mjs" get "$CLOSE_METADATA" mux 2>/dev/null || printf zellij)"
+  fi
+
+  stop_watchdog_for_close() {
+    local watchdog_pidfile="$CLOSE_STATE_DIR/watchdog.pid" previous_watchdog
+    if [[ -f "$watchdog_pidfile" ]]; then
+      previous_watchdog="$(cat "$watchdog_pidfile" 2>/dev/null || true)"
+      if [[ -n "$previous_watchdog" ]] && kill -0 "$previous_watchdog" 2>/dev/null; then
+        kill "$previous_watchdog" 2>/dev/null || true
+      fi
+    fi
+    cleanup_watchdog_artifacts "$CLOSE_STATE_DIR"
+  }
+  stop_watchdog_for_close
+
+  closed=false
+  if [[ "$CLOSE_MUX" == herdr ]]; then
+    if herdr_session_active "$CLOSE_SESSION"; then
+      herdr_workspace_close_by_label "$CLOSE_SESSION"
+      closed=true
+    fi
+  else
+    for close_dir in "$(session_socket_dir_from_env "$CLOSE_STATE_DIR/session.env")" "$(gsb_socket_dir)" "$(default_zellij_socket_dir)"; do
+      [[ -n "$close_dir" ]] || continue
+      if zellij_session_active_in "$close_dir" "$CLOSE_SESSION"; then
+        ZELLIJ_SOCKET_DIR="$close_dir" zellij delete-session --force "$CLOSE_SESSION" >/dev/null 2>&1 || true
+        closed=true
+        break
+      fi
+    done
+  fi
+  if [[ "$closed" == true ]]; then
+    printf 'Closed %s session: %s (state preserved; gsb-local open %s rebuilds it)\n' "$CLOSE_MUX" "$CLOSE_SESSION" "$CLOSE_SESSION"
+  else
+    printf 'No live %s session found for: %s (watchdog stopped if present)\n' "$CLOSE_MUX" "$CLOSE_SESSION"
+  fi
+  exit 0
+fi
+
 if [[ "${1:-}" == "--check" ]]; then
   printf 'GSB Local: %s\n' "$ROOT_DIR"
   printf 'Zellij:   %s\n' "$(zellij --version 2>/dev/null || printf 'missing')"
@@ -701,6 +763,7 @@ while [[ "${1:-}" == --* ]]; do
       printf '%s\n' \
         'Usage: gsb-local [--rebuild] [--background] [--full-access] [--mux zellij|herdr] [--config PROFILE|--configN] [WORKSPACE] [SESSION]' \
         '       gsb-local open [--background] SESSION' \
+        '       gsb-local close SESSION' \
         '       gsb-local layout-status [SESSION]' \
         '       gsb-local watchdog ensure-all|install|uninstall|status' \
         '       gsb-local studio [--project PATH] [--port PORT] [--no-open]' \
@@ -1399,12 +1462,23 @@ create_herdr_session() {
 
   # Layout contract: hub owns the left column; the first spoke splits the hub
   # to the right, further spokes stack downward inside that right column.
+  # herdr's --ratio is the share the SPLIT TARGET keeps (verified: ratio 0.25
+  # leaves the target at 25% and gives the new pane 75%), so equal spoke
+  # heights require splitting the previous spoke with ratio 1/(remaining
+  # shares) — a flat 0.5 would halve every successive spoke.
+  spoke_total=0
+  for role in "${ROLES[@]}"; do
+    [[ "$role" == hub ]] || spoke_total=$((spoke_total + 1))
+  done
   split_target="$hub_pane"
   split_direction=right
+  split_ratio=0.5
+  spoke_index=0
   registry="{\"backend\":\"herdr\",\"workspaceLabel\":\"$(herdr_workspace_label "$SESSION")\",\"panes\":{\"hub\":\"$hub_pane\""
   for role in "${ROLES[@]}"; do
     [[ "$role" == hub ]] && continue
-    role_pane="$("$(herdr_bin)" pane split "$split_target" --direction "$split_direction" --cwd "$WORKSPACE" --ratio 0.5 --no-focus 2>&1 | node -e '
+    spoke_index=$((spoke_index + 1))
+    role_pane="$("$(herdr_bin)" pane split "$split_target" --direction "$split_direction" --cwd "$WORKSPACE" --ratio "$split_ratio" --no-focus 2>&1 | node -e '
       let raw = "";
       process.stdin.on("data", (chunk) => raw += chunk);
       process.stdin.on("end", () => {
@@ -1414,6 +1488,7 @@ create_herdr_session() {
     [[ -n "$role_pane" ]] || return 1
     split_target="$role_pane"
     split_direction=down
+    split_ratio="$(awk -v remaining="$((spoke_total - spoke_index + 1))" 'BEGIN { printf "%.4f", 1 / remaining }')"
     "$(herdr_bin)" pane rename "$role_pane" "spk.$SESSION.$role" >/dev/null || return 1
     sleep "${GSB_HERDR_START_DELAY:-0.5}"
     command_text="source $(printf '%q' "$GSB_SESSION_ENV_FILE") && exec $(printf '%q' "$ROOT_DIR/bin/supervise") $(printf '%q' "$role")"

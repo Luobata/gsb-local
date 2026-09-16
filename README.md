@@ -43,7 +43,9 @@ Studio 默认缓存 Agent 命令存在性检查：可用命令在当前进程内
 gsb-local --mux herdr /path/to/your/repository my-task
 ```
 
-herdr 后端下，一个 GSB 会话对应本地 herdr server 里 label 为 `gsb-<会话名>` 的 workspace：Hub 是 workspace 根 pane，第一个 Spoke 从 Hub 向右分裂、其余 Spoke 在右列向下堆叠，pane label 仍使用 canonical 标题（`hub.<会话>.main` / `spk.<会话>.<角色>`），因此 nudge、relay、watchdog、`layout-status` 与 pane 寻址行为与 Zellij 后端一致。后端选择写入 `session.json` 与 `session.env`（`GSB_MUX`），`gsb-local open` 会按会话自己的后端 attach 或重建，无需再次传 `--mux`。同名会话同时只允许在一个后端上存活：另一后端仍有同名会话时启动会拒绝，`--rebuild` 会先关闭旧后端会话，这也是显式的后端切换方式。herdr server 未运行时会自动后台启动（`GSB_HERDR_AUTOSTART=false` 关闭）；`GSB_HERDR_BIN` 可覆盖 herdr 可执行文件路径，`GSB_HERDR_START_DELAY` 控制每 pane 启动命令前的等待。herdr 后端的 `layout-status` 不校验列几何，只报告角色存活、标题与 herdr 自带的 agent 状态。
+herdr 后端下，一个 GSB 会话对应本地 herdr server 里 label 为 `gsb-<会话名>` 的 workspace：Hub 是 workspace 根 pane，第一个 Spoke 从 Hub 向右分裂、其余 Spoke 在右列向下堆叠且**等高**（按剩余份额递推 split ratio），pane label 仍使用 canonical 标题（`hub.<会话>.main` / `spk.<会话>.<角色>`），因此 nudge、relay、watchdog、`layout-status` 与 pane 寻址行为与 Zellij 后端一致。后端选择写入 `session.json` 与 `session.env`（`GSB_MUX`），`gsb-local open` 会按会话自己的后端 attach 或重建，无需再次传 `--mux`。同名会话同时只允许在一个后端上存活：另一后端仍有同名会话时启动会拒绝，`--rebuild` 会先关闭旧后端会话，这也是显式的后端切换方式。herdr server 未运行时会自动后台启动（`GSB_HERDR_AUTOSTART=false` 关闭）；`GSB_HERDR_BIN` 可覆盖 herdr 可执行文件路径，`GSB_HERDR_START_DELAY` 控制每 pane 启动命令前的等待。herdr 后端的 `layout-status` 不校验列几何，只报告角色存活、标题与 herdr 自带的 agent 状态。
+
+关闭整个会话：Zellij 后端在会话内按 `Ctrl+Q`，或任意后端在命令行执行 `gsb-local close SESSION`——它会按该会话自己的后端关闭全部 pane、停止 watchdog，并保留任务板、合同、报告与 `session.json`，之后 `gsb-local open SESSION` 可随时重建。herdr TUI 内也可以用 `ctrl+b` 前缀加 `shift+d`（close_workspace，默认带确认）关闭当前 workspace。
 
 项目配置本身与后端无关：同一份 `.gsb-local/projects/<项目名>/` 配置可以用不同会话名分别跑在两个后端上。Studio 启动面板的「复用器后端」（Zellij / herdr）是启动级选择，随 `workbench.json` 保存为该项目的默认；选择 herdr 时 Studio 会先确认 herdr 命令存在，会话列表也会同时收录两个后端的运行会话（herdr 会话显示 `herdr` 归属，进入方式为 `gsb-local open <会话名>`）。
 
