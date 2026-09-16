@@ -1542,12 +1542,25 @@ function staticFile(response, pathname) {
   return true;
 }
 
-function pickDirectory() {
+let pendingPickDirectory = null;
+
+// The native folder dialog legally stays open for as long as the user browses;
+// the previous spawnSync call counted that time against a 10-second timeout
+// and blocked the whole server while waiting. Run the dialog detached from the
+// event loop, let concurrent requests share one dialog, and only reap it after
+// ten minutes so a forgotten dialog cannot wedge the UI forever.
+export async function pickDirectory({ spawnImpl = spawn, timeoutMs = 10 * 60_000 } = {}) {
   if (process.platform !== "darwin") throw new Error("当前平台请直接输入绝对项目路径");
-  const result = spawnSync("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择 GSB 项目目录")'], { encoding: "utf8", timeout: 10_000 });
-  if (result.error?.code === "ETIMEDOUT") throw new Error("目录选择超时，请直接输入绝对项目路径");
-  if (result.status !== 0) throw new Error("已取消目录选择");
-  return result.stdout.trim().replace(/\/$/, "");
+  if (pendingPickDirectory) return pendingPickDirectory;
+  const attempt = (async () => {
+    const result = await spawnResult(spawnImpl, "osascript",
+      ["-e", 'POSIX path of (choose folder with prompt "选择 GSB 项目目录")'], {}, timeoutMs);
+    if (result.error?.code === "ETIMEDOUT") throw new Error("目录选择超时（10 分钟未确认），请直接输入绝对项目路径");
+    if (result.status !== 0) throw new Error("已取消目录选择");
+    return String(result.stdout || "").trim().replace(/\/$/, "");
+  })();
+  pendingPickDirectory = attempt.finally(() => { pendingPickDirectory = null; });
+  return pendingPickDirectory;
 }
 
 export function studioLaunchEnv(sourceEnv, watchdogEnabled) {
@@ -1734,7 +1747,7 @@ export function createStudioServer({ project, token, platform = process.platform
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/pick-directory") {
-        jsonResponse(response, 200, { path: pickDirectory() });
+        jsonResponse(response, 200, { path: await pickDirectory() });
         return;
       }
       jsonResponse(response, 404, { error: "Unknown API route" });

@@ -2166,7 +2166,19 @@ async function launch() {
   }
 }
 
+let browsePending = false;
+
 async function browseForProject({ focusTemplates = false } = {}) {
+  if (browsePending) return;
+  browsePending = true;
+  const buttons = [$("#browse-project"), $("#landing-browse-project")];
+  const previousLabels = buttons.map((button) => button?.textContent);
+  buttons.forEach((button) => {
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = "选择中…";
+  });
+  if (focusTemplates) $("#landing-project-status").lastChild.textContent = " 目录选择对话框已打开，请在弹窗中选择项目目录…";
   try {
     const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
     if (focusTemplates) {
@@ -2177,6 +2189,13 @@ async function browseForProject({ focusTemplates = false } = {}) {
     } else if (await loadProject({ path: result.path, name: "" })) goToStep("sec-templates");
   } catch (error) {
     if (!/取消/.test(error.message)) toast(error.message, "error");
+  } finally {
+    browsePending = false;
+    buttons.forEach((button, index) => {
+      if (!button) return;
+      button.disabled = false;
+      button.textContent = previousLabels[index];
+    });
   }
 }
 

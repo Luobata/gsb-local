@@ -25,6 +25,7 @@ import {
   parseArgs,
   parseProfileHeader,
   parseRoleMap,
+  pickDirectory,
   serializeAgents,
   serializeModels,
   sessionSocketLabel,
@@ -113,6 +114,25 @@ function asyncSpawnStub(handler) {
     return child;
   };
 }
+
+test("directory picking shares one native dialog and survives a slow choice", async () => {
+  if (process.platform !== "darwin") return;
+  let spawns = 0;
+  const slowPick = asyncSpawnStub(() => { spawns += 1; return { stdout: "/tmp/chosen-dir/\n", delay: 30 }; });
+  const [first, second] = await Promise.all([
+    pickDirectory({ spawnImpl: slowPick }),
+    pickDirectory({ spawnImpl: slowPick }),
+  ]);
+  assert.equal(first, "/tmp/chosen-dir");
+  assert.equal(second, "/tmp/chosen-dir");
+  assert.equal(spawns, 1);
+
+  await assert.rejects(() => pickDirectory({ spawnImpl: asyncSpawnStub(() => ({ status: 1 })) }), /已取消目录选择/);
+
+  // The pending slot clears after settle, so a retry opens a fresh dialog.
+  const retried = await pickDirectory({ spawnImpl: asyncSpawnStub(() => ({ stdout: "/tmp/second/\n" })) });
+  assert.equal(retried, "/tmp/second");
+});
 
 test("Studio accepts an omitted project and still validates explicit project arguments", () => {
   assert.equal(parseArgs([]).project, "");
