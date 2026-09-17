@@ -182,11 +182,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-total { min-width: 72px; display: grid; justify-items: end; color: var(--faint); font: 10px var(--mono); letter-spacing: .12em; }
 .project-total b { color: var(--signal); font: 30px var(--display); }
 .project-landing-path { margin: 18px 0 10px; }
-.landing-name-field { width: 168px; flex: none; }
 .landing-open-button { white-space: nowrap; }
-.landing-columns { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 30px; align-items: start; }
-.landing-templates .project-landing-head { margin-bottom: 17px; }
-.landing-templates .project-landing-head h2 { font-size: clamp(20px, 2vw, 26px); }
+.landing-columns { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 34px; align-items: start; }
 /* Templates are a secondary column: horizontal compact actions instead of
    the stacked launch rail used by project rows elsewhere. */
 .landing-templates .project-quick-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
@@ -211,7 +208,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .quick-open-command code { overflow-wrap: anywhere; color: var(--signal); font: 10px/1.45 var(--mono); user-select: all; }
 .quick-open-command .copy-command-button { min-height: 26px; padding-inline: 7px; font-size: 10px; }
 .shell.is-project-only { grid-template-columns: 1fr; }
-.shell.is-project-only .workspace { width: min(1220px, 100%); margin: 0 auto; padding: clamp(28px, 5vh, 48px) clamp(18px, 4vw, 42px) 38px; border-right: 0; }
+.shell.is-project-only .workspace { width: min(1720px, 100%); margin: 0 auto; padding: clamp(28px, 5vh, 48px) clamp(18px, 4vw, 42px) 38px; border-right: 0; }
 .shell.is-project-only .landing-head { margin-bottom: 24px; }
 .shell.is-project-only .landing-head h1 { max-width: none; font-size: clamp(32px, 5vw, 52px); }
 .shell.is-project-only #sec-projects { padding: clamp(22px, 3vw, 32px); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(18,24,20,.9), rgba(9,13,10,.82)); box-shadow: 0 28px 80px rgba(0,0,0,.22); }
@@ -657,3 +654,28 @@ body.has-detail-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Landing density — kept last so these overrides win the shared resource-row
+   base rules above. A wide window should read like a dashboard, not a
+   letterboxed phone page: scale up rows, badges, and the open/new form
+   instead of leaving the edges empty. Scoped to the landing lists so the
+   runtime resource browser keeps its compact density. */
+.project-landing-head h2 { font-size: clamp(26px, 2.6vw, 38px); }
+.project-landing-head p { font-size: 13px; }
+.project-total b { font-size: 34px; }
+.project-landing-list { padding: 10px; }
+.project-landing-list .resource-item { min-height: 84px; padding: 12px 13px; }
+.project-landing-list .resource-copy b { font-size: 14px; }
+.project-landing-list .resource-copy small { font-size: 11.5px; }
+.project-landing-list .resource-stat { font-size: 11px; }
+.project-landing-list .resource-badge { font-size: 11px; }
+.project-landing-list .resource-glyph { width: 34px; height: 34px; font-size: 11px; }
+.resource-note { font-size: 12px; }
+.project-landing-path input { height: 46px; font-size: 14px; }
+.project-landing-path .field > span { font-size: 12px; }
+.project-landing-path .field > span small { font-size: 11px; }
+.project-landing-path .primary-button, .project-landing-path .secondary-button { min-height: 46px; font-size: 13px; }
+.landing-name-field { width: 190px; flex: none; }
+.landing-templates .project-landing-head { margin-bottom: 17px; }
+.landing-templates .project-landing-head h2 { font-size: clamp(22px, 2vw, 30px); }
+.landing-templates .project-quick-edit, .landing-templates .project-quick-actions .text-button { font-size: 12px; }
