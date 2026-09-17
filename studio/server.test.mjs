@@ -612,6 +612,29 @@ test("landing page is a two-column layout with projects as the primary column", 
   assert.match(styles, /@media \(max-width: 1040px\)[\s\S]*?\.landing-columns \{ grid-template-columns: 1fr/);
 });
 
+test("themes restyle the whole app through the variable set", () => {
+  const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  // Midnight ships as the default; the original lime skin stays selectable.
+  assert.match(html, /<body data-theme="midnight">/);
+  assert.match(html, /id="theme-toggle"/);
+  for (const theme of ["midnight", "signal", "ember", "paper"]) {
+    assert.match(styles, new RegExp(`body\\[data-theme="${theme}"\\]`), theme);
+  }
+  // The light theme must flip the UA color scheme too, not just the palette.
+  assert.match(styles, /body\[data-theme="paper"\] \{\s*\n\s*color-scheme: light/);
+  assert.match(app, /const THEMES = \[/);
+  assert.match(app, /localStorage\.setItem\("gsb-theme"/);
+  // Literal accent tints may only live in :root and the theme blocks.
+  const rootStart = styles.indexOf(":root {");
+  const rootEnd = styles.indexOf("}", styles.indexOf("--card-grad", rootStart)) + 1;
+  const beforeThemes = styles.slice(rootEnd, styles.indexOf("body[data-theme=\"midnight\"]"));
+  assert.ok(beforeThemes.length > 100, "theme marker not found in stylesheet");
+  assert.doesNotMatch(beforeThemes, /rgba\(200,\s*255,\s*61/);
+  assert.doesNotMatch(beforeThemes, /#0b0f0c|#101511|#202620/);
+});
+
 test("a freshly loaded project is not dirty after prompt normalization", () => {
   const source = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
   // renderRoleEditor() calls ensurePromptState(), which fills promptMode/prompt

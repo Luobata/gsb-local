@@ -2293,6 +2293,32 @@ async function launch() {
 
 let browsePending = false;
 
+const THEMES = [
+  { id: "midnight", label: "午夜蓝" },
+  { id: "signal", label: "信号绿" },
+  { id: "ember", label: "余烬琥珀" },
+  { id: "paper", label: "纸面浅色" },
+];
+
+function savedTheme() {
+  try { return localStorage.getItem("gsb-theme") || ""; } catch { return ""; }
+}
+
+function applyTheme(id) {
+  const index = THEMES.findIndex((theme) => theme.id === id);
+  const theme = THEMES[index === -1 ? 0 : index];
+  document.body.dataset.theme = theme.id;
+  try { localStorage.setItem("gsb-theme", theme.id); } catch { /* private mode */ }
+  const button = $("#theme-toggle");
+  if (button) {
+    const next = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    button.textContent = theme.label;
+    button.title = `当前主题：${theme.label}，点击切换到 ${next.label}`;
+    button.setAttribute("aria-label", button.title);
+  }
+  return theme.id;
+}
+
 async function browseForProject({ focusTemplates = false } = {}) {
   if (browsePending) return;
   browsePending = true;
@@ -2463,6 +2489,12 @@ function bindEvents() {
   $$('input[name="permission"]').forEach((input) => input.addEventListener("change", (event) => { workbench.permission = event.target.value; renderSummary(); scheduleValidation(); }));
   $$('input[name="mux"]').forEach((input) => input.addEventListener("change", (event) => { workbench.mux = event.target.value; renderSummary(); scheduleValidation(); }));
   $("#watchdog-enabled").addEventListener("change", (event) => { workbench.watchdog = event.target.checked; renderSummary(); scheduleValidation(); });
+  $("#theme-toggle").addEventListener("click", () => {
+    const current = THEMES.findIndex((theme) => theme.id === document.body.dataset.theme);
+    const next = THEMES[(current + 1) % THEMES.length];
+    toast(`主题已切换：${next.label}`);
+    applyTheme(next.id);
+  });
   $("#rebuild-session").addEventListener("change", (event) => { workbench.rebuild = event.target.checked; renderSaveState(); scheduleValidation(); });
   ["#workspace-path", "#session-name", "#role-id", "#role-agent", "#role-model"].forEach((selector) => {
     $(selector).addEventListener("blur", (event) => requestValidation({ reportField: event.currentTarget }));
@@ -2569,6 +2601,7 @@ function bindEvents() {
 
 async function start() {
   if (!token) throw new Error("缺少本地 Studio token，请从 gsb-local studio 输出的地址进入");
+  applyTheme(savedTheme());
   bootstrap = await api("/api/bootstrap");
   if (bootstrap.product?.apiVersion !== 2) {
     throw new Error("Studio 服务端版本过旧。请回到启动它的终端按 Ctrl-C，然后重新运行 gsb-local studio");
