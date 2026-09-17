@@ -78,7 +78,10 @@ herdr_bin() {
 }
 
 herdr_server_reachable() {
-  "$(herdr_bin)" status >/dev/null 2>&1
+  # `herdr status` exits 0 even when the server is down (it just prints
+  # "status: not running"), so probe an operation that actually needs the
+  # socket: workspace list exits 1 when the server is unreachable.
+  "$(herdr_bin)" workspace list >/dev/null 2>&1
 }
 
 ensure_herdr_server() {
