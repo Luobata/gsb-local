@@ -66,41 +66,47 @@
         </div>
 
         <section id="sec-projects" class="stage is-active" data-stage="0">
-          <div class="project-landing-head">
-            <div>
-              <span class="eyebrow">PROJECTS / RECENT + ACTIVE</span>
-              <h2>从项目继续，而不是重新填写</h2>
-              <p>最近项目优先；已保存的角色、模板、会话和运行策略会随项目恢复。</p>
+          <div class="landing-columns">
+            <div class="landing-column landing-projects">
+              <div class="project-landing-head">
+                <div>
+                  <span class="eyebrow">PROJECTS / RECENT + ACTIVE</span>
+                  <h2>从项目继续</h2>
+                  <p>最近项目优先；已保存的角色、模板、会话和运行策略随项目恢复。</p>
+                </div>
+                <span class="project-total"><b id="landing-project-count">00</b><small>PROJECTS</small></span>
+              </div>
+              <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
+              <div class="path-control project-landing-path">
+                <label class="field grow">
+                  <span>打开其他项目 <small>输入绝对路径</small></span>
+                  <input id="landing-project-path" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/project" required />
+                </label>
+                <label class="field landing-name-field">
+                  <span>项目名 <small>新建必填</small></span>
+                  <input id="landing-project-name" autocomplete="off" spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="my-project" />
+                </label>
+                <button id="landing-browse-project" class="secondary-button" type="button" title="在系统对话框中选择项目目录">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
+                  选择目录
+                </button>
+                <button id="landing-open-project" class="primary-button landing-open-button" type="button">打开 / 新建</button>
+              </div>
+              <p id="landing-project-status" class="resource-note" aria-live="polite"><span aria-hidden="true">↳</span> 选择项目后进入完整工作台。</p>
             </div>
-            <span class="project-total"><b id="landing-project-count">00</b><small>PROJECTS</small></span>
-          </div>
-          <div class="path-control project-landing-path">
-            <label class="field grow">
-              <span>打开其他项目 <small>输入绝对路径</small></span>
-              <input id="landing-project-path" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/project" required />
-            </label>
-            <label class="field">
-              <span>项目名 <small>新建时必填，全局唯一</small></span>
-              <input id="landing-project-name" autocomplete="off" spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="my-project" />
-            </label>
-            <button id="landing-open-project" class="secondary-button" type="button">打开 / 新建</button>
-            <button id="landing-browse-project" class="secondary-button" type="button">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
-              选择目录
-            </button>
-          </div>
-          <p id="landing-project-status" class="resource-note" aria-live="polite"><span aria-hidden="true">↳</span> 选择项目后进入完整工作台。</p>
-          <div id="landing-project-options" class="resource-list project-landing-list" aria-label="最近与已配置项目"></div>
 
-          <div class="project-landing-head landing-template-head">
-            <div>
-              <span class="eyebrow">TEMPLATES / REUSABLE SPEC</span>
-              <h2>编辑模板，同步关联项目</h2>
-              <p>模板改动只写模板本身；保存后可选择把哪些使用它的项目一起更新。</p>
+            <div class="landing-column landing-templates">
+              <div class="project-landing-head">
+                <div>
+                  <span class="eyebrow">TEMPLATES / REUSABLE SPEC</span>
+                  <h2>模板</h2>
+                  <p>改动只写模板本身；保存后可同步关联项目。</p>
+                </div>
+                <span class="project-total"><b id="landing-template-count">00</b><small>TEMPLATES</small></span>
+              </div>
+              <div id="landing-template-options" class="resource-list project-landing-list" aria-label="可编辑模板"></div>
             </div>
-            <span class="project-total"><b id="landing-template-count">00</b><small>TEMPLATES</small></span>
           </div>
-          <div id="landing-template-options" class="resource-list project-landing-list" aria-label="可编辑模板"></div>
         </section>
 
         <section id="sec-templates" class="stage" data-stage="0" aria-labelledby="heading-templates">

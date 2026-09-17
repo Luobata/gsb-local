@@ -591,6 +591,27 @@ test("Studio launch controls expose validation state and a direct project edit a
   assert.match(styles, /\.primary-button:disabled \{ cursor: not-allowed; opacity: \.4/);
 });
 
+test("landing page is a two-column layout with projects as the primary column", () => {
+  const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  // Projects come first with the open/new form below the list; templates live
+  // in their own column instead of stacking under everything.
+  assert.match(html, /class="landing-columns"/);
+  assert.match(html, /class="landing-column landing-projects"/);
+  assert.match(html, /class="landing-column landing-templates"/);
+  const projectsPos = html.indexOf("landing-projects");
+  const templatesPos = html.indexOf("landing-templates");
+  const listPos = html.indexOf('id="landing-project-options"');
+  const formPos = html.indexOf('id="landing-open-project"');
+  assert.ok(projectsPos < templatesPos, "projects column precedes templates column");
+  assert.ok(listPos < formPos, "project list renders above the open/new form");
+  assert.match(html, /id="landing-open-project" class="primary-button/);
+  assert.match(styles, /\.landing-columns \{ display: grid; grid-template-columns: minmax\(0, 1\.5fr\) minmax\(0, 1fr\)/);
+  // One page-level scroll: landing lists must not keep their inner scrollbars.
+  assert.match(styles, /\.shell\.is-project-only \.project-landing-list \{ max-height: none; overflow: visible/);
+  assert.match(styles, /@media \(max-width: 1040px\)[\s\S]*?\.landing-columns \{ grid-template-columns: 1fr/);
+});
+
 test("a freshly loaded project is not dirty after prompt normalization", () => {
   const source = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
   // renderRoleEditor() calls ensurePromptState(), which fills promptMode/prompt

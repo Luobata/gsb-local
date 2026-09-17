@@ -181,8 +181,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .project-landing-head p { margin: 0; color: var(--muted); font-size: 12px; }
 .project-total { min-width: 72px; display: grid; justify-items: end; color: var(--faint); font: 10px var(--mono); letter-spacing: .12em; }
 .project-total b { color: var(--signal); font: 30px var(--display); }
-.project-landing-path { margin-bottom: 15px; }
-.landing-template-head { margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--line); }
+.project-landing-path { margin: 18px 0 10px; }
+.landing-name-field { width: 168px; flex: none; }
+.landing-open-button { white-space: nowrap; }
+.landing-columns { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 30px; align-items: start; }
+.landing-templates .project-landing-head { margin-bottom: 17px; }
+.landing-templates .project-landing-head h2 { font-size: clamp(20px, 2vw, 26px); }
+/* Templates are a secondary column: horizontal compact actions instead of
+   the stacked launch rail used by project rows elsewhere. */
+.landing-templates .project-quick-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
+.landing-templates .project-launch-row { grid-template-columns: minmax(0, 1fr) auto; }
 .template-mode-bar { border-color: var(--signal-dim); }
 .template-mode-badge { cursor: default; }
 .template-mode-badge .project-switcher-glyph { border-color: var(--signal); color: var(--signal); }
@@ -203,11 +211,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .quick-open-command code { overflow-wrap: anywhere; color: var(--signal); font: 10px/1.45 var(--mono); user-select: all; }
 .quick-open-command .copy-command-button { min-height: 26px; padding-inline: 7px; font-size: 10px; }
 .shell.is-project-only { grid-template-columns: 1fr; }
-.shell.is-project-only .workspace { width: min(920px, 100%); margin: 0 auto; padding: clamp(28px, 5vh, 48px) clamp(18px, 4vw, 42px) 38px; border-right: 0; }
+.shell.is-project-only .workspace { width: min(1220px, 100%); margin: 0 auto; padding: clamp(28px, 5vh, 48px) clamp(18px, 4vw, 42px) 38px; border-right: 0; }
 .shell.is-project-only .landing-head { margin-bottom: 24px; }
 .shell.is-project-only .landing-head h1 { max-width: none; font-size: clamp(32px, 5vw, 52px); }
 .shell.is-project-only #sec-projects { padding: clamp(22px, 3vw, 32px); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(18,24,20,.9), rgba(9,13,10,.82)); box-shadow: 0 28px 80px rgba(0,0,0,.22); }
-.shell.is-project-only .project-landing-list { max-height: min(440px, 48vh); }
+/* The landing page scrolls as one page; inner list scrollbars fight the page
+   scroll and hide rows behind a second viewport. */
+.shell.is-project-only .project-landing-list { max-height: none; overflow: visible; }
 
 .editor-project-bar { position: sticky; z-index: 17; top: 138px; min-height: 72px; margin: -8px 0 28px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line); background: linear-gradient(90deg, #101a17, var(--panel) 55%); }
 .project-switcher { min-width: 0; flex: 1; padding: 7px 10px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 0; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
@@ -597,6 +607,8 @@ body.has-detail-open { overflow: hidden; }
   .runtime-grid, .review-grid { grid-template-columns: 1fr; }
   .template-upgrade-body { grid-template-columns: 1fr; }
   .runtime-options { padding: 25px 0 0; border: 0; border-top: 1px solid var(--line); }
+  .landing-columns { grid-template-columns: 1fr; gap: 22px; }
+  .landing-templates .project-landing-head { padding-top: 18px; border-top: 1px solid var(--line); }
 }
 
 @media (max-width: 780px) {
