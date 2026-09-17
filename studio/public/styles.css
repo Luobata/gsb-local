@@ -468,7 +468,9 @@ input[readonly] { border-style: dashed; color: var(--signal-dim); cursor: not-al
 .launch-result.is-error { border-color: var(--danger); background: rgba(255,113,104,.045); }
 .launch-result h3 { margin: 0 0 8px; font: 18px var(--display); }
 .launch-result code { display: block; overflow: auto; color: var(--cyan); font: 10px var(--mono); white-space: nowrap; }
-.terminal-open-row { margin: 8px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.command-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; margin: 4px 0; }
+.command-row code { overflow-wrap: anywhere; white-space: normal; user-select: all; }
+.terminal-open-row { margin: 8px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; }
 .terminal-open-row code { min-width: 0; }
 
 .detail-backdrop { position: fixed; z-index: 45; inset: 0; background: rgba(2,7,7,.74); backdrop-filter: blur(5px); opacity: 0; transition: opacity 180ms ease; pointer-events: none; }

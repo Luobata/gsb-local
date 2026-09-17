@@ -562,6 +562,21 @@ test("Studio role rail supports drag-to-reorder with a button fallback", () => {
   assert.match(styles, /\.role-drag\.is-drop-before/);
 });
 
+test("every displayed terminal command carries a copy button", () => {
+  const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
+  const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
+  // One shared clipboard affordance, used by the launch panel (success and
+  // failure), the open-command row, and detail-dialog command codes.
+  assert.match(app, /function copyCommandButton\(command, label = "复制"\)/);
+  assert.match(app, /navigator\.clipboard\.writeText\(command\)/);
+  assert.match(app, /commandRow\(result\.command\)/);
+  assert.match(app, /row\.append\(element\("code", "", `进入工作台：\$\{command\}`\), copyCommandButton\(command\)/);
+  assert.match(app, /element\("code", "detail-code", item\.code\), copyCommandButton\(item\.code\)/);
+  assert.match(app, /row\.replaceChildren\(element\("code", "", openCommand\), copyCommandButton\(openCommand\)\)/);
+  assert.match(app, /copyCommandButton\(command, "复制命令"\)/);
+  assert.match(styles, /\.command-row/);
+});
+
 test("Studio launch controls expose validation state and a direct project edit action", () => {
   const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
   const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");

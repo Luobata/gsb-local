@@ -200,9 +200,34 @@ function terminalOpenButton(session) {
   return button;
 }
 
+// Shared clipboard affordance for every terminal command Studio displays.
+// The command text stays visible next to the button so it remains copyable by
+// hand when the clipboard permission is unavailable.
+function copyCommandButton(command, label = "复制") {
+  const button = element("button", "text-button copy-command-button", label);
+  button.type = "button";
+  button.title = `复制 ${command}`;
+  button.setAttribute("aria-label", `复制命令 ${command}`);
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      toast(`已复制：${command}`);
+    } catch {
+      toast("复制失败，请手动选择命令文本", "error");
+    }
+  });
+  return button;
+}
+
+function commandRow(command, { label = "" } = {}) {
+  const row = element("div", "command-row");
+  row.append(element("code", "", label ? `${label}${command}` : command), copyCommandButton(command));
+  return row;
+}
+
 function terminalCommandRow(session, command) {
   const row = element("div", "terminal-open-row");
-  row.append(element("code", "", `进入工作台：${command}`), terminalOpenButton(session));
+  row.append(element("code", "", `进入工作台：${command}`), copyCommandButton(command), terminalOpenButton(session));
   return row;
 }
 
@@ -481,7 +506,7 @@ function renderDetail(view = detailView) {
       row.classList.toggle("is-pending", Boolean(item.pending));
       row.append(element("b", "", item.title));
       if (item.meta) row.append(element("small", "", item.meta));
-      if (item.code) row.append(element("code", "detail-code", item.code));
+      if (item.code) row.append(element("code", "detail-code", item.code), copyCommandButton(item.code));
       list.append(row);
     });
     section.append(list);
@@ -1004,18 +1029,7 @@ function upgradeLaunchRow(project) {
   launchButton.type = "button";
   launchButton.title = command;
   launchButton.addEventListener("click", () => launchUpgradedProject(project, Boolean(running), launchButton));
-  const copyButton = element("button", "text-button copy-command-button", "复制命令");
-  copyButton.type = "button";
-  copyButton.title = command;
-  copyButton.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(command);
-      toast(`已复制：${command}`);
-    } catch {
-      toast("复制失败，请手动选择命令文本", "error");
-    }
-  });
-  row.append(copy, launchButton, copyButton);
+  row.append(copy, launchButton, copyCommandButton(command, "复制命令"));
   return row;
 }
 
@@ -1523,19 +1537,7 @@ function renderOpenCommand(container, session, command) {
     row = element("div", "quick-open-command");
     container.append(row);
   }
-  const code = element("code", "", openCommand);
-  const copy = element("button", "text-button copy-command-button", "复制");
-  copy.type = "button";
-  copy.title = `复制 ${openCommand}`;
-  copy.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(openCommand);
-      toast(`已复制：${openCommand}`);
-    } catch {
-      toast("复制失败，请手动选择命令文本", "error");
-    }
-  });
-  row.replaceChildren(code, copy);
+  row.replaceChildren(element("code", "", openCommand), copyCommandButton(openCommand));
   return row;
 }
 
@@ -2255,7 +2257,7 @@ async function launch() {
     panel.classList.remove("is-error");
     panel.replaceChildren(
       element("h3", "", "工作台已在后台启动"),
-      element("code", "", result.command),
+      commandRow(result.command),
       terminalCommandRow(workbench.session, result.openCommand || `gsb-local open ${workbench.session}`),
       element("code", "", (result.stdout || "").trim()),
     );
@@ -2277,7 +2279,11 @@ async function launch() {
     const panel = $("#launch-result");
     panel.hidden = false;
     panel.classList.add("is-error");
-    panel.replaceChildren(element("h3", "", "启动失败"), element("code", "", result.command || error.message), element("code", "", (result.stderr || "").trim()));
+    panel.replaceChildren(
+      element("h3", "", "启动失败"),
+      result.command ? commandRow(result.command) : element("code", "", error.message),
+      element("code", "", (result.stderr || "").trim()),
+    );
     toast(error.message, "error");
   } finally {
     launchPending = false;
