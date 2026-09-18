@@ -1329,6 +1329,21 @@ test("role bases match exact names and aliases before falling back to generic", 
   }
 });
 
+test("frontend roles carry the synced front-design quality baseline", () => {
+  // The codex frontend-design skill is synced into prompts/ verbatim (with its
+  // license) and distilled into the frontend/ui bases, because role prompts
+  // compose from a single base file — a cross-reference would never load.
+  const source = readFileSync(path.join(ROOT_DIR, "prompts", "front-design.md"), "utf8");
+  assert.match(source, /^---\nname: frontend-design\n/m);
+  assert.match(source, /NEVER use generic AI-generated aesthetics/);
+  assert.ok(existsSync(path.join(ROOT_DIR, "prompts", "front-design.LICENSE.txt")), "skill license must ship alongside");
+  for (const base of ["frontend.md", "ui.md"]) {
+    const content = readFileSync(path.join(ROOT_DIR, "prompts", base), "utf8");
+    assert.match(content, /Design quality baseline \(synced from the codex frontend-design skill/, base);
+    assert.match(content, /front-design\.md/, `${base} should point at the full source`);
+  }
+});
+
 test("workbench validation rejects an empty role list", () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-empty-roster-"));
   try {
