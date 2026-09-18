@@ -619,20 +619,29 @@ test("themes restyle the whole app through the variable set", () => {
   // Midnight ships as the default; the original lime skin stays selectable.
   assert.match(html, /<body data-theme="midnight">/);
   assert.match(html, /id="theme-toggle"/);
-  for (const theme of ["midnight", "signal", "ember", "paper"]) {
+  for (const theme of ["midnight", "signal", "ember", "paper", "cloud"]) {
     assert.match(styles, new RegExp(`body\\[data-theme="${theme}"\\]`), theme);
   }
+  // Cloud is the soft-UI skin: light scheme plus rounded surfaces, with the
+  // radius overrides living inside its own block so angular skins stay sharp.
+  assert.match(styles, /body\[data-theme="cloud"\] input,[\s\S]*?border-radius: 10px/);
+  assert.match(styles, /body\[data-theme="cloud"\] \.studio-dialog \{ border-radius: 16px/);
+  // Light skins must flip the UA color scheme on <html>, not just the palette.
+  assert.match(app, /documentElement\.style\.colorScheme/);
+  assert.match(app, /"paper" \|\| theme\.id === "cloud" \? "light" : "dark"/);
   // The light theme must flip the UA color scheme too, not just the palette.
   assert.match(styles, /body\[data-theme="paper"\] \{\s*\n\s*color-scheme: light/);
   assert.match(app, /const THEMES = \[/);
   assert.match(app, /localStorage\.setItem\("gsb-theme"/);
-  // Literal accent tints may only live in :root and the theme blocks.
+  // Literal accent tints and dark surfaces may only live in :root and the
+  // theme blocks.
   const rootStart = styles.indexOf(":root {");
   const rootEnd = styles.indexOf("}", styles.indexOf("--card-grad", rootStart)) + 1;
   const beforeThemes = styles.slice(rootEnd, styles.indexOf("body[data-theme=\"midnight\"]"));
   assert.ok(beforeThemes.length > 100, "theme marker not found in stylesheet");
   assert.doesNotMatch(beforeThemes, /rgba\(200,\s*255,\s*61/);
   assert.doesNotMatch(beforeThemes, /#0b0f0c|#101511|#202620/);
+  assert.doesNotMatch(beforeThemes, /rgba\(9, ?12, ?11|rgba\(2, ?7, ?7|#121713|#161c17/);
 });
 
 test("a freshly loaded project is not dirty after prompt normalization", () => {

@@ -2298,6 +2298,7 @@ const THEMES = [
   { id: "signal", label: "信号绿" },
   { id: "ember", label: "余烬琥珀" },
   { id: "paper", label: "纸面浅色" },
+  { id: "cloud", label: "云朵圆角" },
 ];
 
 function savedTheme() {
@@ -2308,6 +2309,10 @@ function applyTheme(id) {
   const index = THEMES.findIndex((theme) => theme.id === id);
   const theme = THEMES[index === -1 ? 0 : index];
   document.body.dataset.theme = theme.id;
+  // UA form controls and autofill pick their colors from the ROOT scheme, so
+  // light skins must flip it on <html> too — the body-level color-scheme in
+  // CSS alone leaves native widgets dark.
+  document.documentElement.style.colorScheme = theme.id === "paper" || theme.id === "cloud" ? "light" : "dark";
   try { localStorage.setItem("gsb-theme", theme.id); } catch { /* private mode */ }
   const button = $("#theme-toggle");
   if (button) {
