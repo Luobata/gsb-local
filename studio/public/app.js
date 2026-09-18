@@ -2294,6 +2294,7 @@ async function launch() {
 let browsePending = false;
 
 const THEMES = [
+  { id: "phosphor", label: "磷光终端" },
   { id: "midnight", label: "午夜蓝" },
   { id: "signal", label: "信号绿" },
   { id: "ember", label: "余烬琥珀" },

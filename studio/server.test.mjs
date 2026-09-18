@@ -616,12 +616,18 @@ test("themes restyle the whole app through the variable set", () => {
   const html = readFileSync(path.join(ROOT_DIR, "studio", "public", "index.html"), "utf8");
   const styles = readFileSync(path.join(ROOT_DIR, "studio", "public", "styles.css"), "utf8");
   const app = readFileSync(path.join(ROOT_DIR, "studio", "public", "app.js"), "utf8");
-  // Midnight ships as the default; the original lime skin stays selectable.
-  assert.match(html, /<body data-theme="midnight">/);
+  // Phosphor (the front-design skill skin) ships as the default.
+  assert.match(html, /<body data-theme="phosphor">/);
   assert.match(html, /id="theme-toggle"/);
-  for (const theme of ["midnight", "signal", "ember", "paper", "cloud"]) {
+  for (const theme of ["phosphor", "midnight", "signal", "ember", "paper", "cloud"]) {
     assert.match(styles, new RegExp(`body\\[data-theme="${theme}"\\]`), theme);
   }
+  // The phosphor skin commits to one direction: mono display type, CRT
+  // scanlines, phosphor bloom, staggered row reveals.
+  assert.match(styles, /body\[data-theme="phosphor"\] \{[\s\S]*?--display: "SFMono-Regular"/);
+  assert.match(styles, /body\[data-theme="phosphor"\] \.ambient-grid[\s\S]*?repeating-linear-gradient\(0deg/);
+  assert.match(styles, /body\[data-theme="phosphor"\] \.primary-button \{ box-shadow:\s+0 0 22px/);
+  assert.match(styles, /phos-in/);
   // Cloud is the soft-UI skin: light scheme plus rounded surfaces, with the
   // radius overrides living inside its own block so angular skins stay sharp.
   assert.match(styles, /body\[data-theme="cloud"\] input,[\s\S]*?border-radius: 10px/);

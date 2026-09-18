@@ -845,3 +845,81 @@ body[data-theme="cloud"] .choice-card span { border-radius: 10px; }
 body[data-theme="cloud"] .quick-open-command { border-radius: 10px; }
 body[data-theme="cloud"] .launch-result { border-radius: 12px; }
 body[data-theme="cloud"] .resource-badge { border-radius: 999px; }
+
+/* ---------------------------------------------------------------------------
+   磷光终端 (phosphor) — the front-design skill applied as a full skin.
+   One committed direction: an amber-P3 CRT console. Warm-black glass, mono
+   display type, scanlines, phosphor bloom, staggered row reveals.
+   --------------------------------------------------------------------------- */
+body[data-theme="phosphor"] {
+  color-scheme: dark;
+  --canvas: #0a0904;
+  --panel: #12100a;
+  --panel-2: #191510;
+  --line: #33290f;
+  --line-strong: #5a4519;
+  --ink: #f5e9c8;
+  --muted: #b9a671;
+  --faint: #7d6f4a;
+  --signal: #ffb000;
+  --signal-dim: #8a6200;
+  --cyan: #7ee787;
+  --display: "SFMono-Regular", Menlo, Monaco, monospace;
+  --body: "Avenir Next", "Helvetica Neue", sans-serif;
+  --input-bg: #0d0b06;
+  --hover-bg: #1b160c;
+  --row-sep: #251d0e;
+  --panel-soft: rgba(13, 11, 6, .58);
+  --panel-deep: rgba(13, 11, 6, .74);
+  --panel-trans: rgba(25, 21, 16, .5);
+  --bar-bg: rgba(10, 9, 4, .93);
+  --backdrop: rgba(3, 2, 0, .78);
+  --signal-tint: rgba(255, 176, 0, .06);
+  --signal-tint-strong: rgba(255, 176, 0, .1);
+  --page-bg:
+    radial-gradient(circle at 70% -18%, rgba(255, 176, 0, .12), transparent 30rem),
+    radial-gradient(circle at 50% 118%, rgba(126, 231, 135, .05), transparent 42rem),
+    linear-gradient(160deg, #0c0a05 0%, #070603 52%, #0e0b05 100%);
+}
+/* CRT scanlines replace the ambient grid; slightly stronger, masked like a tube. */
+body[data-theme="phosphor"] .ambient-grid {
+  opacity: .5;
+  background-image: repeating-linear-gradient(0deg, rgba(255, 214, 130, .05) 0 1px, transparent 1px 3px);
+  background-size: auto;
+  mask-image: radial-gradient(ellipse at 50% 42%, black 30%, transparent 78%);
+}
+/* Phosphor bloom on the few elements that carry signal. */
+body[data-theme="phosphor"] .primary-button { box-shadow: 0 0 22px rgba(255, 176, 0, .3), inset 0 0 12px rgba(255, 176, 0, .18); }
+body[data-theme="phosphor"] .primary-button:hover:not(:disabled) { box-shadow: 0 0 34px rgba(255, 176, 0, .45), inset 0 0 16px rgba(255, 176, 0, .24); }
+body[data-theme="phosphor"] .brand b,
+body[data-theme="phosphor"] .project-total b { text-shadow: 0 0 14px rgba(255, 176, 0, .55); }
+body[data-theme="phosphor"] .connection i { box-shadow: 0 0 12px var(--signal); }
+body[data-theme="phosphor"] .resource-item.is-selected::before { box-shadow: 0 0 10px var(--signal); }
+body[data-theme="phosphor"] .resource-item.is-selected .resource-glyph { text-shadow: 0 0 10px rgba(255, 176, 0, .6); }
+body[data-theme="phosphor"] input,
+body[data-theme="phosphor"] textarea { caret-color: var(--signal); }
+body[data-theme="phosphor"] ::selection { background: rgba(255, 176, 0, .32); color: var(--ink); }
+/* Corner brackets: the console-panel frame on the two big cards. */
+body[data-theme="phosphor"] .shell.is-project-only #sec-projects,
+body[data-theme="phosphor"] .summary-panel { position: relative; }
+body[data-theme="phosphor"] .shell.is-project-only #sec-projects::before,
+body[data-theme="phosphor"] .summary-panel::before,
+body[data-theme="phosphor"] .shell.is-project-only #sec-projects::after,
+body[data-theme="phosphor"] .summary-panel::after {
+  content: ""; position: absolute; width: 18px; height: 18px; border: 1px solid var(--signal-dim); pointer-events: none;
+}
+body[data-theme="phosphor"] .shell.is-project-only #sec-projects::before,
+body[data-theme="phosphor"] .summary-panel::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+body[data-theme="phosphor"] .shell.is-project-only #sec-projects::after,
+body[data-theme="phosphor"] .summary-panel::after { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+/* One orchestrated load: rows surface in sequence. */
+body[data-theme="phosphor"] .resource-item { animation: phos-in .32s ease both; }
+body[data-theme="phosphor"] .resource-item:nth-child(1) { animation-delay: .02s; }
+body[data-theme="phosphor"] .resource-item:nth-child(2) { animation-delay: .07s; }
+body[data-theme="phosphor"] .resource-item:nth-child(3) { animation-delay: .12s; }
+body[data-theme="phosphor"] .resource-item:nth-child(4) { animation-delay: .17s; }
+body[data-theme="phosphor"] .resource-item:nth-child(5) { animation-delay: .22s; }
+body[data-theme="phosphor"] .resource-item:nth-child(n+6) { animation-delay: .27s; }
+body[data-theme="phosphor"] .project-landing-head { animation: phos-in .38s ease both; }
+body[data-theme="phosphor"] .project-landing-path { animation: phos-in .38s ease .1s both; }
+@keyframes phos-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
