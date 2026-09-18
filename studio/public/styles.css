@@ -923,3 +923,55 @@ body[data-theme="phosphor"] .resource-item:nth-child(n+6) { animation-delay: .27
 body[data-theme="phosphor"] .project-landing-head { animation: phos-in .38s ease both; }
 body[data-theme="phosphor"] .project-landing-path { animation: phos-in .38s ease .1s both; }
 @keyframes phos-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+/* ---------------------------------------------------------------------------
+   磷光终端 — acceptance pass fixes (visual review of every page).
+   --------------------------------------------------------------------------- */
+/* P0: the warm-brown faint/muted failed contrast on dark panels — the Hub
+   core panel, textareas, field labels, and "已校验" captions were near-
+   invisible. Lift the neutrals; metadata keeps its hue but reads. */
+body[data-theme="phosphor"] {
+  --ink: #f7eccd;
+  --muted: #cdbb8b;
+  --faint: #a08d5f;
+  --cyan: #95e08a; /* P1 phosphor green, tuned for warm-black contrast */
+}
+/* Secondary text on panel backgrounds gets one extra step. */
+body[data-theme="phosphor"] .field > span { color: var(--muted); }
+body[data-theme="phosphor"] .field > span small { color: var(--faint); }
+body[data-theme="phosphor"] .hub-core-panel,
+body[data-theme="phosphor"] .hub-core-panel * { color-scheme: dark; }
+body[data-theme="phosphor"] .hub-core-panel .eyebrow { color: var(--signal); }
+body[data-theme="phosphor"] .hub-core-panel p { color: var(--muted); }
+body[data-theme="phosphor"] textarea { color: var(--ink); }
+/* P1: color discipline — cyan-family UI semantics fold into phosphor green.
+   Keep --cyan for the inspection dialog (its teal identity reads well on the
+   near-black backdrop) but everything on main surfaces goes green. */
+body[data-theme="phosphor"] .terminal-open-button { color: var(--cyan); }
+body[data-theme="phosphor"] .resource-badge.configured { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 45%, transparent); }
+body[data-theme="phosphor"] .launch-result code { color: var(--cyan); }
+/* P1: metadata must not out-shout titles — de-saturate amber mono captions
+   to the muted tier. */
+body[data-theme="phosphor"] .resource-copy small,
+body[data-theme="phosphor"] .resource-stat { color: var(--faint); }
+body[data-theme="phosphor"] .resource-copy small.project-last-session { color: var(--signal-dim); }
+body[data-theme="phosphor"] .resource-copy b { color: var(--ink); }
+/* P2: the theme chip joins the skin — amber outline, mono label, soft bloom. */
+body[data-theme="phosphor"] button.connection {
+  border-color: var(--line-strong); color: var(--signal); border-radius: 3px;
+}
+body[data-theme="phosphor"] button.connection:hover {
+  border-color: var(--signal); box-shadow: 0 0 14px rgba(255, 176, 0, .35); color: var(--signal);
+}
+/* P2: an empty templates column gets the console footer instead of a void. */
+.landing-templates::after {
+  content: "—— GSB LOCAL CONSOLE ——";
+  display: block;
+  margin-top: 18px;
+  color: var(--faint);
+  font: 10px var(--mono);
+  letter-spacing: .3em;
+  text-align: center;
+  opacity: .75;
+}
+body:not([data-theme="phosphor"]) .landing-templates::after { content: none; }
