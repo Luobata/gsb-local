@@ -637,6 +637,10 @@ test("themes restyle the whole app through the variable set", () => {
   assert.match(app, /"paper" \|\| theme\.id === "cloud" \? "light" : "dark"/);
   // The light theme must flip the UA color scheme too, not just the palette.
   assert.match(styles, /body\[data-theme="paper"\] \{\s*\n\s*color-scheme: light/);
+  // Paper re-skins every hardcoded-dark surface through the variable set.
+  assert.match(styles, /body\[data-theme="paper"\] \{[\s\S]*?--on-signal: #ffffff/);
+  assert.match(styles, /body\[data-theme="paper"\] \{[\s\S]*?--dialog-bg: linear-gradient\(145deg, rgba\(255, 255, 255/);
+  assert.match(styles, /--elev-card: 0 22px 60px rgba\(60, 58, 48, \.14\)/);
   assert.match(app, /const THEMES = \[/);
   assert.match(app, /localStorage\.setItem\("gsb-theme"/);
   // Literal accent tints and dark surfaces may only live in :root and the
