@@ -31,6 +31,8 @@ import {
   sessionSocketLabel,
   sessionState,
   studioLaunchEnv,
+  kimiModelSuggestions,
+  modelSuggestions,
   templateScopeValidation,
   validateWorkbench,
   zellijSocketPathInfo,
@@ -1747,6 +1749,37 @@ test("model mismatches warn without blocking a launch", () => {
   assert.deepEqual(modelWarnings({ agent: "codex", model: "gpt-5.6-sol" }), [], "a family-matched model is silent");
   assert.deepEqual(modelWarnings({ agent: "claude-glm-5.3", model: "" }), [], "no model means the agent default");
   assert.deepEqual(modelWarnings({ agent: "shell:true", model: "anything" }), [], "shell agents ignore the model");
+});
+
+test("Kimi models come from Kimi's own registry and a display name is caught", () => {
+  const config = [
+    'default_model = "kimi-code/k3.1-pro-highspeed"',
+    '[providers."managed:kimi-code"]',
+    'type = "kimi"',
+    '[models."kimi-code/k3.1-pro"]',
+    'model = "k3.1-pro"',
+    'capabilities = [ "thinking", "tool_use" ]',
+    'display_name = "K3.1 Pro"',
+    '[models."kimi-code/k3.1-pro-highspeed"]',
+    'display_name = "K3.1 Pro Highspeed 2x Usage Cost"',
+    '[thinking]',
+    'display_name = "not a model"',
+  ].join("\n");
+  assert.deepEqual(kimiModelSuggestions(config).map(({ value, label }) => ({ value, label })), [
+    { value: "kimi-code/k3.1-pro", label: "Kimi K3.1 Pro" },
+    { value: "kimi-code/k3.1-pro-highspeed", label: "Kimi K3.1 Pro Highspeed 2x Usage Cost" },
+  ]);
+
+  const suggestions = modelSuggestions(config);
+  assert.deepEqual(suggestions.filter((entry) => entry.family === "Kimi").map((entry) => entry.value),
+    ["kimi-code/k3.1-pro", "kimi-code/k3.1-pro-highspeed"], "the registry replaces the static Kimi fallback");
+  assert.ok(suggestions.some((entry) => entry.family === "Codex"), "other families keep their entries");
+  assert.ok(modelSuggestions("").some((entry) => entry.value === "kimi-code/k3"), "no registry falls back to the static list");
+
+  const wb = (model) => ({ workspace: os.tmpdir(), projectName: "p", session: "p", roles: [{ id: "design", agent: "kimi", model }] });
+  const warnings = (model) => validateWorkbench(wb(model), { suggestions }).warnings.filter((warning) => warning.includes("模型"));
+  assert.match(warnings("K3.1 Pro Highspeed 2x Usage Cost").join("\n"), /是显示名称.*别名 kimi-code\/k3\.1-pro-highspeed/);
+  assert.deepEqual(warnings("kimi-code/k3.1-pro-highspeed"), [], "a registry alias is silent");
 });
 
 test("template scope validation drops project identity errors but keeps role errors", () => {

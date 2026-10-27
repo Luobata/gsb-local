@@ -95,6 +95,39 @@ const MODEL_SUGGESTIONS = [
   { family: "Claude", value: "sonnet", label: "Claude Sonnet alias" },
 ];
 
+// `kimi --model` takes the alias, i.e. the key of a [models."<alias>"] table in
+// Kimi's own config, never its display_name. Read that registry so the
+// dropdown offers exactly what the installed kimi accepts; the static Kimi
+// entries above only stand in when the config is missing or unreadable.
+export function kimiModelSuggestions(configText) {
+  const entries = [];
+  let current = null;
+  for (const line of String(configText || "").split(/\r?\n/)) {
+    const section = line.match(/^\s*\[(.+)\]\s*$/);
+    if (section) {
+      const alias = section[1].match(/^models\."([^"]+)"$/)?.[1];
+      current = alias ? { family: "Kimi", value: alias, label: `Kimi ${alias}` } : null;
+      if (current) entries.push(current);
+      continue;
+    }
+    const display = current && line.match(/^\s*display_name\s*=\s*"([^"]*)"/);
+    if (display) {
+      current.label = `Kimi ${display[1]}`;
+      current.displayName = display[1];
+    }
+  }
+  return entries;
+}
+
+function kimiConfigFile() {
+  return path.join(os.homedir(), ".kimi-code", "config.toml");
+}
+
+export function modelSuggestions(kimiConfig = readText(kimiConfigFile())) {
+  const kimi = kimiModelSuggestions(kimiConfig);
+  return kimi.length ? [...MODEL_SUGGESTIONS.filter((entry) => entry.family !== "Kimi"), ...kimi] : MODEL_SUGGESTIONS;
+}
+
 export function parseArgs(argv) {
   const options = { project: "", port: 0, open: true };
   for (let index = 0; index < argv.length; index++) {
@@ -367,12 +400,16 @@ function agentFamily(agent) {
   return /^[A-Za-z_][A-Za-z0-9._-]*$/.test(spec) ? "claude" : "";
 }
 
-function modelFamilyWarning(role) {
+function modelFamilyWarning(role, suggestions) {
   const model = String(role?.model || "").trim();
   if (!model) return "";
   const family = agentFamily(role.agent);
   if (!family || family === "shell") return "";
-  const suggestion = MODEL_SUGGESTIONS.find((entry) => entry.value === model);
+  const suggestion = suggestions.find((entry) => entry.value === model);
+  const byDisplayName = !suggestion && suggestions.find((entry) => entry.displayName === model);
+  if (byDisplayName) {
+    return `角色 ${role.id} 的模型 ${model} 是显示名称，${byDisplayName.family} 只接受别名 ${byDisplayName.value}；请改用别名，否则 Pane 会在启动后立即退出`;
+  }
   if (!suggestion) {
     return `角色 ${role.id} 的模型 ${model} 不在已知模型列表中；名称无效时 Pane 会在启动后立即退出`;
   }
@@ -400,7 +437,7 @@ function isImplementerRole(role) {
   return String(role?.type || "") === "executor";
 }
 
-export function validateWorkbench(input) {
+export function validateWorkbench(input, { suggestions = modelSuggestions() } = {}) {
   const errors = [];
   const warnings = [];
   const workbench = input && typeof input === "object" && !Array.isArray(input) ? input : {};
@@ -433,7 +470,7 @@ export function validateWorkbench(input) {
     if (role.model != null && typeof role.model !== "string") errors.push(`角色 ${role.id || index + 1} 的模型必须是文本`);
     else if (CONTROL_PATTERN.test(role.model || "")) errors.push(`角色 ${role.id || index + 1} 的模型不能包含换行或控制字符`);
     else {
-      const modelWarning = modelFamilyWarning(role);
+      const modelWarning = modelFamilyWarning(role, suggestions);
       if (modelWarning) warnings.push(modelWarning);
     }
   }
@@ -1437,7 +1474,7 @@ async function bootstrap(project) {
     prompts,
     roleMeta,
     roleBaseAliases,
-    modelSuggestions: MODEL_SUGGESTIONS,
+    modelSuggestions: modelSuggestions(),
     recentProjects,
     userTemplates,
     sessions: sessionOptions.filter((session) => session.raw).map((session) => session.raw),
