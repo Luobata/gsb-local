@@ -95,6 +95,14 @@ for tainted_var in \
   CLAUDE_PID; do
   unset "$tainted_var" 2>/dev/null || true
 done
+# herdr's agent integrations (claude/codex/kimi hooks) report each agent's
+# session id from inside its pane, and after a server restart herdr resumes
+# those agents itself: outside supervise, without the session contract, and
+# for kimi in the wrong directory. GSB owns the lifecycle of its panes, so keep
+# the hooks silent; every herdr hook is a no-op without a pane id. Agent status
+# then comes from herdr's screen-based detection only (kimi's hook-reported
+# working/blocked states are dropped with the rest).
+unset HERDR_PANE_ID 2>/dev/null || true
 if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
   export TERM=xterm-256color
 fi
@@ -286,7 +294,7 @@ run_kimi_adapter() {
   local temporary_file="$agent_file.$$.tmp"
   local permission_mode="${GSB_KIMI_PERMISSION:-yolo}"
   local model="${ROLE_MODEL:-${GSB_KIMI_MODEL:-kimi-code/k3-256k}}"
-  local host_cwd="${GSB_KIMI_HOST_CWD:-$ROOT_DIR}"
+  local host_cwd="${GSB_KIMI_HOST_CWD:-$WORKSPACE}"
   local kimi_args=()
 
   mkdir -p "$agent_file_dir"
@@ -324,8 +332,10 @@ run_kimi_adapter() {
   esac
   kimi_args+=(--model "$model")
   export KIMI_CODE_IDENTITY_NAME="$DISPLAY_NAME"
-  # Keep project-local agents/MCP/plugins outside Kimi's project root. The real
-  # workspace is an explicit additional directory governed by the GSB contract.
+  # Kimi runs from the workspace like the other agents, so relative paths land
+  # in the project rather than in the GSB install. GSB_KIMI_HOST_CWD can still
+  # point Kimi at a trusted host directory without project-level extensions;
+  # the workspace stays reachable through --add-dir either way.
   cd "$host_cwd"
   exec_agent_command "$agent_binary" "${kimi_args[@]}"
 }

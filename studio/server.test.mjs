@@ -187,7 +187,8 @@ test("Studio launches with pane-scoped GSB and Zellij variables removed", async 
       invalidateSessionCacheImpl: () => { invalidations += 1; },
     });
     assert.equal(result.launched, true);
-    assert.equal(invalidations, 1);
+    // Once before the duplicate probe (fresh listing), once after the launch.
+    assert.equal(invalidations, 2);
     assert.equal(spawned.options.env.PATH, "/usr/bin:/bin");
     assert.equal(spawned.options.env.GSB_WATCHDOG_ENABLED, "true");
     for (const name of ["GSB_STATE_DIR", "GSB_SESSION", "GSB_SOCKET_DIR_OVERRIDE", "ZELLIJ_SESSION_NAME", "ZELLIJ_SOCKET_DIR"]) {
@@ -253,10 +254,32 @@ test("Studio launch refuses herdr when the binary is missing and names the backe
       spawnSyncImpl() { return { status: 0, stdout: "", stderr: "" }; },
       activeSessionLineImpl: () => "studio-test herdr workspace (running)",
       invalidateSessionCacheImpl: () => {},
+      herdrSessionHealthImpl: () => "partial",
     });
     assert.equal(duplicate.launched, false);
     assert.match(duplicate.error, /herdr/);
     assert.match(duplicate.stderr, /重建同名会话/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("Studio launch checks duplicates against a fresh listing and lets the CLI rebuild orphaned herdr workspaces", async () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "gsb-studio-launch-herdr-orphan-"));
+  const events = [];
+  try {
+    const result = await launchWorkbench({ ...fixture(workspace), mux: "herdr" }, {
+      spawnSyncImpl(command, args) {
+        if (command === "herdr") return { status: 0, stdout: "herdr 0.9.0\n", stderr: "" };
+        events.push(`launch ${args.includes("--rebuild") ? "rebuild" : "plain"}`);
+        return { status: 0, stdout: "rebuilt\n", stderr: "" };
+      },
+      invalidateSessionCacheImpl: () => events.push("invalidate"),
+      activeSessionLineImpl: () => { events.push("probe"); return "studio-test herdr workspace (running)"; },
+      herdrSessionHealthImpl: (session) => { events.push(`health ${session}`); return "orphaned"; },
+    });
+    assert.equal(result.launched, true);
+    assert.deepEqual(events, ["invalidate", "probe", "health studio-test", "launch plain", "invalidate"]);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
@@ -431,7 +454,7 @@ test("pane GSB decisions classify every direct environment fallback", () => {
   const preserved = new Set(`
     GSB_MODEL GSB_EFFORT GSB_KIMI_MODEL GSB_KIMI_HOST_CWD GSB_CONFIG
     GSB_MODELS_CONFIG GSB_SOCKET_DIR_OVERRIDE
-    GSB_HERDR_BIN GSB_HERDR_AUTOSTART GSB_HERDR_START_DELAY
+    GSB_HERDR_BIN GSB_HERDR_AUTOSTART GSB_HERDR_START_DELAY GSB_HERDR_READY_TIMEOUT
   `.trim().split(/\s+/));
   const denylistBlock = source.match(/PANE_RUNTIME_VARS=\(\n([\s\S]*?)\n\)/);
   assert.ok(denylistBlock, "pane runtime denylist must remain explicit");

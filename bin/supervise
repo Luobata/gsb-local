@@ -6,6 +6,15 @@ set -euo pipefail
 # not restarted. The watchdog may request a hard restart by touching
 # agent-files/<role>.restart-requested before signalling the pane; the marker
 # forces a restart even when the exit code looks clean.
+#
+# On herdr a pane closes the moment its process exits, which would silently
+# drop the role from the session (Zellij keeps an exited pane and offers a
+# rerun). There the supervisor holds the pane instead of exiting and restarts
+# on Enter, so a nudge or a human can bring the role back.
+#
+# agent-files/<role>.supervise.pid marks the pane as GSB-managed: session
+# health requires a live supervisor per role, which panes that herdr restored
+# on its own after a server restart never have.
 
 ROLE="${1:?role is required}"
 ROOT_DIR="${GSB_LOCAL_ROOT:?GSB_LOCAL_ROOT is required}"
@@ -16,6 +25,15 @@ BASE_DELAY="${GSB_SUPERVISE_BASE_DELAY:-30}"
 RESTART_MARKER="$STATE_DIR/agent-files/$ROLE.restart-requested"
 EXIT_LOG="$STATE_DIR/agent-files/$ROLE.exit.log"
 mkdir -p "$STATE_DIR/agent-files"
+printf '%s\n' "$$" > "$STATE_DIR/agent-files/$ROLE.supervise.pid"
+
+hold_or_exit() {
+  local code="$1"
+  [[ "${GSB_MUX:-zellij}" == herdr && -t 0 ]] || exit "$code"
+  printf '\n[gsb] %s stopped (exit %s). Press Enter to restart it, or Ctrl-C to close this pane.\n' "$ROLE" "$code"
+  read -r _ || exit "$code"
+  printf '%s role=%s restarted from held pane\n' "$(date -u +%FT%TZ)" "$ROLE" >> "$EXIT_LOG"
+}
 
 attempt=0
 while true; do
@@ -31,7 +49,9 @@ while true; do
   fi
 
   if [[ "$restart_requested" != true && ( "$exit_code" -eq 0 || "$exit_code" -eq 130 ) ]]; then
-    exit 0
+    hold_or_exit 0
+    attempt=0
+    continue
   fi
 
   attempt=$((attempt + 1))
@@ -42,7 +62,9 @@ while true; do
       "{\"question\":\"$ROLE exited $attempt times (last exit code $exit_code)\",\"missing\":\"supervisor restart budget exhausted; inspect $EXIT_LOG\",\"safe_fallback\":\"no_safe_fallback\"}" \
       >/dev/null 2>&1 || true
     bash "$ROOT_DIR/bin/nudge" hub >/dev/null 2>&1 || true
-    exit "$exit_code"
+    hold_or_exit "$exit_code"
+    attempt=0
+    continue
   fi
 
   delay=$((BASE_DELAY * (1 << (attempt - 1))))

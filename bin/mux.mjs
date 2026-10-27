@@ -19,6 +19,8 @@
 //   mux.mjs send-keys <session> <paneId> <key> [key...]
 //   mux.mjs pane-exists <session> <paneId>  → exit 0 when the pane is live
 //   mux.mjs session-active <session>        → exit 0 when the session is live
+//   mux.mjs session-health <session> [roles-csv]
+//                                           → "<state> <missing-roles-csv>"
 //   mux.mjs print-attach <session>          → attach command for humans
 //
 // Backend selection: GSB_MUX (zellij|herdr, default zellij). The zellij
@@ -26,7 +28,7 @@
 // calls; the herdr adapter honors GSB_HERDR_BIN and talks to the local herdr
 // server socket. Set GSB_MUX_TIMEOUT_MS per caller (default 10s).
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import os from "node:os";
@@ -220,6 +222,83 @@ function createHerdr(env) {
 }
 
 // ---------------------------------------------------------------------------
+// Session health
+// ---------------------------------------------------------------------------
+
+// A live workspace is not a live GSB session. herdr persists workspace and
+// pane labels across a server restart and restores the panes on its own, but
+// the processes behind them are new: plain shells or agents resumed by herdr's
+// integrations, outside `supervise` and without the session contract. A GSB
+// session is healthy only when every roster role has its labelled pane AND
+// that role's supervise process (agent-files/<role>.supervise.pid) is alive.
+//
+//   complete — every role is labelled and supervised
+//   partial  — some roles are, some are not (live agents worth keeping)
+//   orphaned — the session is up but no role is supervised (safe to rebuild)
+//   absent   — no live session
+
+export function roleTitle(session, role) {
+  return role === "hub" ? `hub.${session}.main` : `spk.${session}.${role}`;
+}
+
+export function classifySessionHealth({ session, active, titles, roles, supervised }) {
+  if (!active) return { state: "absent", missing: [...roles] };
+  const labelled = (role) => {
+    const title = roleTitle(session, role);
+    return titles.some((candidate) => candidate === title || candidate.startsWith(`${title} · `));
+  };
+  const missing = roles.filter((role) => !labelled(role) || !supervised.has(role));
+  if (!missing.length) return { state: "complete", missing };
+  return { state: missing.length === roles.length ? "orphaned" : "partial", missing };
+}
+
+export function supervisorCommandMatches(commandLine, role) {
+  const match = String(commandLine).trim().match(/\/bin\/supervise\s+(\S+)$/);
+  return Boolean(match) && match[1] === role;
+}
+
+function processCommandLine(pid) {
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 5_000 });
+  return result.status === 0 ? result.stdout : "";
+}
+
+export function supervisedRoles(stateDir, roles, commandLine = processCommandLine) {
+  const supervised = new Set();
+  for (const role of roles) {
+    let pid;
+    try {
+      pid = Number.parseInt(readFileSync(path.join(stateDir, "agent-files", `${role}.supervise.pid`), "utf8"), 10);
+    } catch { continue; }
+    if (Number.isInteger(pid) && pid > 0 && supervisorCommandMatches(commandLine(pid), role)) supervised.add(role);
+  }
+  return supervised;
+}
+
+function sessionStateDir(session, env) {
+  return env.GSB_STATE_DIR ||
+    path.join(env.XDG_STATE_HOME || path.join(os.homedir(), ".local/state"), "gsb-local", session);
+}
+
+function savedRoles(stateDir) {
+  try {
+    const roles = JSON.parse(readFileSync(path.join(stateDir, "session.json"), "utf8")).roles;
+    return Array.isArray(roles) ? roles.filter((role) => typeof role === "string" && role) : [];
+  } catch { return []; }
+}
+
+export async function sessionHealth(mux, session, { roles, stateDir }) {
+  const active = await mux.sessionActive(session);
+  const titles = active ? (await mux.listPanes(session)).filter((pane) => !pane.exited).map((pane) => pane.title) : [];
+  return classifySessionHealth({
+    session,
+    active,
+    titles,
+    roles,
+    supervised: active ? supervisedRoles(stateDir, roles) : new Set(),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Factory + CLI
 // ---------------------------------------------------------------------------
 
@@ -230,7 +309,7 @@ export function createMux(env = process.env) {
 
 async function cliMain(argv, env = process.env) {
   const [op, session, paneId, ...rest] = argv;
-  if (!op || !session) throw new MuxError("usage: mux.mjs <list-panes|read|send-text|send-keys|pane-exists|session-active|print-attach> <session> [pane-id] [payload...]", 2);
+  if (!op || !session) throw new MuxError("usage: mux.mjs <list-panes|read|send-text|send-keys|pane-exists|session-active|session-health|print-attach> <session> [pane-id] [payload...]", 2);
   const mux = createMux(envWithSessionContract(env, session));
   switch (op) {
     case "list-panes":
@@ -255,6 +334,15 @@ async function cliMain(argv, env = process.env) {
     }
     case "session-active":
       return (await mux.sessionActive(session)) ? 0 : 1;
+    case "session-health": {
+      // The second positional is a roles CSV here; default to the running
+      // session's own roster rather than whatever config invoked us.
+      const stateDir = sessionStateDir(session, env);
+      const roles = paneId ? paneId.split(",").filter(Boolean) : savedRoles(stateDir);
+      const health = await sessionHealth(mux, session, { roles, stateDir });
+      console.log(`${health.state} ${health.missing.join(",")}`);
+      return 0;
+    }
     case "print-attach": {
       const argvAttach = mux.attachArgv(session);
       console.log(`${env.GSB_HERDR_BIN || (mux.name === "herdr" ? "herdr" : env.GSB_ZELLIJ_BIN || "zellij")} ${argvAttach.join(" ")}`);
@@ -281,7 +369,19 @@ function selftest() {
   const hmux = createMux(herdrEnv);
   assert.equal(hmux.name, "herdr");
   assert.deepEqual(hmux.attachArgv("demo"), ["session", "attach", "default"]);
-  console.log("mux selftest: 10 passed");
+  const roles = ["hub", "coder", "review"];
+  const titles = ["hub.demo.main", "spk.demo.coder", "spk.demo.review · busy"];
+  const health = (supervised, overrides = {}) =>
+    classifySessionHealth({ session: "demo", active: true, titles, roles, supervised: new Set(supervised), ...overrides });
+  assert.deepEqual(health(roles), { state: "complete", missing: [] });
+  assert.deepEqual(health(["hub", "coder"]), { state: "partial", missing: ["review"] });
+  assert.deepEqual(health([]), { state: "orphaned", missing: roles });
+  assert.deepEqual(health(roles, { titles: ["hub.demo.main"] }), { state: "partial", missing: ["coder", "review"] });
+  assert.equal(health(roles, { active: false }).state, "absent");
+  assert.ok(supervisorCommandMatches("bash /opt/gsb-local/bin/supervise coder\n", "coder"));
+  assert.ok(!supervisorCommandMatches("bash /opt/gsb-local/bin/supervise coder", "code"));
+  assert.ok(!supervisorCommandMatches("claude --resume abc", "coder"));
+  console.log("mux selftest: 18 passed");
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

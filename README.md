@@ -45,6 +45,8 @@ gsb-local --mux herdr /path/to/your/repository my-task
 
 herdr 后端下，一个 GSB 会话对应本地 herdr server 里 label 为 `gsb-<会话名>` 的 workspace：Hub 是 workspace 根 pane，第一个 Spoke 从 Hub 向右分裂、其余 Spoke 在右列向下堆叠且**等高**（按剩余份额递推 split ratio），pane label 仍使用 canonical 标题（`hub.<会话>.main` / `spk.<会话>.<角色>`），因此 nudge、relay、watchdog、`layout-status` 与 pane 寻址行为与 Zellij 后端一致。后端选择写入 `session.json` 与 `session.env`（`GSB_MUX`），`gsb-local open` 会按会话自己的后端 attach 或重建，无需再次传 `--mux`。同名会话同时只允许在一个后端上存活：另一后端仍有同名会话时启动会拒绝，`--rebuild` 会先关闭旧后端会话，这也是显式的后端切换方式。herdr server 未运行时会自动后台启动（`GSB_HERDR_AUTOSTART=false` 关闭）；`GSB_HERDR_BIN` 可覆盖 herdr 可执行文件路径，`GSB_HERDR_START_DELAY` 控制每 pane 启动命令前的等待。herdr 后端的 `layout-status` 不校验列几何，只报告角色存活、标题与 herdr 自带的 agent 状态。
 
+herdr 会话的存活不按“workspace 还在”判断，而是要求名册中每个角色都有 canonical 标签的 pane，且该角色的 `supervise` 进程仍存活（`agent-files/<角色>.supervise.pid`）。原因是 herdr server 重启后会连同 workspace/pane 标签一起自行恢复 pane，但其中的进程已不是 GSB 托管的。据此分三种情况：全部托管才算 `complete`，正常 attach；一个托管角色都没有（`orphaned`，通常是 herdr 重启后的残留）时，`gsb-local open`、重复启动和 Studio 启动都会自动关闭残留并按持久化配置重建；部分缺失（`partial`）时只打印缺失角色并 attach，不会杀掉仍在运行的 Agent，需要补齐时显式 `--rebuild`。创建时同样以全部角色进入 `supervise` 为成功标准（`GSB_HERDR_READY_TIMEOUT` 秒，默认 10）：失败会关闭半成品 workspace 并重试一次，最终失败时报出未就绪的角色。herdr 下 Agent 正常退出（或重启预算耗尽）后 pane 不会消失，而是停在“按 Enter 重启”提示，nudge 也会唤醒它。GSB 会清掉 Agent 进程的 `HERDR_PANE_ID`，让 herdr 的 claude/codex/kimi 集成不再上报会话 ID，herdr 重启时也就不会绕过 `supervise` 自行 resume 这些 Agent；代价是 kimi 集成的 hook 状态上报随之停用，Agent 状态只剩 herdr 自带的屏幕识别。watchdog reaper（`gsb-local watchdog ensure-all`）按会话自己的后端探测存活，herdr 会话的 watchdog 也会被自愈。
+
 关闭整个会话：Zellij 后端在会话内按 `Ctrl+Q`，或任意后端在命令行执行 `gsb-local close SESSION`——它会按该会话自己的后端关闭全部 pane、停止 watchdog，并保留任务板、合同、报告与 `session.json`，之后 `gsb-local open SESSION` 可随时重建。herdr TUI 内也可以用 `ctrl+b` 前缀加 `shift+d`（close_workspace，默认带确认）关闭当前 workspace。
 
 项目配置本身与后端无关：同一份 `.gsb-local/projects/<项目名>/` 配置可以用不同会话名分别跑在两个后端上。重复执行 `gsb-local <目录> <会话名>` 时，后端跟随该会话在 `session.json` 里记录的选择（无需再传 `--mux`）；只有显式传 `--mux` 加 `--rebuild` 才是切换后端。Studio 启动面板的「复用器后端」（Zellij / herdr）是启动级选择，随 `workbench.json` 保存为该项目的默认；选择 herdr 时 Studio 会先确认 herdr 命令存在，会话列表也会同时收录两个后端的运行会话（herdr 会话显示 `herdr` 归属，进入方式为 `gsb-local open <会话名>`）。
@@ -242,7 +244,7 @@ Kimi 默认使用其托管 Provider 中已注册的 `kimi-code/k3-256k` 别名�
 GSB_KIMI_MODEL=kimi-code/k3 gsb-local --rebuild /path/to/your/repository
 ```
 
-为避免目标仓库的项目级 Agent、MCP 或插件在未审核时自动生效，Kimi 默认从 GSB 安装目录启动，并通过 `--add-dir` 访问目标仓库。可用 `GSB_KIMI_HOST_CWD` 指定另一个已信任、无项目扩展的宿主目录；这不会改变 `GSB_WORKSPACE` 或契约中的实际工作路径。
+Kimi 与 Claude、Codex 一样默认从目标仓库启动，相对路径因此落在项目内，而不是 GSB 安装目录；这也意味着目标仓库的项目级 Kimi Agent、MCP 或插件会自动生效。不信任目标仓库时，可用 `GSB_KIMI_HOST_CWD` 指定一个已信任、无项目扩展的宿主目录，Kimi 仍通过 `--add-dir` 访问目标仓库；这不会改变 `GSB_WORKSPACE` 或契约中的实际工作路径。
 
 ## 布局
 

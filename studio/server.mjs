@@ -1577,6 +1577,7 @@ export async function launchWorkbench(workbench, {
   sourceEnv = process.env,
   activeSessionLineImpl = activeSessionLine,
   invalidateSessionCacheImpl = invalidateSessionCache,
+  herdrSessionHealthImpl = herdrSessionHealth,
 } = {}) {
   const saved = await persistProjectState(workbench);
   if (!saved.validation.valid) return { ...saved, launched: false };
@@ -1603,9 +1604,16 @@ export async function launchWorkbench(workbench, {
       };
     }
   }
+  // The duplicate guard must see the sessions as they are now: a 30s-old
+  // listing can refuse a session that was just closed, or miss one that was
+  // just started (the CLI then only reports "already active" and exits 0).
+  invalidateSessionCacheImpl();
   const existing = await activeSessionLineImpl(workbench.session);
-  if (existing && !workbench.rebuild) {
-    const backend = /herdr/.test(existing) ? "herdr" : "zellij";
+  const backend = existing && existing.includes(HERDR_SESSION_MARKER) ? "herdr" : "zellij";
+  // A herdr workspace with no supervised role left is a leftover of a herdr
+  // server restart, not a running session; the CLI rebuilds it.
+  const orphaned = existing && backend === "herdr" && herdrSessionHealthImpl(workbench.session) === "orphaned";
+  if (existing && !workbench.rebuild && !orphaned) {
     return {
       ...saved,
       launched: false,
@@ -1629,6 +1637,15 @@ export async function launchWorkbench(workbench, {
     stderr: result.stderr || "",
     status: result.status,
   };
+}
+
+function herdrSessionHealth(session) {
+  const result = spawnSync(process.execPath, [path.join(ROOT_DIR, "bin", "mux.mjs"), "session-health", session], {
+    encoding: "utf8",
+    env: { ...process.env, GSB_MUX: "herdr", GSB_STATE_DIR: path.join(stateRoot(), session) },
+    timeout: SPAWN_TIMEOUT_MS * 2,
+  });
+  return result.status === 0 ? String(result.stdout).trim().split(/\s+/, 1)[0] : "unknown";
 }
 
 export function openTerminalSession(session, { platform = process.platform, spawnImpl = spawn } = {}) {
